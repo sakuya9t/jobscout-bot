@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · JobScout{% endblock %}
+{% block body %}
+<header>
+  <span class="brand">JobScout</span>
+  <div class="flex">
+    <span class="muted">{{ user.email }}</span>
+    <button class="ghost" onclick="logout()">Log out</button>
+  </div>
+</header>
+<main>
+  <!-- Resume -->
+  <div class="card">
+    <h2>1 · Resume</h2>
+    <p class="muted">Upload your resume (PDF, docx, txt, md). The newest upload is used for scoring.</p>
+    <div class="flex">
+      <input id="resumeFile" type="file" accept=".pdf,.docx,.txt,.md" />
+      <button onclick="uploadResume()">Upload</button>
+    </div>
+    <div id="resumes"></div>
+  </div>
+
+  <!-- Companies -->
+  <div class="card">
+    <h2>2 · Companies to watch</h2>
+    <p class="muted">Paste a careers URL — Greenhouse / Lever / Ashby are auto-detected. Otherwise pick the ATS and token.</p>
+    <div class="row">
+      <div><label>Name</label><input id="cName" placeholder="Anthropic" /></div>
+      <div><label>Careers URL</label><input id="cUrl" placeholder="https://job-boards.greenhouse.io/anthropic" /></div>
+    </div>
+    <div class="row">
+      <div><label>ATS</label>
+        <select id="cAts">
+          <option value="auto">auto-detect</option>
+          <option value="greenhouse">greenhouse</option>
+          <option value="lever">lever</option>
+          <option value="ashby">ashby</option>
+          <option value="html">generic html</option>
+        </select>
+      </div>
+      <div><label>ATS token (optional)</label><input id="cToken" placeholder="board token / org slug" /></div>
+    </div>
+    <button style="margin-top:10px;" onclick="addCompany()">Add company</button>
+    <div id="companies"></div>
+  </div>
+
+  <!-- Interests -->
+  <div class="card">
+    <h2>3 · What you want</h2>
+    <p class="muted">Define your target role. Keywords gate which postings get scored; notes steer the LLM.</p>
+    <div class="row">
+      <div><label>Label</label><input id="iLabel" placeholder="Senior Backend (EU remote)" /></div>
+      <div><label>Min score to report (0-100)</label><input id="iMin" type="number" value="70" /></div>
+    </div>
+    <div class="row">
+      <div><label>Title keywords (comma-sep)</label><input id="iTitles" placeholder="backend, platform, infrastructure" /></div>
+      <div><label>Locations (comma-sep)</label><input id="iLocs" placeholder="remote, berlin, eu" /></div>
+    </div>
+    <div class="row">
+      <div><label>Seniority</label><input id="iSen" placeholder="senior, staff" /></div>
+      <div><label>Exclude keywords</label><input id="iExcl" placeholder="manager, sales" /></div>
+    </div>
+    <label>Notes / requirements for the AI</label>
+    <textarea id="iNotes" placeholder="Must allow EU remote. Strong Python + distributed systems. No on-call-heavy roles."></textarea>
+    <button style="margin-top:10px;" onclick="addInterest()">Add interest</button>
+    <div id="interests"></div>
+  </div>
+
+  <!-- Run + report -->
+  <div class="card">
+    <h2>4 · Daily report</h2>
+    <div class="flex">
+      <button onclick="run()">Run scan now</button>
+      <span id="runStatus" class="muted"></span>
+    </div>
+    <p class="muted" style="margin-top:10px;">
+      Telegram: DM your bot <code>/start {{ link_code }}</code> to get this report daily.
+    </p>
+    <div id="report"></div>
+  </div>
+</main>
+
+<script>
+const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts});
+const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+async function logout(){ await api("/api/auth/logout",{method:"POST"}); window.location="/login"; }
+
+async function uploadResume(){
+  const f = document.getElementById("resumeFile").files[0];
+  if(!f){ return; }
+  const fd = new FormData(); fd.append("file", f);
+  const r = await fetch("/api/resumes", {method:"POST", body:fd});
+  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Upload failed"); }
+  loadResumes();
+}
+async function loadResumes(){
+  const r = await api("/api/resumes"); const list = await r.json();
+  document.getElementById("resumes").innerHTML = list.map(x =>
+    `<div class="list-item flex" style="justify-content:space-between;">
+       <span>${esc(x.filename)} ${x.is_active?'<span class="pill">active</span>':''}</span>
+       <button class="ghost" onclick="delResume(${x.id})">Delete</button></div>`).join("") ||
+    '<p class="muted">No resume yet.</p>';
+}
+async function delResume(id){ await api(`/api/resumes/${id}`,{method:"DELETE"}); loadResumes(); }
+
+async function addCompany(){
+  const body = {name:val("cName"), careers_url:val("cUrl"), ats_type:val("cAts"), ats_token:val("cToken")||null};
+  const r = await api("/api/companies",{method:"POST", body:JSON.stringify(body)});
+  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); }
+  ["cName","cUrl","cToken"].forEach(i=>document.getElementById(i).value="");
+  loadCompanies();
+}
+async function loadCompanies(){
+  const r = await api("/api/companies"); const list = await r.json();
+  document.getElementById("companies").innerHTML = list.map(x =>
+    `<div class="list-item flex" style="justify-content:space-between;">
+       <span><b>${esc(x.name)}</b> <span class="pill">${x.ats_type}</span>
+       <span class="muted">${esc(x.careers_url||"")}</span></span>
+       <button class="ghost" onclick="delCompany(${x.id})">Remove</button></div>`).join("") ||
+    '<p class="muted">No companies yet.</p>';
+}
+async function delCompany(id){ await api(`/api/companies/${id}`,{method:"DELETE"}); loadCompanies(); }
+
+async function addInterest(){
+  const body = {label:val("iLabel"), title_keywords:val("iTitles"), locations:val("iLocs"),
+    seniority:val("iSen"), exclude_keywords:val("iExcl"), notes:val("iNotes"),
+    min_score:parseInt(val("iMin")||"70")};
+  const r = await api("/api/interests",{method:"POST", body:JSON.stringify(body)});
+  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); }
+  ["iLabel","iTitles","iLocs","iSen","iExcl","iNotes"].forEach(i=>document.getElementById(i).value="");
+  loadInterests();
+}
+async function loadInterests(){
+  const r = await api("/api/interests"); const list = await r.json();
+  document.getElementById("interests").innerHTML = list.map(x =>
+    `<div class="list-item flex" style="justify-content:space-between;">
+       <span><b>${esc(x.label)}</b> <span class="muted">min ${x.min_score} · ${esc(x.title_keywords||"any")} · ${esc(x.locations||"any")}</span></span>
+       <button class="ghost" onclick="delInterest(${x.id})">Delete</button></div>`).join("") ||
+    '<p class="muted">No interests yet.</p>';
+}
+async function delInterest(id){ await api(`/api/interests/${id}`,{method:"DELETE"}); loadInterests(); }
+
+async function run(){
+  const s = document.getElementById("runStatus"); s.textContent = "Scanning & scoring… (this can take a minute)";
+  const r = await api("/api/run",{method:"POST"});
+  const d = await r.json();
+  if(!r.ok){ s.textContent = d.detail || "Run failed"; return; }
+  s.textContent = `${d.new_positions} new positions · ${d.scored} scored` +
+    (d.errors.length ? ` · ${d.errors.length} warning(s)` : "");
+  loadReport();
+}
+async function loadReport(){
+  const r = await api("/api/report"); const list = await r.json();
+  document.getElementById("report").innerHTML = list.map(m => `
+    <div class="list-item">
+      <div class="flex" style="justify-content:space-between;">
+        <span><b>${esc(m.title)}</b> — ${esc(m.company)} ${m.location?`<span class="muted">· ${esc(m.location)}</span>`:""}</span>
+        <span class="score">${m.match_score}/100 · win ${m.win_probability}%</span>
+      </div>
+      <p>${esc(m.reasoning||"")}</p>
+      ${m.strengths.length?`<div class="muted">Strengths</div><ul class="tight">${m.strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>`:""}
+      ${m.gaps.length?`<div class="muted">Watch-outs</div><ul class="tight">${m.gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>`:""}
+      ${m.url?`<a href="${esc(m.url)}" target="_blank">View posting →</a>`:""}
+    </div>`).join("") || '<p class="muted">No strong matches yet — add companies/interests and run a scan.</p>';
+}
+
+const val = id => document.getElementById(id).value.trim();
+loadResumes(); loadCompanies(); loadInterests(); loadReport();
+</script>
+{% endblock %}

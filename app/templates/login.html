@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ mode|capitalize }} · JobScout{% endblock %}
+{% block body %}
+<header><span class="brand">JobScout</span></header>
+<main style="max-width:420px;">
+  <div class="card">
+    <h1 id="title">{{ "Create account" if mode == "register" else "Log in" }}</h1>
+    <label>Email</label>
+    <input id="email" type="email" autocomplete="username" />
+    <label>Password</label>
+    <input id="password" type="password" autocomplete="current-password" />
+    <p class="err" id="err"></p>
+    <button id="submit" style="width:100%; margin-top:8px;">
+      {{ "Sign up" if mode == "register" else "Log in" }}
+    </button>
+    <p class="muted" style="margin-top:14px;">
+      {% if mode == "register" %}
+        Already have an account? <a href="/login">Log in</a>
+      {% else %}
+        New here? <a href="/register">Create an account</a>
+      {% endif %}
+    </p>
+  </div>
+</main>
+<script>
+  const mode = "{{ mode }}";
+  document.getElementById("submit").onclick = async () => {
+    const err = document.getElementById("err");
+    err.textContent = "";
+    const body = {
+      email: document.getElementById("email").value,
+      password: document.getElementById("password").value,
+    };
+    const path = mode === "register" ? "/api/auth/register" : "/api/auth/login";
+    const r = await fetch(path, {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+    });
+    if (r.ok) { window.location = "/"; }
+    else { const d = await r.json().catch(() => ({})); err.textContent = d.detail || "Something went wrong"; }
+  };
+</script>
+{% endblock %}

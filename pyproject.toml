@@ -1,0 +1,40 @@
+[project]
+name = "jobscout"
+version = "0.1.0"
+description = "Multi-user job-matching automation: scrape company career pages daily, match new positions against per-user requirements and resume using an Ollama Cloud model, and deliver a ranked daily report via web dashboard, Telegram, and MCP."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "email-validator>=2",
+    "python-multipart>=0.0.9",
+    "bcrypt>=4.1",
+    "PyJWT>=2.8",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "pypdf>=4.2",
+    "python-docx>=1.1",
+    "apscheduler>=3.10",
+    "jinja2>=3.1",
+    "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+# Heavy, optional: only needed for JavaScript-rendered career pages.
+browser = ["playwright>=1.44"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+jobscout = "app.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
