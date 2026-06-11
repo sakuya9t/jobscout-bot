@@ -28,6 +28,18 @@ class GoodClient:
 
     def chat_json(self, system, user, schema, temperature=0.2):
         self.calls += 1
+        if "results" in schema.get("properties", {}):
+            n = user.count("### Posting ")
+            return {
+                "results": [
+                    {
+                        "id": i + 1, "matches_requirements": True,
+                        "match_score": self.score, "win_probability": 50,
+                        "reasoning": "Solid fit.", "strengths": ["Python"], "gaps": [],
+                    }
+                    for i in range(n)
+                ]
+            }
         return {
             "matches_requirements": True, "match_score": self.score,
             "win_probability": 50, "reasoning": "Solid fit.",
@@ -40,6 +52,16 @@ class FailClient:
 
     def chat_json(self, *a, **k):
         raise OllamaError("Ollama returned 500: server error")
+
+
+class BudgetClient:
+    """Scoring stub that simulates Ollama quota/budget exhaustion (HTTP 402)."""
+    model = "fake-budget"
+
+    def chat_json(self, *a, **k):
+        from app.services.ollama_client import OllamaBudgetError
+
+        raise OllamaBudgetError("Ollama budget/quota exhausted (HTTP 402): no remaining credits")
 
 
 class BoomClient:
@@ -248,6 +270,28 @@ def test_failure_persists_marker_and_is_not_rebilled():
         assert matcher.clear_failed_markers(db, user_id=uid) == 1
 
 
+def test_budget_exhaustion_stops_run_and_auto_recovers():
+    """An exhausted Ollama budget surfaces a clear warning, writes NO error-markers
+    (unlike a generic failure), and lets the postings re-score on the next run once
+    quota is back — without a manual --retry-failed."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        res = matcher.run_for_user(db, db.get(models.User, uid),
+                                   client=BudgetClient(), filter_client=FilterPass())
+    assert res.scored == 0
+    assert any("budget" in e.lower() or "quota" in e.lower() for e in res.errors)
+    # The half-processed batch was rolled back: no markers, no rows at all — so the
+    # score-dedup `already` set won't skip these postings next run.
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.MatchResult))) == []
+    # Quota restored: the same postings now score (proving they weren't skipped).
+    with session_scope() as db:
+        res2 = matcher.run_for_user(db, db.get(models.User, uid),
+                                    client=GoodClient(), filter_client=FilterPass())
+    assert res2.scored >= 1
+
+
 def test_descriptionless_position_skipped_with_warning(monkeypatch):
     from app.services import scraper
 
@@ -299,8 +343,6 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
         [["New York, NY, USA", ["New York, NY, USA"], "New York", None, "NY", "US"]],
     ]
     page1 = "AF_initDataCallback({key:'ds:0', data:" + json.dumps([[rec]]) + ", sideChannel: {}});"
-    pages: dict[str, str] = {}
-
     def fake_fetch(url: str) -> str:
         return page1 if "page=1" in url else "<html>no jobs here</html>"
 
@@ -392,6 +434,27 @@ def test_filter_batch_one_call_mixed_verdicts(monkeypatch):
     assert res.scored == 1 and res.filtered == 3 and good.calls == 1
 
 
+def test_scoring_batch_scores_multiple_survivors_in_one_call(monkeypatch):
+    """When several postings survive the cheap filter, the expensive model gets
+    one batched request instead of one request per posting."""
+    from app.services import scraper
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    fresh = [scraper.ScrapedPosition(external_id=f"b{i}", title=f"Backend Engineer {i}",
+                                     location="Remote", description="Build APIs") for i in range(4)]
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: fresh)
+    monkeypatch.setattr(matcher.settings, "score_filter_batch_size", 10)
+    monkeypatch.setattr(matcher.settings, "score_batch_size", 10)
+    good = GoodClient()
+    flt = FilterPass()
+    with session_scope() as db:
+        res = matcher.run_for_user(db, db.get(models.User, uid), client=good, filter_client=flt)
+    assert flt.calls == 1
+    assert res.scored == 5
+    assert good.calls == 1
+
+
 def test_resume_reupload_same_content_is_noop():
     """Re-uploading identical resume content reuses the existing resume (same id),
     so scores cached against it aren't recomputed; new content replaces it."""
@@ -410,9 +473,9 @@ def test_resume_reupload_same_content_is_noop():
         assert len(c.get("/api/resumes", headers=h).json()) == 1
 
 
-def test_scoring_capped_per_run(monkeypatch):
-    """The per-run cap bounds how many postings get evaluated; the rest wait for
-    the next run, and the run says it was truncated."""
+def test_run_drains_whole_backlog_to_zero(monkeypatch):
+    """There is no per-run cap: one run scores the entire backlog, and count_pending
+    drops to 0. (Replaces the old 'capped, click Run again' behavior.)"""
     from app.services import scraper
 
     with session_scope() as db:
@@ -420,12 +483,35 @@ def test_scoring_capped_per_run(monkeypatch):
     fresh = [scraper.ScrapedPosition(external_id=f"f{i}", title="Backend Engineer",
                                      location="Remote", description="Build APIs") for i in range(4)]
     monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: fresh)
-    monkeypatch.setattr(matcher.settings, "score_max_per_run", 2)
     good = GoodClient()
     with session_scope() as db:
-        res = matcher.run_for_user(db, db.get(models.User, uid), client=good, filter_client=FilterPass())
-    assert res.scored == 2 and good.calls == 2
-    assert any("cap" in e.lower() for e in res.errors)
+        user = db.get(models.User, uid)
+        # Backlog before a run = (4 fresh + 1 seeded) described positions × 1 interest.
+        res = matcher.run_for_user(db, user, client=good, filter_client=FilterPass())
+        assert res.scored == 5
+        assert not any("cap" in e.lower() for e in res.errors)  # no cap message anymore
+        assert matcher.count_pending(db, user) == 0  # fully drained
+
+
+def test_excluded_pairs_leave_the_backlog(monkeypatch):
+    """A keyword-excluded pair gets an 'excluded' marker row (so the backlog
+    converges to 0 and the drain terminates) instead of being silently dropped."""
+    from app.services import scraper
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        # Exclude anything mentioning "backend" — the seeded position's title.
+        db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid)
+                  ).exclude_keywords = "backend"
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: [])
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        res = matcher.run_for_user(db, user, client=BoomClient(), filter_client=BoomClient())
+        assert res.scored == 0  # excluded before any LLM call (BoomClient never raises)
+        assert matcher.count_pending(db, user) == 0  # the exclude marker emptied the backlog
+        markers = list(db.scalars(matcher.select(models.MatchResult).where(
+            models.MatchResult.model == matcher.EXCLUDED_MODEL)))
+        assert len(markers) == 1 and markers[0].passed_filter is False
 
 
 def test_report_min_results_backfills_below_threshold():
@@ -502,13 +588,24 @@ def test_job_list_snapshots_keep_previous_ranked_versions():
         db.flush()
         matcher.run_for_user(db, user, client=GoodClient(score=97), filter_client=FilterPass())
         second = reporter.record_job_list_snapshot(
-            db, user, SimpleNamespace(new_positions=1, scored=1, filtered=0, errors=["cap reached"])
+            db,
+            user,
+            SimpleNamespace(
+                new_positions=1,
+                scored=1,
+                filtered=0,
+                errors=[
+                    "Reached this run's scoring cap (50) — more postings remain "
+                    "unscored. Click Run again to continue, or raise JOBSCOUT_SCORE_MAX_PER_RUN."
+                ],
+            ),
         )
 
         assert reporter.job_list_items(first)[0]["title"] == "Backend Engineer"
         latest_items = reporter.job_list_items(second)
         assert [item["title"] for item in latest_items] == ["Principal Backend", "Backend Engineer"]
-        assert reporter.job_list_errors(second) == ["cap reached"]
+        assert "candidate evaluation cap" in reporter.job_list_errors(second)[0]
+        assert "remain unevaluated" in reporter.job_list_errors(second)[0]
 
         from app.routers.reports import _job_list_out
 
@@ -549,6 +646,60 @@ def test_telegram_report_warnings_and_chunking():
     assert "and 3 more" in report_to_telegram([], errors=errors)
 
 
+# ── Async evaluation drain ───────────────────────────────────────────────────
+def test_count_pending_ignores_undescribed():
+    """Description-less postings are never scored, so they're not in the backlog."""
+    with session_scope() as db:
+        uid = _seed_user(db, description=None)
+    with session_scope() as db:
+        assert matcher.count_pending(db, db.get(models.User, uid)) == 0
+
+
+def test_evaluator_drains_backlog_and_records_snapshot(monkeypatch):
+    """The background drain body scores the whole backlog to completion and records
+    one snapshot. (Run synchronously here for determinism.)"""
+    from app.services import evaluator
+
+    with session_scope() as db:
+        uid = _seed_user(db)  # 1 described position × 1 interest = backlog of 1
+    monkeypatch.setattr(matcher, "get_client", lambda: GoodClient())
+    monkeypatch.setattr(matcher, "OllamaClient", lambda **k: FilterPass())
+
+    evaluator._run(uid)
+
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        assert matcher.count_pending(db, user) == 0
+        snaps = list(db.scalars(matcher.select(models.JobListSnapshot)
+                                .where(models.JobListSnapshot.user_id == uid)))
+        assert len(snaps) == 1 and snaps[0].scored == 1
+
+
+def test_run_endpoint_returns_immediately_with_pending(monkeypatch):
+    """/api/run scrapes, hands scoring to the background worker, and returns the
+    pending backlog without scoring inline (scored=0)."""
+    from app.services import evaluator
+
+    kicked: list[int] = []
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: kicked.append(uid))
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'async@x.com').json()['access_token']}"}
+        with session_scope() as db:
+            user = db.scalar(matcher.select(models.User).where(models.User.email == "async@x.com"))
+            db.add(models.Resume(user_id=user.id, filename="r.txt",
+                                 content_text="Senior Python", is_active=True))
+            comp = models.Company(user_id=user.id, name="Acme"); db.add(comp); db.flush()
+            db.add(models.Position(company_id=comp.id, external_id="1",
+                                   title="Backend Engineer", description="Build APIs"))
+            db.add(models.Interest(user_id=user.id, label="be", title_keywords="backend",
+                                   is_active=True))
+        body = c.post("/api/run", headers=h).json()
+        assert body["pending"] == 1 and body["scored"] == 0
+        assert kicked  # background drain was kicked
+        status = c.get("/api/evaluation/status", headers=h).json()
+        assert status["pending"] == 1 and status["in_progress"] is False
+
+
 # ── Health ───────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("status,expected", [(200, "ok"), (401, "unauthorized"), (503, "unreachable")])
 def test_health_states(monkeypatch, status, expected):
@@ -559,3 +710,80 @@ def test_health_states(monkeypatch, status, expected):
 
     monkeypatch.setattr(oc.httpx, "get", lambda *a, **k: Resp())
     assert oc.OllamaClient().health() == expected
+
+
+# ── Ollama logging ───────────────────────────────────────────────────────────
+def test_ollama_logs_request_and_response(monkeypatch, caplog):
+    """Every Ollama call logs the outgoing prompt and the completion (correlated
+    by a request id) on the jobscout.ollama logger — and never the API key."""
+    import app.services.ollama_client as oc
+
+    class Resp:
+        def json(self):
+            return {"message": {"content": "hello world"}, "done_reason": "stop",
+                    "prompt_eval_count": 12, "eval_count": 3}
+
+    monkeypatch.setattr(oc, "_post", lambda url, body, headers, timeout: Resp())
+    with caplog.at_level("INFO", logger=oc.OLLAMA_LOGGER):
+        out = oc.OllamaClient(api_key="super-secret-key").chat_text("be terse", "hi there")
+
+    assert out == "hello world"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "→ POST" in text and "hi there" in text          # request prompt logged
+    assert "assistant: hello world" in text                 # response logged
+    assert "super-secret-key" not in text                   # API key never logged
+
+
+@pytest.mark.parametrize("status,body,expected", [
+    (402, "Payment Required", "budget"),       # 402 is always budget
+    (429, "monthly quota exceeded", "budget"),  # 429 naming a cap = budget
+    (429, "too many requests", "generic"),      # bare 429 = transient rate limit
+    (403, "insufficient credits", "budget"),
+    (500, "internal error", "generic"),
+])
+def test_ollama_budget_error_classification(monkeypatch, status, body, expected):
+    """A budget/quota rejection raises OllamaBudgetError so the matcher can react;
+    everything else stays a generic OllamaError."""
+    import app.services.ollama_client as oc
+
+    class Resp:
+        status_code = status
+        text = body
+
+        def raise_for_status(self):
+            raise oc.httpx.HTTPStatusError("err", request=None, response=self)
+
+    # Bypass the retry/backoff wrapper: post raises the status error directly.
+    monkeypatch.setattr(oc.httpx, "post", lambda *a, **k: Resp())
+    with pytest.raises(oc.OllamaError) as ei:
+        oc.OllamaClient().chat_text("s", "u")
+    is_budget = isinstance(ei.value, oc.OllamaBudgetError)
+    assert is_budget == (expected == "budget")
+
+
+def test_ollama_logs_failures(monkeypatch, caplog):
+    """A transport/HTTP error is logged (with the ✗ marker) before being raised."""
+    import app.services.ollama_client as oc
+
+    def boom(*a, **k):
+        raise oc.httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(oc, "_post", boom)
+    with caplog.at_level("WARNING", logger=oc.OLLAMA_LOGGER):
+        with pytest.raises(oc.OllamaError):
+            oc.OllamaClient().chat_text("s", "u")
+    assert any("✗" in r.getMessage() for r in caplog.records)
+
+
+def test_ollama_logging_can_be_disabled(monkeypatch, caplog):
+    import app.services.ollama_client as oc
+
+    class Resp:
+        def json(self):
+            return {"message": {"content": "quiet"}}
+
+    monkeypatch.setattr(oc, "_post", lambda *a, **k: Resp())
+    monkeypatch.setattr(oc.settings, "log_ollama", False)
+    with caplog.at_level("INFO", logger=oc.OLLAMA_LOGGER):
+        oc.OllamaClient().chat_text("s", "u")
+    assert caplog.records == []

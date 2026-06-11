@@ -22,11 +22,12 @@ external agents (openclaw / hermes) can drive.
 4. **Relevance filter (cheap model)** — `JOBSCOUT_OLLAMA_FILTER_MODEL` decides,
    semantically, whether a posting matches the interest, so the expensive model
    only sees plausible fits. Filtering is **batched** — one call screens
-   `JOBSCOUT_SCORE_FILTER_BATCH_SIZE` postings — and a per-run cap
-   (`JOBSCOUT_SCORE_MAX_PER_RUN`) bounds cost/latency; the rest score next run.
-   Results are cached per resume *version*, so nothing is re-scored until the
-   resume content actually changes.
-5. **Score (main model)** — `JOBSCOUT_OLLAMA_MODEL` structured output:
+   `JOBSCOUT_SCORE_FILTER_BATCH_SIZE` postings. After a scan, scoring **drains to
+   completion in the background** (no per-run cap); the dashboard shows how many
+   positions are still being evaluated. Results are cached per resume *version*,
+   so nothing is re-scored until the resume content actually changes.
+5. **Score (main model)** — `JOBSCOUT_OLLAMA_MODEL` scores surviving postings
+   in batches of `JOBSCOUT_SCORE_BATCH_SIZE`, returning structured output:
    `matches_requirements`, `match_score` (0–100), `win_probability` (0–100),
    `reasoning`, `strengths[]`, `gaps[]`.
 6. **Report** — ranked by match score. The web dashboard always shows the top

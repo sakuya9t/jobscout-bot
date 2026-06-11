@@ -141,7 +141,19 @@ def job_list_errors(snapshot: JobListSnapshot) -> list[str]:
         data = json.loads(snapshot.errors or "[]")
     except json.JSONDecodeError:
         return []
-    return [str(item) for item in data] if isinstance(data, list) else []
+    return [_normalize_snapshot_error(str(item)) for item in data] if isinstance(data, list) else []
+
+
+def _normalize_snapshot_error(message: str) -> str:
+    """Older snapshots used 'scoring cap' for the candidate-screening budget.
+    Normalize on display so historical runs match the current wording."""
+    if message.startswith("Reached this run's scoring cap "):
+        return (
+            message
+            .replace("scoring cap", "candidate evaluation cap", 1)
+            .replace("remain unscored", "remain unevaluated", 1)
+        )
+    return message
 
 
 def report_to_markdown(user_email: str, report: list[dict]) -> str:

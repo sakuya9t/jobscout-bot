@@ -169,7 +169,16 @@ class JobListOut(BaseModel):
     filtered: int = 0
     errors: list[str] = Field(default_factory=list)
     total: int = 0
+    # Positions still queued for background evaluation (0 = fully evaluated).
+    pending: int = 0
     items: list[MatchOut] = Field(default_factory=list)
+
+
+class EvaluationStatus(BaseModel):
+    """Lightweight backlog poll for the dashboard's 'XX positions unevaluated'."""
+
+    pending: int = 0
+    in_progress: bool = False
 
 
 class RunSummary(BaseModel):
@@ -177,3 +186,5 @@ class RunSummary(BaseModel):
     scored: int
     top_matches: list[MatchOut]
     errors: list[str] = []
+    # Positions handed to the background evaluator and not yet scored.
+    pending: int = 0

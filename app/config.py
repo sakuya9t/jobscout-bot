@@ -31,6 +31,20 @@ class Settings(BaseSettings):
     def secret_is_default(self) -> bool:
         return self.secret_key == DEFAULT_SECRET
 
+    # Logging
+    # Central logging is configured by app/logging_config.py:configure_logging().
+    log_level: str = "INFO"
+    # Optional rotating log file. Empty = log to stderr only.
+    log_file: str = ""
+    log_max_bytes: int = 5_000_000
+    log_backup_count: int = 3
+    # Log every Ollama request/response (full prompt + completion) on the
+    # "jobscout.ollama" logger. Prompts carry resume + job text, so they can be
+    # large and sensitive — set JOBSCOUT_LOG_OLLAMA=0 in shared environments.
+    log_ollama: bool = True
+    # Truncate each logged prompt/response to this many chars (0 = no limit).
+    log_ollama_max_chars: int = 4000
+
     # Ollama Cloud
     ollama_base_url: str = "https://ollama.com"
     ollama_api_key: str = ""
@@ -64,16 +78,23 @@ class Settings(BaseSettings):
     # Google careers has no ATS API; we page its server-rendered results (20/page).
     # Cap pages so a run pulls a bounded slice instead of all ~thousands of roles.
     scrape_google_max_pages: int = 20
+    # Only pull postings posted/updated within this many days, to bound how much we
+    # store and score. Applies only to sources that expose a date (greenhouse/
+    # lever/ashby); Google careers and the HTML fallback carry no per-posting date,
+    # so their postings are always kept. 0 = no age filter.
+    scrape_max_age_days: int = 30
 
     # Scoring
-    # The LLM (not a keyword filter) decides relevance, so a run could otherwise
-    # score every scraped posting. Cap LLM calls per run to keep "Run scan now"
-    # responsive and costs bounded; remaining postings score on the next run.
-    # 0 = unlimited.
-    score_max_per_run: int = 50
     # Stage-1 relevance filtering is batched: one cheap call screens this many
     # postings at once (returns a verdict per posting), cutting filter calls ~Nx.
     score_filter_batch_size: int = 10
+    # Stage-2 scoring is also batched: after the cheap filter passes postings,
+    # one expensive request scores this many postings against the resume.
+    score_batch_size: int = 10
+    # Background evaluation: a worker drains each user's whole scoring backlog to
+    # completion off the request path (see app/services/evaluator.py). This bounds
+    # how many users drain concurrently. Internal — not a user-facing knob.
+    eval_max_workers: int = 2
 
     @property
     def resume_dir(self) -> Path:

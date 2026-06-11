@@ -23,7 +23,8 @@
     display:grid; grid-template-columns:280px minmax(0, 1fr);
   }
   .sidebar {
-    background:var(--sidebar); color:var(--sidebar-ink); min-height:100vh;
+    background:var(--sidebar); color:var(--sidebar-ink);
+    height:100vh; position:sticky; top:0; align-self:start; overflow-y:auto;
     padding:22px 18px; display:flex; flex-direction:column; gap:22px;
   }
   .sidebar-top { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
@@ -37,7 +38,7 @@
   .nav-button:hover, .nav-button[aria-current="page"] {
     background:#1d3932; border-color:#2a5148; color:#ffffff;
   }
-  .logout { margin-top:auto; color:#f7fbf9; border-color:#31554d; }
+  button.logout { margin-top:auto; color:#f7fbf9; border-color:#31554d; }
   .workspace { padding:26px clamp(18px, 3vw, 42px); min-width:0; }
   .view-header {
     display:flex; align-items:flex-start; justify-content:space-between; gap:18px;
@@ -88,9 +89,9 @@
   .err { color:var(--danger); font-size:13px; }
   @media (max-width: 860px) {
     main.dashboard { grid-template-columns:1fr; }
-    .sidebar { min-height:auto; position:static; }
+    .sidebar { height:auto; min-height:auto; position:static; }
     .nav-stack { grid-template-columns:1fr 1fr; }
-    .logout { margin-top:0; }
+    button.logout { margin-top:0; }
     .view-header, .job-head { display:grid; }
     .row { grid-template-columns:1fr; }
   }
@@ -142,6 +143,9 @@
           <button id="jobToggle" class="ghost" onclick="toggleJobListSize()">View all</button>
         </div>
         <div id="runGate" class="muted" style="margin-top:8px;"></div>
+        <div id="evalBanner" style="display:none; margin-top:12px; padding:10px 12px;
+             border:1px solid var(--line); background:var(--surface-soft); color:#2a3a34;
+             border-radius:8px; font-size:13px;"></div>
         <div id="jobMeta" class="stat-line" style="margin-top:14px;"></div>
         <div id="jobWarnings"></div>
       </div>
@@ -257,6 +261,8 @@ const viewCopy = {
 };
 let showAllJobs = false;
 let selectedSnapshotId = null;
+let hasActiveResume = false;
+let runInProgress = false;
 let ALL_PRESETS = [];
 let watchedNames = new Set();
 let interestsById = {};
@@ -314,7 +320,8 @@ async function loadResumes(){
 }
 
 function updateScanGate(hasResume){
-  document.getElementById("runBtn").disabled = !hasResume;
+  hasActiveResume = hasResume;
+  document.getElementById("runBtn").disabled = !hasResume || runInProgress;
   document.getElementById("runGate").textContent =
     hasResume ? "" : "Upload a resume before running a scan.";
 }
@@ -434,17 +441,62 @@ async function delInterest(id){
 }
 
 async function run(){
-  if(document.getElementById("runBtn").disabled){ return; }
+  if(!hasActiveResume || runInProgress){ return; }
+  runInProgress = true;
+  updateScanGate(hasActiveResume);
   const s = document.getElementById("runStatus");
-  s.textContent = "Scanning and scoring...";
-  const r = await api("/api/run",{method:"POST"});
-  const d = await r.json().catch(()=>({}));
-  if(!r.ok){ s.textContent = d.detail || "Run failed"; return; }
-  s.textContent = `${d.new_positions} new positions · ${d.scored} scored`;
-  selectedSnapshotId = null;
-  showAllJobs = false;
-  await loadJobRuns();
-  await loadJobList();
+  s.textContent = "Scanning company sites…";
+  try {
+    const r = await api("/api/run",{method:"POST"});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok){ s.textContent = d.detail || "Run failed"; return; }
+    s.textContent = (d.pending > 0)
+      ? `${d.new_positions} new positions · evaluating ${d.pending} in the background…`
+      : `${d.new_positions} new positions · up to date`;
+    selectedSnapshotId = null;
+    showAllJobs = false;
+    await loadJobRuns();
+    await loadJobList();
+    startEvalPolling();  // stream in matches as the background drain scores them
+  } finally {
+    runInProgress = false;
+    updateScanGate(hasActiveResume);
+  }
+}
+
+let evalPolling = false, wasEvaluating = false;
+
+function renderEvalBanner(pending, busy){
+  const el = document.getElementById("evalBanner");
+  if(busy || pending > 0){
+    el.style.display = "";
+    el.textContent = `⏳ Evaluating — ${pending} position${pending===1?"":"s"} still to score…`;
+  } else {
+    el.style.display = "none";
+  }
+}
+
+function startEvalPolling(){
+  if(evalPolling){ return; }   // a poll loop is already running
+  evalPolling = true;
+  pollEval();
+}
+
+async function pollEval(){
+  let d = null;
+  try { const r = await api("/api/evaluation/status"); if(r.ok){ d = await r.json(); } } catch(e) {}
+  if(!d){ setTimeout(pollEval, 6000); return; }  // transient error — keep trying
+  const busy = d.in_progress || d.pending > 0;
+  renderEvalBanner(d.pending, busy);
+  // Refresh the live list as matches get scored (only when viewing "latest").
+  if(busy && selectedSnapshotId === null){ await loadJobList(); }
+  if(!busy && wasEvaluating){
+    await loadJobRuns();  // the finished drain saved a new version
+    if(selectedSnapshotId === null){ await loadJobList(); }
+  }
+  wasEvaluating = busy;
+  if(busy){ setTimeout(pollEval, 4000); }
+  else { evalPolling = false; }
 }
 
 async function loadJobRuns(){
@@ -453,7 +505,7 @@ async function loadJobRuns(){
   const sel = document.getElementById("jobVersion");
   const selected = selectedSnapshotId ? String(selectedSnapshotId) : "latest";
   sel.innerHTML = '<option value="latest">Latest saved list</option>' + runs.map(run => {
-    const label = `${fmtDate(run.created_at)} · ${run.total} jobs · ${run.scored} scored`;
+    const label = `${fmtDate(run.created_at)} · ${run.total} listed · ${run.scored} model-scored`;
     return `<option value="${run.id}">${esc(label)}</option>`;
   }).join("");
   if([...sel.options].some(o => o.value === selected)){ sel.value = selected; }
@@ -490,8 +542,9 @@ function renderJobList(data){
   document.getElementById("jobMeta").innerHTML = `
     <span class="stat">${esc(fmtDate(data.created_at))}</span>
     <span class="stat">${data.new_positions} new positions</span>
-    <span class="stat">${data.scored} scored</span>
-    <span class="stat">${data.total} in list</span>`;
+    <span class="stat">${data.scored} model-scored this run</span>
+    <span class="stat">${data.filtered} screened out this run</span>
+    <span class="stat">${data.total} listed overall</span>`;
   document.getElementById("jobWarnings").innerHTML = (data.errors || []).length
     ? `<div class="warning-box"><b>Warnings</b><ul class="tight">${data.errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul></div>`
     : "";
@@ -522,5 +575,6 @@ loadPresets();
 loadCompanies();
 loadInterests();
 loadJobRuns().then(loadJobList);
+startEvalPolling();  // resume the backlog indicator if a drain is already running
 </script>
 {% endblock %}

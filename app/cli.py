@@ -101,6 +101,10 @@ def cmd_token(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    from .logging_config import configure_logging
+
+    configure_logging()
+
     parser = argparse.ArgumentParser(prog="jobscout")
     sub = parser.add_subparsers(dest="command", required=True)
 

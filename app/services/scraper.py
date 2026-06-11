@@ -10,14 +10,14 @@ import json as _json
 import re
 import socket
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from ..config import settings
-from ..timeutil import to_naive_utc
+from ..timeutil import to_naive_utc, utcnow
 
 # Redirects are not auto-followed; each hop is SSRF-validated up to this many.
 _MAX_REDIRECTS = 3
@@ -397,6 +397,22 @@ def scrape_html(careers_url: str, max_positions: int) -> list[ScrapedPosition]:
 
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
+def _within_max_age(
+    positions: list[ScrapedPosition], max_age_days: int
+) -> list[ScrapedPosition]:
+    """Keep only postings dated within ``max_age_days`` (by ``posted_at``), to
+    bound how much we store and score downstream.
+
+    Postings with no ``posted_at`` are KEPT: Google careers and the generic HTML
+    fallback don't expose a per-posting date, so dropping the undated ones would
+    silently lose every posting from those sources. ``max_age_days`` <= 0 disables
+    the filter."""
+    if max_age_days <= 0:
+        return positions
+    cutoff = utcnow() - timedelta(days=max_age_days)
+    return [p for p in positions if p.posted_at is None or p.posted_at >= cutoff]
+
+
 def _infer_ats(careers_url: str | None) -> tuple[str, str | None]:
     """Return (ats_type, token) guessed from the careers URL host/path."""
     if not careers_url:
@@ -453,4 +469,7 @@ def scrape_company(company) -> list[ScrapedPosition]:
     # have 200+ postings, and external_id dedup means a dropped one is never seen
     # again). The per-company limit only bounds the noisy HTML fallback, which
     # applies it itself via the ``max_positions`` argument to ``scrape_html``.
-    return results
+    #
+    # Drop stale postings last, so every adapter is filtered uniformly: only roles
+    # posted/updated within scrape_max_age_days are pulled (undated sources kept).
+    return _within_max_age(results, settings.scrape_max_age_days)

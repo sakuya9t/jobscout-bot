@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 from ..auth import get_current_user
 from ..db import get_db
 from ..models import JobListSnapshot, User
-from ..schemas import JobListOut, JobListRunOut, MatchOut, RunSummary
-from ..services import matcher, reporter
+from ..schemas import EvaluationStatus, JobListOut, JobListRunOut, MatchOut, RunSummary
+from ..services import evaluator, matcher, reporter
 
 router = APIRouter(prefix="/api", tags=["run"])
 _JOB_LIST_RESPONSE_LIMIT = 500
@@ -17,17 +17,33 @@ _JOB_LIST_RESPONSE_LIMIT = 500
 
 @router.post("/run", response_model=RunSummary)
 def run_now(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> RunSummary:
-    """Scrape this user's companies and score new positions immediately."""
-    result = matcher.run_for_user(db, user)
-    reporter.record_job_list_snapshot(db, user, result)
+    """Scrape this user's companies synchronously, then hand scoring to the
+    background evaluator and return immediately. The dashboard polls
+    ``/api/evaluation/status`` and watches ``pending`` drain to zero."""
+    result = matcher.scrape_only(db, user)
     db.commit()
-    # min_results: the dashboard always shows at least a few, even below threshold.
+    result.finalize_errors()
+    evaluator.ensure_running(user.id)
+    # Show whatever's already scored from prior runs while the backlog evaluates.
     report = reporter.build_report(db, user, limit=10, min_results=5)
     return RunSummary(
         new_positions=result.new_positions,
         scored=result.scored,
         errors=result.errors,
+        pending=matcher.count_pending(db, user),
         top_matches=[MatchOut(**m) for m in _strip(report)],
+    )
+
+
+@router.get("/evaluation/status", response_model=EvaluationStatus)
+def evaluation_status(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> EvaluationStatus:
+    """How many positions are still queued for background scoring, and whether a
+    drain is actively running. Polled by the dashboard backlog indicator."""
+    return EvaluationStatus(
+        pending=matcher.count_pending(db, user),
+        in_progress=user.id in evaluator.active_users(),
     )
 
 
@@ -76,28 +92,34 @@ def get_latest_job_list(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """The default 'latest' view is **live** — a fresh ranked report over current
+    MatchResults — so matches appear progressively as the background evaluator
+    scores them, with ``pending`` counting what's left. Run stats and warnings come
+    from the most recent saved snapshot (the last completed drain); the browsable
+    frozen versions are served by ``/job-lists/runs`` and ``/job-lists/{id}``."""
+    items = _strip(
+        reporter.build_report(
+            db, user, limit=_JOB_LIST_RESPONSE_LIMIT, include_below_threshold=True
+        )
+    )
+    safe_limit = _safe_limit(limit)
     snapshot = db.scalar(
         select(JobListSnapshot)
         .where(JobListSnapshot.user_id == user.id)
         .order_by(JobListSnapshot.created_at.desc(), JobListSnapshot.id.desc())
         .limit(1)
     )
-    if snapshot:
-        return _job_list_out(snapshot, limit)
-
-    # Backward-compatible fallback for databases with matches created before the
-    # snapshot table existed. The first new scan will replace this with a saved
-    # version.
-    items = _strip(
-        reporter.build_report(
-            db,
-            user,
-            limit=_JOB_LIST_RESPONSE_LIMIT,
-            include_below_threshold=True,
-        )
+    return JobListOut(
+        id=snapshot.id if snapshot else None,
+        created_at=snapshot.created_at if snapshot else None,
+        new_positions=snapshot.new_positions if snapshot else 0,
+        scored=snapshot.scored if snapshot else 0,
+        filtered=snapshot.filtered if snapshot else 0,
+        errors=reporter.job_list_errors(snapshot) if snapshot else [],
+        pending=matcher.count_pending(db, user),
+        total=len(items),
+        items=[MatchOut(**m) for m in items[:safe_limit]],
     )
-    safe_limit = _safe_limit(limit)
-    return JobListOut(total=len(items), items=[MatchOut(**m) for m in items[:safe_limit]])
 
 
 @router.get("/job-lists/{snapshot_id}", response_model=JobListOut)

@@ -107,6 +107,39 @@ def test_scrape_company_does_not_cap_ats_results(monkeypatch):
     assert len(out) == 60  # default per-company cap is 40 — must NOT truncate ATS results
 
 
+def test_scrape_company_filters_stale_postings(monkeypatch):
+    """Only postings dated within scrape_max_age_days are pulled; undated postings
+    (Google/HTML carry no date) are always kept."""
+    import app.services.scraper as scraper
+    from datetime import timedelta
+
+    from app.timeutil import utcnow
+
+    recent = scraper.ScrapedPosition(external_id="new", title="Fresh",
+                                     posted_at=utcnow() - timedelta(days=5))
+    stale = scraper.ScrapedPosition(external_id="old", title="Stale",
+                                    posted_at=utcnow() - timedelta(days=90))
+    undated = scraper.ScrapedPosition(external_id="undated", title="No date")  # posted_at=None
+    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: [recent, stale, undated])
+    monkeypatch.setattr(scraper.settings, "scrape_max_age_days", 30)
+
+    company = SimpleNamespace(name="Acme", ats_type="greenhouse", ats_token="acme", careers_url=None)
+    kept = {p.external_id for p in scraper.scrape_company(company)}
+    assert kept == {"new", "undated"}  # stale dropped; recent + undated kept
+
+
+def test_within_max_age_zero_disables_filter():
+    """max_age_days=0 keeps everything, however old."""
+    import app.services.scraper as scraper
+    from datetime import timedelta
+
+    from app.timeutil import utcnow
+
+    ancient = scraper.ScrapedPosition(external_id="x", title="Ancient",
+                                      posted_at=utcnow() - timedelta(days=900))
+    assert scraper._within_max_age([ancient], 0) == [ancient]
+
+
 def test_greenhouse_parse_offline(monkeypatch):
     """Parse a canned Greenhouse payload without network."""
     import json
@@ -183,7 +216,7 @@ def test_dispatch_uses_inferred_token(monkeypatch):
     import app.services.scraper as scraper
 
     captured = {}
-    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: captured.setdefault("t", token) or [])
+    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: captured.update(t=token) or [])
     company = SimpleNamespace(
         name="Acme", ats_type="auto", ats_token=None,
         careers_url="https://boards.greenhouse.io/acme",
