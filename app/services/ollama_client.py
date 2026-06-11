@@ -92,7 +92,11 @@ class OllamaClient:
         except httpx.HTTPError as exc:
             raise OllamaError(f"Could not reach Ollama at {url}: {exc}") from exc
 
-        content = resp.json().get("message", {}).get("content", "")
+        try:
+            payload = resp.json()
+        except json.JSONDecodeError as exc:
+            raise OllamaError(f"Ollama returned a non-JSON body: {resp.text[:300]}") from exc
+        content = payload.get("message", {}).get("content", "")
         try:
             return json.loads(content)
         except json.JSONDecodeError as exc:
@@ -112,9 +116,17 @@ class OllamaClient:
         url = f"{self.base_url}/api/chat"
         try:
             resp = _post(url, body, self._headers, self.timeout)
+        except httpx.HTTPStatusError as exc:
+            raise OllamaError(
+                f"Ollama returned {exc.response.status_code}: {exc.response.text[:300]}"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise OllamaError(f"Ollama request failed: {exc}") from exc
-        return resp.json().get("message", {}).get("content", "")
+            raise OllamaError(f"Could not reach Ollama at {url}: {exc}") from exc
+        try:
+            payload = resp.json()
+        except json.JSONDecodeError as exc:
+            raise OllamaError(f"Ollama returned a non-JSON body: {resp.text[:300]}") from exc
+        return payload.get("message", {}).get("content", "")
 
     def health(self) -> str:
         """Connectivity check used by /health and the CLI. Returns one of

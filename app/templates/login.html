@@ -24,6 +24,14 @@
 </main>
 <script>
   const mode = "{{ mode }}";
+  // FastAPI returns `detail` as a string for raised HTTPExceptions but as an
+  // array of {loc, msg, ...} objects for 422 validation errors — normalize both
+  // so the latter doesn't render as "[object Object]".
+  const errorText = (detail) => {
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) return detail.map((e) => e.msg).filter(Boolean).join("; ");
+    return "";
+  };
   document.getElementById("submit").onclick = async () => {
     const err = document.getElementById("err");
     err.textContent = "";
@@ -36,7 +44,7 @@
       method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
     });
     if (r.ok) { window.location = "/"; }
-    else { const d = await r.json().catch(() => ({})); err.textContent = d.detail || "Something went wrong"; }
+    else { const d = await r.json().catch(() => ({})); err.textContent = errorText(d.detail) || "Something went wrong"; }
   };
 </script>
 {% endblock %}

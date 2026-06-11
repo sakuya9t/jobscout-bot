@@ -27,7 +27,8 @@ def daily_job() -> None:
     total_scored = sum(s.scored for s in summaries.values())
     log.info("daily job done: %d users, %d new positions, %d scored",
              len(summaries), total_new, total_scored)
-    telegram_bot.send_daily_reports()
+    error_by_user = {uid: s.errors for uid, s in summaries.items() if s.errors}
+    telegram_bot.send_daily_reports(error_by_user)
 
 
 def _telegram_loop() -> None:

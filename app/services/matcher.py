@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import session_scope
 from ..models import Company, Interest, MatchResult, Position, Resume, User
 from ..schemas import MatchVerdict
@@ -22,10 +24,35 @@ from .ollama_client import OllamaClient, OllamaError, get_client
 
 log = logging.getLogger(__name__)
 
-# Structured-output schema the model must fill (Ollama `format`). Derived from
-# the Pydantic model so the schema and the parser never drift apart.
+# Structured-output schema the scoring model must fill (Ollama `format`). Derived
+# from the Pydantic model so the schema and the parser never drift apart.
 MATCH_SCHEMA = MatchVerdict.model_json_schema()
 
+# Stage 1: a CHEAP model decides relevance (semantic, not substring) so we only
+# spend the expensive scoring model on postings that actually fit the interest.
+# Batched + free-text JSON, NOT Ollama's structured `format`: cheap models ignore
+# the `format` grammar but happily emit a JSON array when asked to in the prompt.
+FILTER_SYSTEM_PROMPT = (
+    "You are a fast recruiting screener. Given a candidate's role requirements and a "
+    "NUMBERED list of job postings, decide for EACH posting whether it is a plausible "
+    "match for what they're looking for — the right kind of role, seniority, field, "
+    "and location. Judge meaning, not exact keywords (e.g. 'backend' ≈ 'server-side', "
+    "'Bay Area' ≈ 'San Francisco'). Be inclusive at the margin: when unsure, use "
+    "match=true (the detailed scoring step is stricter). Use match=false only for "
+    "clearly wrong roles (wrong discipline/seniority, an excluded keyword, or an "
+    "impossible location).\n"
+    "Respond with ONLY a JSON array — one object per posting, using its number as "
+    '"id": [{"id": 1, "match": true}, {"id": 2, "match": false}]. No prose, no code fences.'
+)
+
+
+def _parse_yes_no(text: str) -> bool:
+    """First yes/no token wins; default to YES (inclusive) when unclear, matching
+    the prompt's 'when unsure, let it through' instruction."""
+    match = re.search(r"\b(yes|no)\b", (text or "").lower())
+    return match.group(1) == "yes" if match else True
+
+# Stage 2: the GOOD model does the expensive resume<->role scoring.
 SYSTEM_PROMPT = (
     "You are a meticulous technical recruiter. Given a candidate's resume, their "
     "role requirements, and a job posting, decide whether the posting genuinely "
@@ -43,6 +70,7 @@ SYSTEM_PROMPT = (
 
 _RESUME_CHARS = 6000
 _DESC_CHARS = 4000
+_FILTER_DESC_CHARS = 800  # the cheap relevance filter only needs a short blurb per posting
 
 # Marker stored on the `model` column of a MatchResult when scoring terminally
 # failed, so the pair is skipped on re-runs rather than re-billed. Cleared by
@@ -56,7 +84,8 @@ _MAX_REPORTED_ERRORS = 5
 @dataclass
 class RunResult:
     new_positions: int = 0
-    scored: int = 0
+    scored: int = 0  # postings the good model fully scored (passed the cheap filter)
+    filtered: int = 0  # postings the cheap model judged not a match
     errors: list[str] = field(default_factory=list)
     match_ids: list[int] = field(default_factory=list)
     # Internal: total error count + de-dup set so one outage doesn't emit 200
@@ -86,28 +115,16 @@ def _csv(value: str | None) -> list[str]:
 
 
 def _passes_prefilter(pos: Position, interest: Interest) -> bool:
-    """Cheap substring gate to avoid spending LLM calls on obvious non-matches.
-    Conservative: only *excludes*, never invents a match. The LLM is authoritative."""
-    haystack = f"{pos.title} {pos.location or ''} {pos.department or ''}".lower()
-
+    """Cheap *negative-only* gate: drop a posting only when it hits an explicit
+    exclude keyword. Positive relevance (title/location/seniority fit) is NOT
+    decided here by substring matching — that's the cheap LLM filter's job, which
+    judges meaning instead of exact text. So title/location act as hints to the
+    models, never as a hard keyword gate that can silently exclude everything."""
     excludes = _csv(interest.exclude_keywords)
-    if any(x in haystack for x in excludes):
-        return False
-
-    titles = _csv(interest.title_keywords)
-    if titles and not any(t in haystack for t in titles):
-        return False
-
-    locations = _csv(interest.locations)
-    # Only gate on location when the posting actually has location data. Many
-    # (often remote) postings ship an empty location; dropping those here would
-    # hide real matches, so defer the call to the LLM instead.
-    if locations and (pos.location or "").strip():
-        loc = pos.location.lower()
-        # "remote" anywhere in the title/location counts as matching a remote pref.
-        if not any(l in loc or l in haystack for l in locations):
-            return False
-    return True
+    if not excludes:
+        return True
+    haystack = f"{pos.title} {pos.location or ''} {pos.department or ''}".lower()
+    return not any(x in haystack for x in excludes)
 
 
 def _build_user_prompt(resume: Resume, interest: Interest, pos: Position) -> str:
@@ -130,6 +147,113 @@ def _build_user_prompt(resume: Resume, interest: Interest, pos: Position) -> str
         f"Employment type: {pos.employment_type or 'n/a'}\n"
         f"Description:\n{(pos.description or '(no description scraped)')[:_DESC_CHARS]}\n"
     )
+
+
+def _build_filter_batch_prompt(interest: Interest, positions: list[Position]) -> str:
+    """Stage-1 prompt: interest requirements vs a NUMBERED batch of postings (no
+    resume — relevance doesn't need it, and a short per-posting blurb keeps the
+    cheap batch call small)."""
+    reqs = [f"- {k}: {v}" for k, v in {
+        "Desired titles": interest.title_keywords,
+        "Locations": interest.locations,
+        "Seniority": interest.seniority,
+        "Employment type": interest.employment_type,
+        "Exclusions": interest.exclude_keywords,
+        "Notes": interest.notes,
+    }.items() if v]
+    blocks = [
+        f"{i}. {pos.title} | loc: {pos.location or 'n/a'} | dept: {pos.department or 'n/a'}\n"
+        f"   {(pos.description or '')[:_FILTER_DESC_CHARS]}"
+        for i, pos in enumerate(positions, 1)
+    ]
+    return (
+        "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
+        "## JOB POSTINGS (decide a match for each, by its number)\n" + "\n".join(blocks) + "\n"
+    )
+
+
+def _extract_json_array(text: str | None) -> list | None:
+    if not text:
+        return None
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _parse_filter_batch(text: str, positions: list[Position]) -> dict[int, tuple[bool, str]]:
+    """Map the cheap model's batch reply to ``{pos_id: (matches, reason)}``. Robust
+    to format drift: prefer a JSON array keyed by 1-based ``id``, fall back to
+    ``n: yes/no`` lines, then to a single global YES/NO, and finally fail OPEN
+    (keep) for anything still missing so the stricter scoring step still gets a look."""
+    verdicts: dict[int, tuple[bool, str]] = {}
+    for item in _extract_json_array(text) or []:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("id", item.get("i", item.get("index")))
+        match = item.get("match", item.get("matches"))
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            continue
+        if 1 <= idx <= len(positions) and isinstance(match, bool):
+            verdicts[positions[idx - 1].id] = (match, str(item.get("reason") or "")[:500])
+    if len(verdicts) < len(positions):  # line fallback "n: yes/no"
+        for m in re.finditer(r"(\d+)\s*[:.)\-]\s*(yes|no)\b", text.lower()):
+            idx = int(m.group(1))
+            if 1 <= idx <= len(positions):
+                verdicts.setdefault(positions[idx - 1].id, (m.group(2) == "yes", ""))
+    if not verdicts:  # no per-id signal — treat a lone YES/NO as global
+        keep = _parse_yes_no(text)
+        return {pos.id: (keep, (text or "").strip()[:500]) for pos in positions}
+    for pos in positions:  # fail open on anything the model skipped
+        verdicts.setdefault(pos.id, (True, ""))
+    return verdicts
+
+
+def _filter_batch(
+    client: OllamaClient, interest: Interest, positions: list[Position]
+) -> tuple[dict[int, tuple[bool, str]], str | None]:
+    """Stage 1 (cheap model), batched: one call screens ``positions``. Returns
+    ``({pos_id: (matches, reason)}, None)`` or ``({}, message)`` on a terminal error."""
+    if not positions:
+        return {}, None
+    try:
+        text = client.chat_text(FILTER_SYSTEM_PROMPT, _build_filter_batch_prompt(interest, positions))
+    except OllamaError as exc:
+        log.warning("batch filter failed (%d postings): %s", len(positions), exc)
+        return {}, f"Filtering failed: {exc}"
+    return _parse_filter_batch(text, positions), None
+
+
+def _persist_error_marker(
+    db: Session, user: User, resume: Resume, interest: Interest, pos: Position, message: str
+) -> None:
+    """Mark a (position, interest) pair as terminally failed so it isn't re-billed
+    until ``--retry-failed`` clears it."""
+    db.add(MatchResult(
+        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+        passed_filter=False, match_score=0, win_probability=0,
+        reasoning=message[:1000], model=ERROR_MODEL,
+    ))
+    db.flush()
+
+
+def _persist_filter_reject(
+    db: Session, user: User, resume: Resume, interest: Interest, pos: Position,
+    reason: str, filter_model: str,
+) -> None:
+    """Record a cheap-filter 'not a match' so it ranks out of the report and the
+    pair lands in the ``already`` set (not re-screened next run)."""
+    db.add(MatchResult(
+        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+        passed_filter=False, match_score=0, win_probability=0,
+        reasoning=(reason or "Screened out as not a match.")[:1000],
+        strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model,
+    ))
+    db.flush()
 
 
 def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], list[str]]:
@@ -163,6 +287,9 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
         )
         db.add(pos)
         new_positions.append(pos)
+        # Guard against a board repeating an id within one scrape — a second
+        # row would violate uq_position_company_extid and abort the whole run.
+        existing[sp.external_id] = pos
     company.last_scraped_at = utcnow()
     db.flush()  # assign ids
     return new_positions, errors
@@ -232,11 +359,21 @@ def clear_failed_markers(db: Session, user_id: int | None = None) -> int:
     return db.execute(stmt).rowcount or 0
 
 
-def run_for_user(db: Session, user: User, client: OllamaClient | None = None) -> RunResult:
+def run_for_user(
+    db: Session,
+    user: User,
+    client: OllamaClient | None = None,
+    filter_client: OllamaClient | None = None,
+) -> RunResult:
     """Scrape all of a user's companies and score newly-seen / unscored positions
     against their active resume. Idempotent: positions already scored for the
-    active resume are skipped, so re-running the same day costs nothing extra."""
-    client = client or get_client()
+    active resume are skipped, so re-running the same day costs nothing extra.
+
+    Two-stage scoring: a cheap model triages relevance, then the good (scoring)
+    model — ``client`` if injected, else ``get_client()`` — only scores the
+    survivors. A per-run cap bounds how many postings are evaluated."""
+    score_client = client or get_client()
+    filter_client = filter_client or OllamaClient(model=settings.ollama_filter_model)
     res = RunResult()
 
     resume = db.scalar(
@@ -288,36 +425,74 @@ def run_for_user(db: Session, user: User, client: OllamaClient | None = None) ->
         )
     }
 
-    undescribed = 0
-    for pos in all_positions:
-        # Postings with no scraped description come from the generic HTML
-        # fallback (nav links etc.). Scoring them just bills the LLM to read
-        # "(no description scraped)" and yields meaningless numbers, so skip and
-        # nudge the user to configure a real ATS instead.
-        if not (pos.description or "").strip():
-            undescribed += 1
-            continue
-        # Score the position independently against EVERY interest whose pre-filter
-        # it passes, so each interest gets its own ranking. Skipping already-scored
-        # (position, interest) pairs keeps re-runs free, while a newly added or
-        # edited interest still re-evaluates previously-seen positions.
-        wrote_this_pos = False
-        for interest in interests:
+    # Newest first so the per-run cap spends its budget on the freshest postings.
+    all_positions.sort(key=lambda p: p.first_seen_at or utcnow(), reverse=True)
+    # Postings with no scraped description come from the generic HTML fallback (nav
+    # links etc.). Scoring them just bills the LLM to read "(no description scraped)"
+    # and yields meaningless numbers, so skip them and (for newly-seen ones) nudge
+    # the user to configure a real ATS instead.
+    described = [p for p in all_positions if (p.description or "").strip()]
+    undescribed = sum(
+        1 for p in all_positions if p.id in new_ids and not (p.description or "").strip()
+    )
+
+    # Per-run budget on how many postings we evaluate; bounds the cheap-filter and
+    # scoring work alike. 0 = unlimited.
+    budget = settings.score_max_per_run
+    batch_size = max(1, settings.score_filter_batch_size)
+    evaluated = 0
+    truncated = False
+    excluded = 0  # pairs dropped by an explicit exclude keyword (before any LLM call)
+    filter_model = settings.ollama_filter_model
+
+    # Evaluate each interest against the postings it hasn't been scored for. The
+    # cheap relevance filter is BATCHED (one call screens up to batch_size postings);
+    # only survivors get the expensive per-posting scoring.
+    for interest in interests:
+        if truncated:
+            break
+        candidates: list[Position] = []
+        for pos in described:
             if (pos.id, interest.id) in already:
                 continue
-            if not _passes_prefilter(pos, interest):
+            if not _passes_prefilter(pos, interest):  # explicit exclude keyword
+                excluded += 1
                 continue
-            match_id, error = _score_position(client, db, user, resume, interest, pos)
-            if match_id is not None:
-                res.scored += 1
-                res.match_ids.append(match_id)
-            if error is not None:
-                res.add_error(error)
-            # Either a real result or an error-marker row was written.
-            wrote_this_pos = True
-        # Commit per position so the write lock is released between LLM calls and
-        # partial progress (incl. error markers) survives a crash mid-run.
-        if wrote_this_pos:
+            candidates.append(pos)
+
+        idx = 0
+        while idx < len(candidates):
+            if budget and evaluated >= budget:
+                truncated = True
+                break
+            room = min(batch_size, budget - evaluated) if budget else batch_size
+            batch = candidates[idx : idx + room]
+            idx += len(batch)
+            evaluated += len(batch)
+
+            # Stage 1 — batched cheap relevance filter.
+            verdicts, ferr = _filter_batch(filter_client, interest, batch)
+            if ferr is not None:
+                res.add_error(ferr)
+                for pos in batch:  # marker so the batch isn't re-billed every run
+                    _persist_error_marker(db, user, resume, interest, pos, ferr)
+                db.commit()
+                continue
+            for pos in batch:
+                matches, reason = verdicts[pos.id]
+                if not matches:
+                    _persist_filter_reject(db, user, resume, interest, pos, reason, filter_model)
+                    res.filtered += 1
+                    continue
+                # Stage 2 — expensive resume<->role scoring for survivors only.
+                match_id, serr = _score_position(score_client, db, user, resume, interest, pos)
+                if match_id is not None:
+                    res.scored += 1
+                    res.match_ids.append(match_id)
+                if serr is not None:
+                    res.add_error(serr)
+            # Commit per batch so the write lock is released between calls and
+            # partial progress (incl. markers) survives a crash mid-run.
             db.commit()
 
     if undescribed:
@@ -325,6 +500,25 @@ def run_for_user(db: Session, user: User, client: OllamaClient | None = None) ->
             f"{undescribed} posting(s) had no scraped description and were skipped — "
             "set the company's ATS (greenhouse/lever/ashby) for full job text."
         )
+    if truncated:
+        res.add_error(
+            f"Reached this run's scoring cap ({budget}) — more postings remain "
+            "unscored. Click Run again to continue, or raise JOBSCOUT_SCORE_MAX_PER_RUN."
+        )
+    # Explain a "0 scored" run instead of leaving it silent (cf. the pre-filter was
+    # silent by design). Order matters: the relevance filter is the usual culprit.
+    if res.scored == 0 and not truncated:
+        if res.filtered:
+            res.add_error(
+                f"The relevance filter judged none of the {res.filtered} evaluated "
+                "posting(s) a match for your interests — broaden an interest "
+                "(titles/locations/notes) and run again."
+            )
+        elif excluded:
+            res.add_error(
+                f"{excluded} posting(s) were dropped by your interest's exclude "
+                "keywords before scoring. Loosen the exclude list if that's too broad."
+            )
     res.finalize_errors()
     return res
 
@@ -338,10 +532,13 @@ def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
     for uid in user_ids:
         try:
             with session_scope() as db:
+                from . import reporter
+
                 user = db.get(User, uid)
                 if retry_failed:
                     clear_failed_markers(db, user_id=uid)
                 summaries[uid] = run_for_user(db, user)
+                reporter.record_job_list_snapshot(db, user, summaries[uid])
         except Exception as exc:  # isolate per-user failures
             log.exception("daily run failed for user %s", uid)
             r = RunResult()

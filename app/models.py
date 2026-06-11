@@ -38,6 +38,26 @@ class User(Base):
     companies: Mapped[list[Company]] = relationship(back_populates="user", cascade="all, delete-orphan")
     interests: Mapped[list[Interest]] = relationship(back_populates="user", cascade="all, delete-orphan")
     matches: Mapped[list[MatchResult]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    job_list_snapshots: Mapped[list[JobListSnapshot]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class JobListSnapshot(Base):
+    """A saved dashboard job-list version captured after a scan finishes."""
+
+    __tablename__ = "job_list_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    new_positions: Mapped[int] = mapped_column(Integer, default=0)
+    scored: Mapped[int] = mapped_column(Integer, default=0)
+    filtered: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[str | None] = mapped_column(Text)
+    items_json: Mapped[str] = mapped_column(Text, default="[]")
+
+    user: Mapped[User] = relationship(back_populates="job_list_snapshots")
 
 
 class Resume(Base):
@@ -104,6 +124,12 @@ class Interest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     user: Mapped[User] = relationship(back_populates="interests")
+    # Deleting an interest removes the matches scored against it (mirrors the
+    # Resume semantics). Without this cascade, PRAGMA foreign_keys=ON turns
+    # every interest delete into an IntegrityError once it has match rows.
+    matches: Mapped[list[MatchResult]] = relationship(
+        back_populates="interest", cascade="all, delete-orphan"
+    )
 
 
 class Position(Base):
@@ -162,3 +188,4 @@ class MatchResult(Base):
     user: Mapped[User] = relationship(back_populates="matches")
     position: Mapped[Position] = relationship(back_populates="matches")
     resume: Mapped[Resume | None] = relationship(back_populates="matches")
+    interest: Mapped[Interest | None] = relationship(back_populates="matches")

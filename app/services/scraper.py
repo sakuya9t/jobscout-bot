@@ -19,9 +19,6 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 from ..config import settings
 from ..timeutil import to_naive_utc
 
-# Cap on any single response we'll buffer, to bound memory from a hostile or
-# misconfigured endpoint (we stream and abort past this).
-_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 # Redirects are not auto-followed; each hop is SSRF-validated up to this many.
 _MAX_REDIRECTS = 3
 
@@ -68,14 +65,11 @@ def _host_is_public(host: str) -> bool:
             addr = ipaddress.ip_address(info[4][0])
         except ValueError:
             return False
-        if (
-            addr.is_private
-            or addr.is_loopback
-            or addr.is_link_local
-            or addr.is_reserved
-            or addr.is_multicast
-            or addr.is_unspecified
-        ):
+        # ``is_global`` is the single source of truth for "publicly routable":
+        # it already excludes private, loopback, link-local (incl. the
+        # 169.254.169.254 metadata endpoint), reserved, multicast, unspecified,
+        # AND ranges the explicit flags miss — notably 100.64.0.0/10 (CGNAT).
+        if not addr.is_global:
             return False
     return True
 
@@ -109,6 +103,9 @@ def _is_transient(exc: BaseException) -> bool:
 def _fetch_bytes_once(url: str) -> bytes:
     """One SSRF-guarded GET attempt (retried on transient errors by the
     decorator). Validates the host on every redirect hop and caps body size."""
+    # Cap on any single response we'll buffer, to bound memory from a hostile or
+    # misconfigured endpoint (we stream and abort past this).
+    max_bytes = settings.scrape_max_response_mb * 1024 * 1024
     with _client() as c:
         for _ in range(_MAX_REDIRECTS + 1):
             _validate_url(url)
@@ -123,9 +120,9 @@ def _fetch_bytes_once(url: str) -> bytes:
                 total = 0
                 for chunk in resp.iter_bytes():
                     total += len(chunk)
-                    if total > _MAX_RESPONSE_BYTES:
+                    if total > max_bytes:
                         raise ScrapeError(
-                            f"response from {url} exceeds {_MAX_RESPONSE_BYTES} bytes"
+                            f"response from {url} exceeds {max_bytes} bytes"
                         )
                     chunks.append(chunk)
                 return b"".join(chunks)
@@ -160,6 +157,16 @@ def _strip_html(html: str | None) -> str | None:
     return BeautifulSoup(html, "lxml").get_text(" ", strip=True)
 
 
+def _http_url(value) -> str | None:
+    """Keep only http(s) URLs from third-party ATS JSON. The posting URL is
+    rendered as a link in the dashboard and Telegram, so a hostile/buggy board
+    must not be able to smuggle a javascript:/data: scheme into an href."""
+    if not value:
+        return None
+    url = str(value).strip()
+    return url if url.lower().startswith(("http://", "https://")) else None
+
+
 def _parse_ts(value) -> datetime | None:
     """Parse an ATS timestamp to naive UTC (the app-wide storage convention)."""
     if value is None:
@@ -187,7 +194,7 @@ def scrape_greenhouse(token: str) -> list[ScrapedPosition]:
                 title=job.get("title", "Untitled"),
                 location=(job.get("location") or {}).get("name"),
                 department=(job.get("departments") or [{}])[0].get("name"),
-                url=job.get("absolute_url"),
+                url=_http_url(job.get("absolute_url")),
                 description=_strip_html(job.get("content")),
                 posted_at=_parse_ts(job.get("updated_at") or job.get("first_published")),
             )
@@ -208,7 +215,7 @@ def scrape_lever(token: str) -> list[ScrapedPosition]:
                 location=cats.get("location"),
                 department=cats.get("team") or cats.get("department"),
                 employment_type=cats.get("commitment"),
-                url=job.get("hostedUrl"),
+                url=_http_url(job.get("hostedUrl")),
                 description=_strip_html(job.get("descriptionPlain") or job.get("description")),
                 posted_at=_parse_ts(job.get("createdAt")),
             )
@@ -228,11 +235,120 @@ def scrape_ashby(token: str) -> list[ScrapedPosition]:
                 location=job.get("location"),
                 department=job.get("department") or job.get("team"),
                 employment_type=job.get("employmentType"),
-                url=job.get("jobUrl"),
+                url=_http_url(job.get("jobUrl")),
                 description=_strip_html(job.get("descriptionHtml")),
                 posted_at=_parse_ts(job.get("publishedAt")),
             )
         )
+    return out
+
+
+# ── Google careers (no ATS API) ──────────────────────────────────────────────
+# Google's careers site is a JS SPA, but it *server-side-renders* each results
+# page's jobs into the HTML as an ``AF_initDataCallback({... data:[...]})`` blob,
+# and ``?page=N`` paginates over plain HTTP. So we parse that embedded JSON rather
+# than running a headless browser. The record layout is positional and could shift
+# if Google reworks the page, so every field access is defensive and best-effort.
+_GOOGLE_RESULTS_URL = "https://www.google.com/about/careers/applications/jobs/results/"
+_AF_INIT = re.compile(r"AF_initDataCallback\((\{.*?\})\);", re.S)
+_AF_DATA = re.compile(r"data:(\[.*\])\s*,\s*sideChannel", re.S)
+
+
+def _looks_like_google_job(rec) -> bool:
+    # A job record starts with a long numeric id and a title string.
+    return (
+        isinstance(rec, list)
+        and len(rec) >= 3
+        and isinstance(rec[0], str)
+        and rec[0].isdigit()
+        and len(rec[0]) >= 15
+        and isinstance(rec[1], str)
+    )
+
+
+def _find_google_jobs(node) -> list | None:
+    """Depth-first search for the list of job records inside a parsed data blob."""
+    if isinstance(node, list):
+        if node and all(_looks_like_google_job(r) for r in node):
+            return node
+        for el in node:
+            found = _find_google_jobs(el)
+            if found:
+                return found
+    return None
+
+
+def _google_records(html: str) -> list:
+    """Pull the job-record list out of a results page's embedded JSON."""
+    for blob in _AF_INIT.findall(html):
+        m = _AF_DATA.search(blob)
+        if not m:
+            continue
+        try:
+            data = _json.loads(m.group(1))
+        except _json.JSONDecodeError:
+            continue
+        found = _find_google_jobs(data)
+        if found:
+            return found
+    return []
+
+
+def _google_location(rec) -> str | None:
+    """Locations live in a ``[["City, ST, USA", [...], ...], ...]`` sub-array;
+    find it by shape so we don't depend on its exact index."""
+    for field in rec[3:]:
+        if (
+            isinstance(field, list)
+            and field
+            and isinstance(field[0], list)
+            and field[0]
+            and isinstance(field[0][0], str)
+        ):
+            return field[0][0]
+    return None
+
+
+def _google_position(rec) -> ScrapedPosition:
+    job_id = rec[0]
+    # Description = "about the job" + "minimum qualifications", each a [None, html]
+    # pair; concatenate whatever HTML strings the record carries.
+    desc_parts = [
+        f[1]
+        for f in rec[2:]
+        if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str) and "<" in f[1]
+    ]
+    return ScrapedPosition(
+        external_id=job_id,
+        title=(rec[1] or "Untitled")[:300],
+        location=_google_location(rec),
+        url=_http_url(rec[2] if len(rec) > 2 else None) or f"{_GOOGLE_RESULTS_URL}{job_id}",
+        description=_strip_html(" ".join(desc_parts)) if desc_parts else None,
+    )
+
+
+def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPosition]:
+    base = careers_url or _GOOGLE_RESULTS_URL
+    sep = "&" if urlparse(base).query else "?"
+    out: list[ScrapedPosition] = []
+    seen: set[str] = set()
+    for page in range(1, max_pages + 1):
+        records = _google_records(_fetch_text(f"{base}{sep}page={page}"))
+        if not records:
+            break  # past the last page (or layout changed)
+        added = 0
+        for rec in records:
+            try:
+                pos = _google_position(rec)
+            except (IndexError, TypeError):
+                continue  # skip a malformed record rather than aborting the run
+            if pos.external_id in seen:
+                continue
+            seen.add(pos.external_id)
+            out.append(pos)
+            added += 1
+        if added == 0:
+            break  # a full page of already-seen ids: no progress, stop paging
     return out
 
 
@@ -289,11 +405,16 @@ def _infer_ats(careers_url: str | None) -> tuple[str, str | None]:
     path = urlparse(careers_url).path.strip("/")
     parts = [p for p in path.split("/") if p]
     if "greenhouse.io" in host and parts:
-        return "greenhouse", parts[-1]
+        # parts[0] is the board token; a pasted *job* URL
+        # (boards.greenhouse.io/<token>/jobs/<id>) must still resolve to <token>,
+        # not the trailing job id.
+        return "greenhouse", parts[0]
     if "lever.co" in host and parts:
         return "lever", parts[0]
     if "ashbyhq.com" in host and parts:
         return "ashby", parts[0]
+    if "google.com" in host and "careers" in path:
+        return "google", None
     return "html", None
 
 
@@ -319,6 +440,8 @@ def scrape_company(company) -> list[ScrapedPosition]:
         results = scrape_lever(token)
     elif ats_type == "ashby":
         results = scrape_ashby(token)
+    elif ats_type == "google":
+        results = scrape_google(company.careers_url, settings.scrape_google_max_pages)
     elif ats_type == "html":
         if not company.careers_url:
             raise ScrapeError(f"{company.name}: html scrape needs careers_url")
@@ -326,4 +449,8 @@ def scrape_company(company) -> list[ScrapedPosition]:
     else:
         raise ScrapeError(f"{company.name}: unknown ats_type {ats_type!r}")
 
-    return results[: settings.scrape_max_positions_per_company]
+    # No global cap: the ATS adapters return a company's full board (large boards
+    # have 200+ postings, and external_id dedup means a dropped one is never seen
+    # again). The per-company limit only bounds the noisy HTML fallback, which
+    # applies it itself via the ``max_positions`` argument to ``scrape_html``.
+    return results

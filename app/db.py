@@ -26,6 +26,10 @@ if _is_sqlite:
         cur = dbapi_conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA busy_timeout=15000")
+        # SQLite ignores FK constraints unless this is set per-connection. ORM
+        # cascades cover today's deletes, but this stops any raw-SQL delete from
+        # silently orphaning child rows.
+        cur.execute("PRAGMA foreign_keys=ON")
         cur.close()
 
 

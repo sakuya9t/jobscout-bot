@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
 from ..db import get_db
-from ..models import Interest, User
+from ..models import Interest, MatchResult, User
 from ..schemas import InterestIn, InterestOut, InterestUpdate
 
 router = APIRouter(prefix="/api/interests", tags=["interests"])
+
+# Fields that change *what the LLM matches against*; editing any of them must
+# invalidate this interest's existing matches so the next run re-evaluates.
+_SCORING_FIELDS = {"title_keywords", "locations", "seniority", "employment_type", "exclude_keywords", "notes"}
 
 
 def _owned(db: Session, user: User, interest_id: int) -> Interest:
@@ -42,8 +46,18 @@ def update_interest(
     db: Session = Depends(get_db),
 ):
     interest = _owned(db, user, interest_id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(interest, field, value)
+    if _SCORING_FIELDS & changes.keys():
+        # Matching criteria changed: drop this interest's matches (incl. cheap-filter
+        # rejections) so the next run re-screens every posting against the new
+        # criteria instead of skipping them as "already scored".
+        db.execute(
+            delete(MatchResult).where(
+                MatchResult.user_id == user.id, MatchResult.interest_id == interest_id
+            )
+        )
     db.commit()
     db.refresh(interest)
     return interest

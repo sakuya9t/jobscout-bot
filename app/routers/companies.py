@@ -3,14 +3,23 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
+from ..company_presets import PRESETS
 from ..db import get_db
 from ..models import Company, User
-from ..schemas import CompanyIn, CompanyOut, CompanyUpdate
+from ..schemas import CompanyIn, CompanyOut, CompanyPresetOut, CompanyUpdate
 
 router = APIRouter(prefix="/api/companies", tags=["companies"])
+
+
+@router.get("/presets", response_model=list[CompanyPresetOut])
+def list_presets(user: User = Depends(get_current_user)):
+    """Built-in popular companies the dashboard offers as one-click form fills.
+    Static data; auth-gated only so nothing is exposed before login."""
+    return PRESETS
 
 
 def _owned(db: Session, user: User, company_id: int) -> Company:
@@ -31,7 +40,13 @@ def add_company(payload: CompanyIn, user: User = Depends(get_current_user), db: 
         raise HTTPException(status.HTTP_409_CONFLICT, "Company already on your list")
     company = Company(user_id=user.id, **payload.model_dump())
     db.add(company)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a concurrent-insert race past the pre-check; the unique
+        # (user_id, name) constraint is the source of truth (cf. register).
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Company already on your list")
     db.refresh(company)
     return company
 

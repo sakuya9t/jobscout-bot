@@ -47,7 +47,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     new = sum(s.new_positions for s in summaries.values())
     scored = sum(s.scored for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
-    telegram_bot.send_daily_reports()
+    telegram_bot.send_daily_reports({uid: s.errors for uid, s in summaries.items() if s.errors})
     print(f"Users: {len(summaries)} | new positions: {new} | scored: {scored} | warnings: {len(errors)}")
     for e in errors:
         print(f"  - {e}")
@@ -90,7 +90,9 @@ def cmd_token(args: argparse.Namespace) -> int:
 
     init_db()
     with session_scope() as db:
-        user = db.scalar(select(User).where(User.email == args.email))
+        # Emails are stored lowercased (see the register route) — normalize the
+        # lookup the same way so `jobscout token Foo@Bar.com` still finds the user.
+        user = db.scalar(select(User).where(User.email == args.email.strip().lower()))
         if not user:
             print(f"No user with email {args.email}", file=sys.stderr)
             return 1

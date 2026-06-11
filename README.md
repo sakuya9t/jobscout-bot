@@ -17,10 +17,21 @@ external agents (openclaw / hermes) can drive.
    ATS are auto-detected from their careers URL.
 2. **Dedup** — a posting is "new" when its `(company, external_id)` hasn't been
    seen before. Re-runs are idempotent and don't re-bill the LLM.
-3. **Pre-filter** — cheap keyword/location gate to avoid wasting LLM calls.
-4. **Score** — Ollama structured output: `matches_requirements`, `match_score`
-   (0–100), `win_probability` (0–100), `reasoning`, `strengths[]`, `gaps[]`.
-5. **Report** — ranked matches above each interest's threshold.
+3. **Exclude gate** — the only cheap text filter left is your explicit *exclude*
+   keywords; positive relevance is the LLM's job, not substring matching.
+4. **Relevance filter (cheap model)** — `JOBSCOUT_OLLAMA_FILTER_MODEL` decides,
+   semantically, whether a posting matches the interest, so the expensive model
+   only sees plausible fits. Filtering is **batched** — one call screens
+   `JOBSCOUT_SCORE_FILTER_BATCH_SIZE` postings — and a per-run cap
+   (`JOBSCOUT_SCORE_MAX_PER_RUN`) bounds cost/latency; the rest score next run.
+   Results are cached per resume *version*, so nothing is re-scored until the
+   resume content actually changes.
+5. **Score (main model)** — `JOBSCOUT_OLLAMA_MODEL` structured output:
+   `matches_requirements`, `match_score` (0–100), `win_probability` (0–100),
+   `reasoning`, `strengths[]`, `gaps[]`.
+6. **Report** — ranked by match score. The web dashboard always shows the top
+   matches (at least a few, even below threshold); the Telegram push keeps only
+   matches above each interest's threshold.
 
 ## Setup
 ```bash
@@ -34,9 +45,10 @@ cp .env.example .env          # then edit: set JOBSCOUT_OLLAMA_API_KEY etc.
 Configure Ollama in `.env`:
 - **Cloud:** `JOBSCOUT_OLLAMA_BASE_URL=https://ollama.com`,
   `JOBSCOUT_OLLAMA_API_KEY=<key from ollama.com>`,
-  `JOBSCOUT_OLLAMA_MODEL=gpt-oss:120b-cloud`.
+  `JOBSCOUT_OLLAMA_MODEL=gpt-oss:120b-cloud` (scoring),
+  `JOBSCOUT_OLLAMA_FILTER_MODEL=deepseek-v4-flash` (cheap relevance filter).
 - **Local:** `JOBSCOUT_OLLAMA_BASE_URL=http://localhost:11434`, key blank,
-  model e.g. `llama3.1`.
+  set both models to one you've pulled, e.g. `llama3.1`.
 
 ## Run
 ```bash

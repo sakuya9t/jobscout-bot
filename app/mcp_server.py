@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy.exc import IntegrityError
 
 from .auth import authenticate_token
 from .db import init_db, session_scope
@@ -62,7 +63,12 @@ def add_company(
         user = _current_user(db)
         company = Company(user_id=user.id, **payload.model_dump())
         db.add(company)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            # Same unique (user_id, name) constraint the HTTP router returns 409 for.
+            db.rollback()
+            raise ValueError(f"Company {name!r} is already on your list") from exc
         return {"id": company.id, "name": company.name}
 
 
@@ -96,6 +102,7 @@ def add_interest(
     title_keywords: str | None = None,
     locations: str | None = None,
     seniority: str | None = None,
+    employment_type: str | None = None,
     exclude_keywords: str | None = None,
     notes: str | None = None,
     min_score: int = 70,
@@ -104,8 +111,8 @@ def add_interest(
     are comma-separated; notes is free text used to steer the LLM match decision."""
     payload = InterestIn(
         label=label, title_keywords=title_keywords, locations=locations,
-        seniority=seniority, exclude_keywords=exclude_keywords, notes=notes,
-        min_score=min_score,
+        seniority=seniority, employment_type=employment_type,
+        exclude_keywords=exclude_keywords, notes=notes, min_score=min_score,
     )
     with session_scope() as db:
         user = _current_user(db)
@@ -130,6 +137,7 @@ def run_daily_scan() -> dict:
     with session_scope() as db:
         user = _current_user(db)
         result = matcher.run_for_user(db, user)
+        reporter.record_job_list_snapshot(db, user, result)
         db.flush()
         top = reporter.build_report(db, user, limit=10)
         return {

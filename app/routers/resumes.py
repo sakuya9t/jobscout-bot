@@ -1,5 +1,6 @@
-"""Resume upload / list / activate / delete. The most-recent upload becomes the
-active resume used for scoring; the original file is also kept on disk."""
+"""Resume upload / list / delete. One resume per account: a new upload replaces
+the previous one (and its scored matches) and is the resume used for scoring; the
+original file is also kept on disk."""
 from __future__ import annotations
 
 import os
@@ -38,7 +39,9 @@ async def upload_resume(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Resume:
-    data = await file.read()
+    # Bounded read: ask for one byte past the cap instead of buffering an
+    # arbitrarily large upload into memory just to reject it afterwards.
+    data = await file.read(MAX_RESUME_BYTES + 1)
     if len(data) > MAX_RESUME_BYTES:
         raise HTTPException(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -50,9 +53,18 @@ async def upload_resume(
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-    # New upload becomes the sole active resume.
-    for r in db.scalars(select(Resume).where(Resume.user_id == user.id, Resume.is_active == True)):  # noqa: E712
-        r.is_active = False
+    # One resume per account: this upload replaces any existing resume. Capture the
+    # old rows/files now; the new resume gets a fresh id (so a distinct on-disk path)
+    # and the old matches cascade away on delete, forcing a re-score on the new resume.
+    old_resumes = list(db.scalars(select(Resume).where(Resume.user_id == user.id)))
+
+    # Cache by resume *version* (content): re-uploading identical text is a no-op so
+    # the matches already scored against it survive instead of being recomputed.
+    for r in old_resumes:
+        if r.content_text == text:
+            return r
+
+    old_paths = [_stored_path(user.id, r) for r in old_resumes]
 
     resume = Resume(user_id=user.id, filename=safe_name, content_text=text)
     db.add(resume)
@@ -70,8 +82,13 @@ async def upload_resume(
             status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to store the uploaded resume"
         ) from exc
 
+    for r in old_resumes:
+        db.delete(r)  # cascades to that resume's MatchResults
     db.commit()
     db.refresh(resume)
+    # Delete old files only now that the replacement is durably committed.
+    for path in old_paths:
+        path.unlink(missing_ok=True)
     return resume
 
 
@@ -86,17 +103,6 @@ def _owned(db: Session, user: User, resume_id: int) -> Resume:
     resume = db.get(Resume, resume_id)
     if not resume or resume.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Resume not found")
-    return resume
-
-
-@router.post("/{resume_id}/activate", response_model=ResumeOut)
-def activate(resume_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    resume = _owned(db, user, resume_id)
-    for r in db.scalars(select(Resume).where(Resume.user_id == user.id, Resume.is_active == True)):  # noqa: E712
-        r.is_active = False
-    resume.is_active = True
-    db.commit()
-    db.refresh(resume)
     return resume
 
 

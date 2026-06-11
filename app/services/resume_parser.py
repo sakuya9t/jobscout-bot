@@ -32,16 +32,27 @@ def _from_docx(data: bytes) -> str:
 
 
 def extract_text(filename: str, data: bytes) -> str:
-    """Dispatch on extension. Raises ValueError for unsupported types or empty text."""
+    """Dispatch on extension. Raises ValueError for unsupported types, empty
+    text, or an unreadable (corrupt/encrypted) file — so the upload route can
+    return 422 instead of a 500. pypdf (PdfReadError) and python-docx
+    (BadZipFile/PackageNotFoundError) raise their own exception types on
+    malformed input; normalize them all to ValueError here."""
     name = (filename or "").lower()
-    if name.endswith(".pdf"):
-        text = _from_pdf(data)
-    elif name.endswith(".docx"):
-        text = _from_docx(data)
-    elif name.endswith((".txt", ".md", ".markdown")):
-        text = data.decode("utf-8", errors="replace")
-    else:
-        raise ValueError(f"Unsupported resume type: {filename!r} (use pdf, docx, txt, md)")
+    try:
+        if name.endswith(".pdf"):
+            text = _from_pdf(data)
+        elif name.endswith(".docx"):
+            text = _from_docx(data)
+        elif name.endswith((".txt", ".md", ".markdown")):
+            text = data.decode("utf-8", errors="replace")
+        else:
+            raise ValueError(f"Unsupported resume type: {filename!r} (use pdf, docx, txt, md)")
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — any parser failure means a bad file
+        raise ValueError(
+            f"Could not read {filename!r}; the file may be corrupt or password-protected."
+        ) from exc
 
     text = _clean(text)
     if not text:

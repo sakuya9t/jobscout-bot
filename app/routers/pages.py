@@ -17,12 +17,12 @@ templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent
 
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "mode": "login"})
+    return templates.TemplateResponse(request, "login.html", {"mode": "login"})
 
 
 @router.get("/register", response_class=HTMLResponse)
 def register_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "mode": "register"})
+    return templates.TemplateResponse(request, "login.html", {"mode": "register"})
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -30,6 +30,7 @@ def dashboard(request: Request, user: User | None = Depends(get_optional_user)):
     if user is None:
         return RedirectResponse("/login")
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
-        {"request": request, "user": user, "link_code": user.telegram_link_code},
+        {"user": user, "link_code": user.telegram_link_code},
     )

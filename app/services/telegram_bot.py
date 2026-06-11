@@ -29,18 +29,61 @@ def _api(method: str) -> str:
     return f"https://api.telegram.org/bot{settings.telegram_bot_token}/{method}"
 
 
+# Telegram rejects any sendMessage body over 4096 chars with a 400, which would
+# drop the whole report. Split on line boundaries to stay under the limit.
+_TELEGRAM_LIMIT = 4096
+
+
+def _split_for_telegram(text: str, limit: int = _TELEGRAM_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        # A single line longer than the limit gets hard-split (rare; only the
+        # reasoning text, which carries no HTML tags to break).
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _response_ok(resp: httpx.Response) -> bool:
+    try:
+        return resp.status_code == 200 and bool(resp.json().get("ok"))
+    except Exception:  # noqa: BLE001 — a non-JSON/garbage body is "not ok"
+        return False
+
+
 def send_message(chat_id: str, text: str) -> None:
     if not _enabled():
         return
-    try:
-        httpx.post(
-            _api("sendMessage"),
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=20,
-        )
-    except httpx.HTTPError as exc:
-        log.warning("telegram send failed: %s", exc)
+    for chunk in _split_for_telegram(text):
+        try:
+            resp = httpx.post(
+                _api("sendMessage"),
+                json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
+                timeout=20,
+            )
+        except httpx.HTTPError as exc:
+            log.warning("telegram send failed: %s", exc)
+            return
+        if not _response_ok(resp):
+            # e.g. 400 "message is too long", 403 bot blocked — previously these
+            # were silently dropped, so a user just never got their report.
+            log.warning("telegram sendMessage rejected (HTTP %s): %s",
+                        resp.status_code, resp.text[:200])
+            return
 
 
 def _link_account(link_code: str, chat_id: str) -> str:
@@ -49,6 +92,9 @@ def _link_account(link_code: str, chat_id: str) -> str:
         if not user:
             return "That link code isn't valid. Copy it from your JobScout dashboard."
         user.telegram_chat_id = str(chat_id)
+        # One-time: burn the code on use so a leaked code can't be replayed to
+        # re-bind someone else's chat. The dashboard can mint a fresh one.
+        user.telegram_link_code = None
         return f"✅ Linked to {user.email}. You'll get your daily JobScout report here."
 
 
@@ -88,15 +134,21 @@ def poll_updates(offset: int | None = None) -> int | None:
     return next_offset
 
 
-def send_daily_reports() -> None:
-    """Push today's report to every user who has linked Telegram."""
+def send_daily_reports(error_by_user: dict[int, list[str]] | None = None) -> None:
+    """Push today's report to every user who has linked Telegram. ``error_by_user``
+    maps user id → that run's warnings so they're surfaced alongside the matches
+    instead of leaving a broken account staring at an empty report."""
     if not _enabled():
         return
     from ..timeutil import utcnow
 
+    error_by_user = error_by_user or {}
     today_utc = utcnow().date()
     with session_scope() as db:
         users = list(db.scalars(select(User).where(User.telegram_chat_id.isnot(None))))
         for user in users:
             report = build_report(db, user, on_date=today_utc)
-            send_message(user.telegram_chat_id, report_to_telegram(report))
+            send_message(
+                user.telegram_chat_id,
+                report_to_telegram(report, error_by_user.get(user.id)),
+            )

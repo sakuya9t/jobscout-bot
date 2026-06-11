@@ -25,7 +25,19 @@ def test_resume_parser_rejects_unknown():
         extract_text("cv.rtf", b"whatever")
 
 
-def test_prefilter_excludes_and_titles():
+def test_resume_parser_rejects_corrupt_pdf():
+    """A malformed PDF must surface as ValueError (→ HTTP 422), not a raw
+    PdfReadError bubbling up as a 500."""
+    from app.services.resume_parser import extract_text
+
+    with pytest.raises(ValueError):
+        extract_text("cv.pdf", b"definitely not a real pdf")
+
+
+def test_prefilter_is_excludes_only():
+    """The cheap pre-filter is negative-only: it drops a posting solely on an
+    explicit exclude keyword. Title/location no longer gate (the LLM judges those),
+    so a non-excluded posting always passes regardless of title/location match."""
     from app.models import Interest, Position
     from app.services.matcher import _passes_prefilter
 
@@ -34,21 +46,65 @@ def test_prefilter_excludes_and_titles():
         locations="remote, berlin", exclude_keywords="manager",
     )
     assert _passes_prefilter(Position(title="Senior Backend Engineer", location="Remote (EU)"), interest)
-    assert not _passes_prefilter(Position(title="Engineering Manager", location="Remote"), interest)
-    assert not _passes_prefilter(Position(title="Backend Engineer", location="New York"), interest)
-    assert not _passes_prefilter(Position(title="Sales Lead", location="Remote"), interest)
-    # No location data → don't drop on the location gate; defer to the LLM.
+    assert not _passes_prefilter(Position(title="Engineering Manager", location="Remote"), interest)  # excluded
+    # Title/location no longer gate — these reach the LLM instead of being dropped.
+    assert _passes_prefilter(Position(title="Backend Engineer", location="New York"), interest)
+    assert _passes_prefilter(Position(title="Sales Lead", location="Remote"), interest)
     assert _passes_prefilter(Position(title="Backend Engineer", location=None), interest)
+    # With no exclude keywords, everything passes.
+    assert _passes_prefilter(Position(title="Anything"), Interest(label="x"))
+
+
+def test_parse_filter_batch():
+    """The batched cheap-filter reply is parsed robustly: JSON array first, then
+    'n: yes/no' lines, then a lone global YES/NO, and fail-OPEN (keep) otherwise."""
+    from types import SimpleNamespace
+
+    from app.services.matcher import _parse_filter_batch
+
+    pos = [SimpleNamespace(id=10), SimpleNamespace(id=20), SimpleNamespace(id=30)]
+
+    v = _parse_filter_batch('[{"id":1,"match":true},{"id":2,"match":false},{"id":3,"match":true}]', pos)
+    assert v[10][0] is True and v[20][0] is False and v[30][0] is True
+    # Wrapped in prose / code fences still parses.
+    assert _parse_filter_batch('sure:\n```json\n[{"id":1,"match":false}]\n```', pos)[10][0] is False
+    # Line fallback.
+    v = _parse_filter_batch("1: yes\n2: no\n3: yes", pos)
+    assert v[10][0] is True and v[20][0] is False and v[30][0] is True
+    # A lone global YES/NO applies to all.
+    assert all(m is False for m, _ in _parse_filter_batch("NO", pos).values())
+    # Unparseable → fail open (keep everything for the stricter scoring step).
+    assert all(m is True for m, _ in _parse_filter_batch("???", pos).values())
+    # Partial JSON → named id honored, the rest fail open.
+    v = _parse_filter_batch('[{"id":2,"match":false}]', pos)
+    assert v[20][0] is False and v[10][0] is True and v[30][0] is True
 
 
 def test_infer_ats():
     from app.services.scraper import _infer_ats
 
     assert _infer_ats("https://boards.greenhouse.io/anthropic") == ("greenhouse", "anthropic")
+    # A pasted *job* URL must still resolve to the board token, not the job id.
+    assert _infer_ats("https://boards.greenhouse.io/anthropic/jobs/123") == ("greenhouse", "anthropic")
     assert _infer_ats("https://jobs.lever.co/openai") == ("lever", "openai")
     assert _infer_ats("https://jobs.ashbyhq.com/openai") == ("ashby", "openai")
+    # Google careers has no ATS token; it routes to the dedicated "google" adapter.
+    assert _infer_ats("https://www.google.com/about/careers/applications/jobs/results/") == ("google", None)
     assert _infer_ats("https://example.com/careers") == ("html", None)
     assert _infer_ats(None) == ("html", None)
+
+
+def test_scrape_company_does_not_cap_ats_results(monkeypatch):
+    """ATS adapters return the full board; only the noisy HTML fallback is capped."""
+    import app.services.scraper as scraper
+
+    big = [scraper.ScrapedPosition(external_id=str(i), title=f"Role {i}") for i in range(60)]
+    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: list(big))
+    company = SimpleNamespace(
+        name="Acme", ats_type="greenhouse", ats_token="acme", careers_url=None
+    )
+    out = scraper.scrape_company(company)
+    assert len(out) == 60  # default per-company cap is 40 — must NOT truncate ATS results
 
 
 def test_greenhouse_parse_offline(monkeypatch):
@@ -62,18 +118,22 @@ def test_greenhouse_parse_offline(monkeypatch):
             {"id": 123, "title": "Backend Engineer",
              "location": {"name": "Remote"}, "departments": [{"name": "Eng"}],
              "absolute_url": "https://x/123", "content": "<p>Build <b>things</b></p>",
-             "updated_at": "2026-01-02T00:00:00Z"}
+             "updated_at": "2026-01-02T00:00:00Z"},
+            # A hostile/buggy board must not smuggle a javascript: scheme into
+            # the stored url (it ends up inside an href in dashboard/Telegram).
+            {"id": 124, "title": "Evil Role", "absolute_url": "javascript:alert(1)"},
         ]
     }
 
     # Stub the SSRF-guarded byte fetch so no DNS/network is touched.
     monkeypatch.setattr(scraper, "_fetch_bytes", lambda url: json.dumps(payload).encode())
     out = scraper.scrape_greenhouse("acme")
-    assert len(out) == 1
+    assert len(out) == 2
     p = out[0]
     assert p.external_id == "123" and p.title == "Backend Engineer"
     assert p.location == "Remote" and p.url == "https://x/123"
     assert p.description == "Build things"  # html stripped
+    assert out[1].url is None  # non-http(s) scheme dropped
 
 
 def test_ssrf_blocks_private_and_nonhttp(monkeypatch):

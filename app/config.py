@@ -34,7 +34,12 @@ class Settings(BaseSettings):
     # Ollama Cloud
     ollama_base_url: str = "https://ollama.com"
     ollama_api_key: str = ""
-    ollama_model: str = "gpt-oss:120b-cloud"
+    # Two models: a cheap one triages relevance (does this posting match the
+    # interest?), and the main one does the expensive resume<->role scoring only
+    # for postings that pass. Keeping a strong cheap default here means matching
+    # doesn't silently inherit whatever the user set as the scoring model.
+    ollama_model: str = "gpt-oss:120b-cloud"  # scoring model (the "good" one)
+    ollama_filter_model: str = "deepseek-v4-flash"  # cheap relevance filter
     ollama_timeout: int = 120
 
     # Telegram
@@ -52,6 +57,23 @@ class Settings(BaseSettings):
     use_browser: bool = False
     scrape_user_agent: str = "Mozilla/5.0 (compatible; JobScoutBot/0.1)"
     scrape_max_positions_per_company: int = 40
+    # Per-response buffer cap (bounds memory from a hostile/misconfigured endpoint).
+    # Large popular boards are legitimately big — a full Greenhouse board with
+    # descriptions (~5MB) or a big Ashby board (~11MB) — so this must clear them.
+    scrape_max_response_mb: int = 32
+    # Google careers has no ATS API; we page its server-rendered results (20/page).
+    # Cap pages so a run pulls a bounded slice instead of all ~thousands of roles.
+    scrape_google_max_pages: int = 20
+
+    # Scoring
+    # The LLM (not a keyword filter) decides relevance, so a run could otherwise
+    # score every scraped posting. Cap LLM calls per run to keep "Run scan now"
+    # responsive and costs bounded; remaining postings score on the next run.
+    # 0 = unlimited.
+    score_max_per_run: int = 50
+    # Stage-1 relevance filtering is batched: one cheap call screens this many
+    # postings at once (returns a verdict per posting), cutting filter calls ~Nx.
+    score_filter_batch_size: int = 10
 
     @property
     def resume_dir(self) -> Path:

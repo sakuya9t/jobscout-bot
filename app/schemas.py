@@ -21,8 +21,10 @@ class MatchVerdict(BaseModel):
     match_score: int = Field(ge=0, le=100)  # resume <-> role fit
     win_probability: int = Field(ge=0, le=100)  # realistic chance of an offer
     reasoning: str
-    strengths: list[str]
-    gaps: list[str]
+    # Supplementary lists: some capable models honor the schema's core fields but
+    # omit these arrays, so default them empty rather than failing the whole score.
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -52,6 +54,17 @@ class ResumeOut(_ORM):
 
 
 # ── Company ──────────────────────────────────────────────────────────────────
+class CompanyPresetOut(BaseModel):
+    """A built-in popular-company option the dashboard offers as a one-click fill."""
+
+    key: str
+    name: str
+    careers_url: str
+    ats_type: str
+    ats_token: str | None = None
+    location_hint: str | None = None
+
+
 class CompanyIn(BaseModel):
     name: str
     careers_url: str | None = None
@@ -133,6 +146,30 @@ class MatchOut(BaseModel):
     reasoning: str | None
     strengths: list[str]
     gaps: list[str]
+    # True when this row is below the user's score threshold but shown anyway to
+    # keep the dashboard non-empty (the daily Telegram report omits these).
+    below_threshold: bool = False
+
+
+class JobListRunOut(BaseModel):
+    id: int
+    created_at: datetime
+    new_positions: int
+    scored: int
+    filtered: int
+    total: int
+    has_errors: bool = False
+
+
+class JobListOut(BaseModel):
+    id: int | None = None
+    created_at: datetime | None = None
+    new_positions: int = 0
+    scored: int = 0
+    filtered: int = 0
+    errors: list[str] = Field(default_factory=list)
+    total: int = 0
+    items: list[MatchOut] = Field(default_factory=list)
 
 
 class RunSummary(BaseModel):

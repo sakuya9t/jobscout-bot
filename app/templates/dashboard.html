@@ -1,90 +1,296 @@
 {% extends "base.html" %}
 {% block title %}Dashboard · JobScout{% endblock %}
 {% block body %}
-<header>
-  <span class="brand">JobScout</span>
-  <div class="flex">
-    <span class="muted">{{ user.email }}</span>
-    <button class="ghost" onclick="logout()">Log out</button>
-  </div>
-</header>
-<main>
-  <!-- Resume -->
-  <div class="card">
-    <h2>1 · Resume</h2>
-    <p class="muted">Upload your resume (PDF, docx, txt, md). The newest upload is used for scoring.</p>
-    <div class="flex">
-      <input id="resumeFile" type="file" accept=".pdf,.docx,.txt,.md" />
-      <button onclick="uploadResume()">Upload</button>
-    </div>
-    <div id="resumes"></div>
-  </div>
+<style>
+  :root {
+    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
+    --muted:#68746e; --line:#d8e0dc; --sidebar:#10221d; --sidebar-ink:#f6fbf8;
+    --accent:#0f766e; --accent-ink:#f5fffd; --amber:#b76b00; --danger:#b42318;
+    --good:#157347;
+  }
+  body { background:var(--page); color:var(--ink); }
+  a { color:var(--accent); }
+  header { display:none; }
+  button { background:var(--accent); color:var(--accent-ink); border-radius:8px; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  input, textarea, select {
+    background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
+  }
+  label { color:var(--muted); }
+  main.dashboard {
+    max-width:none; min-height:100vh; margin:0; padding:0;
+    display:grid; grid-template-columns:280px minmax(0, 1fr);
+  }
+  .sidebar {
+    background:var(--sidebar); color:var(--sidebar-ink); min-height:100vh;
+    padding:22px 18px; display:flex; flex-direction:column; gap:22px;
+  }
+  .sidebar-top { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+  .brand-mark { font-size:22px; font-weight:800; letter-spacing:.01em; }
+  .account { color:#b9c8c1; font-size:13px; word-break:break-word; }
+  .nav-stack { display:grid; gap:6px; }
+  .nav-button {
+    width:100%; text-align:left; background:transparent; color:#dce8e3;
+    border:1px solid transparent; padding:10px 11px; font-weight:650;
+  }
+  .nav-button:hover, .nav-button[aria-current="page"] {
+    background:#1d3932; border-color:#2a5148; color:#ffffff;
+  }
+  .logout { margin-top:auto; color:#f7fbf9; border-color:#31554d; }
+  .workspace { padding:26px clamp(18px, 3vw, 42px); min-width:0; }
+  .view-header {
+    display:flex; align-items:flex-start; justify-content:space-between; gap:18px;
+    border-bottom:1px solid var(--line); padding-bottom:18px; margin-bottom:18px;
+  }
+  h1 { margin:0; font-size:24px; line-height:1.2; }
+  h2 { margin:0 0 12px; font-size:17px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .panel { display:none; }
+  .panel.active { display:block; }
+  .surface {
+    background:var(--surface); border:1px solid var(--line); border-radius:8px;
+    padding:18px; margin-bottom:16px;
+  }
+  .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .toolbar .grow { flex:1 1 220px; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .list-item, .job-row {
+    border-top:1px solid var(--line); padding:14px 0;
+  }
+  .list-item:first-child, .job-row:first-child { border-top:0; }
+  .job-row { display:grid; gap:9px; }
+  .job-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+  .job-title { font-weight:750; font-size:16px; }
+  .job-meta { color:var(--muted); font-size:13px; }
+  .score { color:var(--good); font-weight:800; white-space:nowrap; }
+  .pill {
+    display:inline-flex; align-items:center; min-height:22px; padding:2px 8px;
+    border-radius:999px; font-size:12px; background:#eef7f5; color:var(--accent);
+  }
+  .pill.warn { background:#fff4df; color:var(--amber); }
+  .empty {
+    border:1px dashed var(--line); border-radius:8px; padding:20px; color:var(--muted);
+    background:#fbfdfc;
+  }
+  .warning-box {
+    border:1px solid #f0cf9b; background:#fff8eb; color:#6b4300;
+    border-radius:8px; padding:12px 14px; margin:12px 0;
+  }
+  .stat-line { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .stat {
+    display:inline-flex; padding:5px 9px; border-radius:8px; background:var(--surface-soft);
+    color:#2a3a34; font-size:13px;
+  }
+  .flex { display:flex; gap:8px; align-items:center; }
+  ul.tight { margin:6px 0; padding-left:18px; }
+  code { background:#edf4f1; color:#12251f; }
+  .err { color:var(--danger); font-size:13px; }
+  @media (max-width: 860px) {
+    main.dashboard { grid-template-columns:1fr; }
+    .sidebar { min-height:auto; position:static; }
+    .nav-stack { grid-template-columns:1fr 1fr; }
+    .logout { margin-top:0; }
+    .view-header, .job-head { display:grid; }
+    .row { grid-template-columns:1fr; }
+  }
+  @media (max-width: 520px) {
+    .nav-stack { grid-template-columns:1fr; }
+    .workspace { padding:18px 14px; }
+  }
+</style>
 
-  <!-- Companies -->
-  <div class="card">
-    <h2>2 · Companies to watch</h2>
-    <p class="muted">Paste a careers URL — Greenhouse / Lever / Ashby are auto-detected. Otherwise pick the ATS and token.</p>
-    <div class="row">
-      <div><label>Name</label><input id="cName" placeholder="Anthropic" /></div>
-      <div><label>Careers URL</label><input id="cUrl" placeholder="https://job-boards.greenhouse.io/anthropic" /></div>
-    </div>
-    <div class="row">
-      <div><label>ATS</label>
-        <select id="cAts">
-          <option value="auto">auto-detect</option>
-          <option value="greenhouse">greenhouse</option>
-          <option value="lever">lever</option>
-          <option value="ashby">ashby</option>
-          <option value="html">generic html</option>
-        </select>
+<main class="dashboard">
+  <aside class="sidebar">
+    <div class="sidebar-top">
+      <div>
+        <div class="brand-mark">JobScout</div>
+        <div class="account">{{ user.email }}</div>
       </div>
-      <div><label>ATS token (optional)</label><input id="cToken" placeholder="board token / org slug" /></div>
     </div>
-    <button style="margin-top:10px;" onclick="addCompany()">Add company</button>
-    <div id="companies"></div>
-  </div>
+    <nav class="nav-stack" aria-label="Dashboard">
+      <button class="nav-button" data-view="jobs" onclick="showView('jobs')">Job lists</button>
+      <button class="nav-button" data-view="resume" onclick="showView('resume')">Check/update resume</button>
+      <button class="nav-button" data-view="companies" onclick="showView('companies')">Company watchlist management</button>
+      <button class="nav-button" data-view="interests" onclick="showView('interests')">Interest management</button>
+      <button class="nav-button" data-view="telegram" onclick="showView('telegram')">Telegram settings</button>
+    </nav>
+    <button class="ghost logout" onclick="logout()">Log out</button>
+  </aside>
 
-  <!-- Interests -->
-  <div class="card">
-    <h2>3 · What you want</h2>
-    <p class="muted">Define your target role. Keywords gate which postings get scored; notes steer the LLM.</p>
-    <div class="row">
-      <div><label>Label</label><input id="iLabel" placeholder="Senior Backend (EU remote)" /></div>
-      <div><label>Min score to report (0-100)</label><input id="iMin" type="number" value="70" /></div>
+  <section class="workspace">
+    <div class="view-header">
+      <div>
+        <h1 id="viewTitle">Job lists</h1>
+        <div id="viewSubtitle" class="muted">Latest ranked positions from your scans</div>
+      </div>
+      <div class="toolbar" id="primaryActions">
+        <button id="runBtn" onclick="run()">Run scan now</button>
+        <span id="runStatus" class="muted"></span>
+      </div>
     </div>
-    <div class="row">
-      <div><label>Title keywords (comma-sep)</label><input id="iTitles" placeholder="backend, platform, infrastructure" /></div>
-      <div><label>Locations (comma-sep)</label><input id="iLocs" placeholder="remote, berlin, eu" /></div>
-    </div>
-    <div class="row">
-      <div><label>Seniority</label><input id="iSen" placeholder="senior, staff" /></div>
-      <div><label>Exclude keywords</label><input id="iExcl" placeholder="manager, sales" /></div>
-    </div>
-    <label>Notes / requirements for the AI</label>
-    <textarea id="iNotes" placeholder="Must allow EU remote. Strong Python + distributed systems. No on-call-heavy roles."></textarea>
-    <button style="margin-top:10px;" onclick="addInterest()">Add interest</button>
-    <div id="interests"></div>
-  </div>
 
-  <!-- Run + report -->
-  <div class="card">
-    <h2>4 · Daily report</h2>
-    <div class="flex">
-      <button onclick="run()">Run scan now</button>
-      <span id="runStatus" class="muted"></span>
-    </div>
-    <p class="muted" style="margin-top:10px;">
-      Telegram: DM your bot <code>/start {{ link_code }}</code> to get this report daily.
-    </p>
-    <div id="report"></div>
-  </div>
+    <section id="view-jobs" class="panel active">
+      <div class="surface">
+        <div class="toolbar">
+          <div class="grow">
+            <label for="jobVersion">Saved list</label>
+            <select id="jobVersion" onchange="selectJobVersion()">
+              <option value="latest">Latest saved list</option>
+            </select>
+          </div>
+          <button id="jobToggle" class="ghost" onclick="toggleJobListSize()">View all</button>
+        </div>
+        <div id="runGate" class="muted" style="margin-top:8px;"></div>
+        <div id="jobMeta" class="stat-line" style="margin-top:14px;"></div>
+        <div id="jobWarnings"></div>
+      </div>
+      <div class="surface">
+        <div id="jobList"></div>
+      </div>
+    </section>
+
+    <section id="view-resume" class="panel">
+      <div class="surface">
+        <h2>Resume</h2>
+        <div class="row">
+          <div>
+            <label for="resumeFile">Resume file</label>
+            <input id="resumeFile" type="file" accept=".pdf,.docx,.txt,.md" />
+          </div>
+          <div class="flex" style="align-self:end;">
+            <button onclick="uploadResume()">Upload / replace</button>
+          </div>
+        </div>
+        <div id="resumes" style="margin-top:14px;"></div>
+      </div>
+    </section>
+
+    <section id="view-companies" class="panel">
+      <div class="surface">
+        <h2>Company watchlist management</h2>
+        <div class="row">
+          <div>
+            <label for="cPreset">Quick add</label>
+            <select id="cPreset" onchange="applyPreset()">
+              <option value="">Choose a preset</option>
+            </select>
+          </div>
+          <div></div>
+        </div>
+        <div class="row">
+          <div><label for="cName">Name</label><input id="cName" placeholder="Anthropic" /></div>
+          <div><label for="cUrl">Careers URL</label><input id="cUrl" placeholder="https://job-boards.greenhouse.io/anthropic" /></div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="cAts">ATS</label>
+            <select id="cAts">
+              <option value="auto">auto-detect</option>
+              <option value="greenhouse">greenhouse</option>
+              <option value="lever">lever</option>
+              <option value="ashby">ashby</option>
+              <option value="google">google careers</option>
+              <option value="html">generic html</option>
+            </select>
+          </div>
+          <div><label for="cToken">ATS token</label><input id="cToken" placeholder="board token / org slug" /></div>
+        </div>
+        <div class="toolbar" style="margin-top:12px;"><button onclick="addCompany()">Add company</button></div>
+      </div>
+      <div class="surface"><div id="companies"></div></div>
+    </section>
+
+    <section id="view-interests" class="panel">
+      <div class="surface">
+        <h2>Interest management</h2>
+        <div class="row">
+          <div><label for="iLabel">Label</label><input id="iLabel" placeholder="Senior Backend (EU remote)" /></div>
+          <div><label for="iMin">Minimum score</label><input id="iMin" type="number" value="70" /></div>
+        </div>
+        <div class="row">
+          <div><label for="iTitles">Title keywords</label><input id="iTitles" placeholder="backend, platform, infrastructure" /></div>
+          <div><label for="iLocs">Locations</label><input id="iLocs" placeholder="remote, berlin, eu" /></div>
+        </div>
+        <div class="row">
+          <div><label for="iSen">Seniority</label><input id="iSen" placeholder="senior, staff" /></div>
+          <div><label for="iExcl">Exclude keywords</label><input id="iExcl" placeholder="manager, sales" /></div>
+        </div>
+        <label for="iNotes">Notes / requirements for the AI</label>
+        <textarea id="iNotes" placeholder="Must allow EU remote. Strong Python + distributed systems. No on-call-heavy roles."></textarea>
+        <div class="toolbar" style="margin-top:12px;">
+          <button id="iSubmit" onclick="saveInterest()">Add interest</button>
+          <button id="iCancel" class="ghost" style="display:none;" onclick="resetInterestForm()">Cancel</button>
+        </div>
+      </div>
+      <div class="surface"><div id="interests"></div></div>
+    </section>
+
+    <section id="view-telegram" class="panel">
+      <div class="surface">
+        <h2>Telegram settings</h2>
+        <div id="tg" class="muted">
+          {% if user.telegram_chat_id %}
+            Telegram linked. <button class="ghost" onclick="regenCode()">Re-link with a new code</button>
+          {% elif link_code %}
+            Telegram link code: <code>/start {{ link_code }}</code>
+            <button class="ghost" onclick="regenCode()">New code</button>
+          {% else %}
+            Telegram not linked. <button class="ghost" onclick="regenCode()">Generate link code</button>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+  </section>
 </main>
 
 <script>
 const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts});
-const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const val = id => document.getElementById(id).value.trim();
+const viewCopy = {
+  jobs: ["Job lists", "Latest ranked positions from your scans"],
+  resume: ["Check/update resume", "Current resume used for matching"],
+  companies: ["Company watchlist management", "Career sites included in each scan"],
+  interests: ["Interest management", "Role preferences and scoring thresholds"],
+  telegram: ["Telegram settings", "Daily report delivery"]
+};
+let showAllJobs = false;
+let selectedSnapshotId = null;
+let ALL_PRESETS = [];
+let watchedNames = new Set();
+let interestsById = {};
+let editingInterestId = null;
+
+function showView(view){
+  const active = viewCopy[view] ? view : "jobs";
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  document.getElementById(`view-${active}`).classList.add("active");
+  document.querySelectorAll(".nav-button").forEach(b => {
+    b.setAttribute("aria-current", b.dataset.view === active ? "page" : "false");
+  });
+  document.getElementById("viewTitle").textContent = viewCopy[active][0];
+  document.getElementById("viewSubtitle").textContent = viewCopy[active][1];
+  document.getElementById("primaryActions").style.display = active === "jobs" ? "" : "none";
+  if(location.hash !== `#${active}`){ history.replaceState(null, "", `#${active}`); }
+}
+
+function fmtDate(value){
+  if(!value){ return "No saved scan yet"; }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString([], {dateStyle:"medium", timeStyle:"short"});
+}
 
 async function logout(){ await api("/api/auth/logout",{method:"POST"}); window.location="/login"; }
+
+async function regenCode(){
+  const r = await api("/api/auth/telegram-code",{method:"POST"});
+  if(!r.ok){ alert("Could not generate a code"); return; }
+  const d = await r.json();
+  document.getElementById("tg").innerHTML =
+    `Telegram link code: <code>/start ${esc(d.telegram_link_code)}</code> `+
+    `<button class="ghost" onclick="regenCode()">New code</button>`;
+}
 
 async function uploadResume(){
   const f = document.getElementById("resumeFile").files[0];
@@ -92,80 +298,229 @@ async function uploadResume(){
   const fd = new FormData(); fd.append("file", f);
   const r = await fetch("/api/resumes", {method:"POST", body:fd});
   if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Upload failed"); }
-  loadResumes();
+  document.getElementById("resumeFile").value = "";
+  await loadResumes();
 }
+
 async function loadResumes(){
   const r = await api("/api/resumes"); const list = await r.json();
-  document.getElementById("resumes").innerHTML = list.map(x =>
-    `<div class="list-item flex" style="justify-content:space-between;">
-       <span>${esc(x.filename)} ${x.is_active?'<span class="pill">active</span>':''}</span>
-       <button class="ghost" onclick="delResume(${x.id})">Delete</button></div>`).join("") ||
-    '<p class="muted">No resume yet.</p>';
+  const resume = list[0];
+  document.getElementById("resumes").innerHTML = resume
+    ? `<div class="list-item flex" style="justify-content:space-between;">
+         <span><b>${esc(resume.filename)}</b> <span class="muted">active resume</span></span>
+         <button class="ghost" onclick="delResume(${resume.id})">Remove</button></div>`
+    : '<div class="empty">No resume uploaded yet.</div>';
+  updateScanGate(!!resume);
 }
-async function delResume(id){ await api(`/api/resumes/${id}`,{method:"DELETE"}); loadResumes(); }
+
+function updateScanGate(hasResume){
+  document.getElementById("runBtn").disabled = !hasResume;
+  document.getElementById("runGate").textContent =
+    hasResume ? "" : "Upload a resume before running a scan.";
+}
+
+async function delResume(id){
+  await api(`/api/resumes/${id}`,{method:"DELETE"});
+  await loadResumes();
+}
+
+async function loadPresets(){
+  const r = await api("/api/companies/presets");
+  if(!r.ok){ return; }
+  ALL_PRESETS = await r.json();
+  renderPresetOptions();
+}
+
+function renderPresetOptions(){
+  const sel = document.getElementById("cPreset");
+  const keep = sel.value;
+  const available = ALL_PRESETS.filter(p => !watchedNames.has(p.name.toLowerCase()));
+  sel.innerHTML = '<option value="">Choose a preset</option>' +
+    available.map(p => `<option value="${esc(p.key)}">${esc(p.name)}</option>`).join("");
+  if(available.some(p => p.key === keep)){ sel.value = keep; }
+}
+
+function applyPreset(){
+  const p = ALL_PRESETS.find(x => x.key === document.getElementById("cPreset").value);
+  if(!p){ return; }
+  document.getElementById("cName").value = p.name;
+  document.getElementById("cUrl").value = p.careers_url;
+  document.getElementById("cAts").value = p.ats_type;
+  document.getElementById("cToken").value = p.ats_token || "";
+}
 
 async function addCompany(){
   const body = {name:val("cName"), careers_url:val("cUrl"), ats_type:val("cAts"), ats_token:val("cToken")||null};
   const r = await api("/api/companies",{method:"POST", body:JSON.stringify(body)});
-  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); }
+  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); return; }
   ["cName","cUrl","cToken"].forEach(i=>document.getElementById(i).value="");
-  loadCompanies();
+  document.getElementById("cAts").value = "auto";
+  document.getElementById("cPreset").value = "";
+  await loadCompanies();
 }
+
 async function loadCompanies(){
   const r = await api("/api/companies"); const list = await r.json();
+  watchedNames = new Set(list.map(x => (x.name || "").toLowerCase()));
+  renderPresetOptions();
   document.getElementById("companies").innerHTML = list.map(x =>
     `<div class="list-item flex" style="justify-content:space-between;">
-       <span><b>${esc(x.name)}</b> <span class="pill">${x.ats_type}</span>
+       <span><b>${esc(x.name)}</b> <span class="pill">${esc(x.ats_type)}</span>
        <span class="muted">${esc(x.careers_url||"")}</span></span>
        <button class="ghost" onclick="delCompany(${x.id})">Remove</button></div>`).join("") ||
-    '<p class="muted">No companies yet.</p>';
+    '<div class="empty">No companies on the watchlist.</div>';
 }
-async function delCompany(id){ await api(`/api/companies/${id}`,{method:"DELETE"}); loadCompanies(); }
 
-async function addInterest(){
-  const body = {label:val("iLabel"), title_keywords:val("iTitles"), locations:val("iLocs"),
+async function delCompany(id){ await api(`/api/companies/${id}`,{method:"DELETE"}); await loadCompanies(); }
+
+function interestBody(){
+  return {label:val("iLabel"), title_keywords:val("iTitles"), locations:val("iLocs"),
     seniority:val("iSen"), exclude_keywords:val("iExcl"), notes:val("iNotes"),
     min_score:parseInt(val("iMin")||"70")};
-  const r = await api("/api/interests",{method:"POST", body:JSON.stringify(body)});
-  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); }
-  ["iLabel","iTitles","iLocs","iSen","iExcl","iNotes"].forEach(i=>document.getElementById(i).value="");
-  loadInterests();
 }
+
+async function saveInterest(){
+  const body = interestBody();
+  if(!body.label){ alert("Give the interest a label."); return; }
+  const r = editingInterestId
+    ? await api(`/api/interests/${editingInterestId}`,{method:"PATCH", body:JSON.stringify(body)})
+    : await api("/api/interests",{method:"POST", body:JSON.stringify(body)});
+  if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); return; }
+  resetInterestForm();
+  await loadInterests();
+}
+
+function editInterest(id){
+  const x = interestsById[id];
+  if(!x){ return; }
+  document.getElementById("iLabel").value = x.label||"";
+  document.getElementById("iMin").value = x.min_score;
+  document.getElementById("iTitles").value = x.title_keywords||"";
+  document.getElementById("iLocs").value = x.locations||"";
+  document.getElementById("iSen").value = x.seniority||"";
+  document.getElementById("iExcl").value = x.exclude_keywords||"";
+  document.getElementById("iNotes").value = x.notes||"";
+  editingInterestId = id;
+  document.getElementById("iSubmit").textContent = "Save changes";
+  document.getElementById("iCancel").style.display = "";
+  document.getElementById("iLabel").focus();
+}
+
+function resetInterestForm(){
+  ["iLabel","iTitles","iLocs","iSen","iExcl","iNotes"].forEach(i=>document.getElementById(i).value="");
+  document.getElementById("iMin").value = "70";
+  editingInterestId = null;
+  document.getElementById("iSubmit").textContent = "Add interest";
+  document.getElementById("iCancel").style.display = "none";
+}
+
 async function loadInterests(){
   const r = await api("/api/interests"); const list = await r.json();
+  interestsById = Object.fromEntries(list.map(x => [x.id, x]));
   document.getElementById("interests").innerHTML = list.map(x =>
     `<div class="list-item flex" style="justify-content:space-between;">
        <span><b>${esc(x.label)}</b> <span class="muted">min ${x.min_score} · ${esc(x.title_keywords||"any")} · ${esc(x.locations||"any")}</span></span>
-       <button class="ghost" onclick="delInterest(${x.id})">Delete</button></div>`).join("") ||
-    '<p class="muted">No interests yet.</p>';
+       <span>
+         <button class="ghost" onclick="editInterest(${x.id})">Edit</button>
+         <button class="ghost" onclick="delInterest(${x.id})">Delete</button>
+       </span></div>`).join("") ||
+    '<div class="empty">No interests configured.</div>';
 }
-async function delInterest(id){ await api(`/api/interests/${id}`,{method:"DELETE"}); loadInterests(); }
+
+async function delInterest(id){
+  await api(`/api/interests/${id}`,{method:"DELETE"});
+  if(editingInterestId === id){ resetInterestForm(); }
+  await loadInterests();
+}
 
 async function run(){
-  const s = document.getElementById("runStatus"); s.textContent = "Scanning & scoring… (this can take a minute)";
+  if(document.getElementById("runBtn").disabled){ return; }
+  const s = document.getElementById("runStatus");
+  s.textContent = "Scanning and scoring...";
   const r = await api("/api/run",{method:"POST"});
-  const d = await r.json();
+  const d = await r.json().catch(()=>({}));
   if(!r.ok){ s.textContent = d.detail || "Run failed"; return; }
-  s.textContent = `${d.new_positions} new positions · ${d.scored} scored` +
-    (d.errors.length ? ` · ${d.errors.length} warning(s)` : "");
-  loadReport();
-}
-async function loadReport(){
-  const r = await api("/api/report"); const list = await r.json();
-  document.getElementById("report").innerHTML = list.map(m => `
-    <div class="list-item">
-      <div class="flex" style="justify-content:space-between;">
-        <span><b>${esc(m.title)}</b> — ${esc(m.company)} ${m.location?`<span class="muted">· ${esc(m.location)}</span>`:""}</span>
-        <span class="score">${m.match_score}/100 · win ${m.win_probability}%</span>
-      </div>
-      <p>${esc(m.reasoning||"")}</p>
-      ${m.strengths.length?`<div class="muted">Strengths</div><ul class="tight">${m.strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>`:""}
-      ${m.gaps.length?`<div class="muted">Watch-outs</div><ul class="tight">${m.gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>`:""}
-      ${m.url?`<a href="${esc(m.url)}" target="_blank">View posting →</a>`:""}
-    </div>`).join("") || '<p class="muted">No strong matches yet — add companies/interests and run a scan.</p>';
+  s.textContent = `${d.new_positions} new positions · ${d.scored} scored`;
+  selectedSnapshotId = null;
+  showAllJobs = false;
+  await loadJobRuns();
+  await loadJobList();
 }
 
-const val = id => document.getElementById(id).value.trim();
-loadResumes(); loadCompanies(); loadInterests(); loadReport();
+async function loadJobRuns(){
+  const r = await api("/api/job-lists/runs");
+  const runs = r.ok ? await r.json() : [];
+  const sel = document.getElementById("jobVersion");
+  const selected = selectedSnapshotId ? String(selectedSnapshotId) : "latest";
+  sel.innerHTML = '<option value="latest">Latest saved list</option>' + runs.map(run => {
+    const label = `${fmtDate(run.created_at)} · ${run.total} jobs · ${run.scored} scored`;
+    return `<option value="${run.id}">${esc(label)}</option>`;
+  }).join("");
+  if([...sel.options].some(o => o.value === selected)){ sel.value = selected; }
+}
+
+function selectJobVersion(){
+  const value = document.getElementById("jobVersion").value;
+  selectedSnapshotId = value === "latest" ? null : parseInt(value, 10);
+  showAllJobs = false;
+  loadJobList();
+}
+
+function toggleJobListSize(){
+  showAllJobs = !showAllJobs;
+  loadJobList();
+}
+
+async function loadJobList(){
+  const limit = showAllJobs ? 500 : 5;
+  const path = selectedSnapshotId
+    ? `/api/job-lists/${selectedSnapshotId}?limit=${limit}`
+    : `/api/job-lists/latest?limit=${limit}`;
+  const r = await api(path);
+  if(!r.ok){
+    document.getElementById("jobList").innerHTML = '<div class="empty">Could not load this job list.</div>';
+    return;
+  }
+  renderJobList(await r.json());
+}
+
+function renderJobList(data){
+  document.getElementById("jobToggle").textContent = showAllJobs ? "View top 5" : "View all";
+  document.getElementById("jobToggle").disabled = data.total <= 5;
+  document.getElementById("jobMeta").innerHTML = `
+    <span class="stat">${esc(fmtDate(data.created_at))}</span>
+    <span class="stat">${data.new_positions} new positions</span>
+    <span class="stat">${data.scored} scored</span>
+    <span class="stat">${data.total} in list</span>`;
+  document.getElementById("jobWarnings").innerHTML = (data.errors || []).length
+    ? `<div class="warning-box"><b>Warnings</b><ul class="tight">${data.errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul></div>`
+    : "";
+  document.getElementById("jobList").innerHTML = (data.items || []).map(m => {
+    const strengths = m.strengths || [];
+    const gaps = m.gaps || [];
+    return `<article class="job-row">
+      <div class="job-head">
+        <div>
+          <div class="job-title">${esc(m.title)}</div>
+          <div class="job-meta">${esc(m.company)}${m.location?` · ${esc(m.location)}`:""}</div>
+        </div>
+        <div class="score">${m.match_score}/100 · win ${m.win_probability}%</div>
+      </div>
+      ${m.below_threshold ? '<span class="pill warn">below threshold</span>' : ""}
+      ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
+      ${strengths.length ? `<div class="muted">Strengths</div><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>` : ""}
+      ${gaps.length ? `<div class="muted">Watch-outs</div><ul class="tight">${gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>` : ""}
+      ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">View posting</a>` : ""}
+    </article>`;
+  }).join("") || '<div class="empty">No positions in this list yet.</div>';
+}
+
+const initialView = (location.hash || "#jobs").replace("#", "");
+showView(initialView);
+loadResumes();
+loadPresets();
+loadCompanies();
+loadInterests();
+loadJobRuns().then(loadJobList);
 </script>
 {% endblock %}

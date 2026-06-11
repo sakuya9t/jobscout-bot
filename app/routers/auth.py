@@ -26,14 +26,18 @@ COOKIE = "access_token"
 def _set_cookie(response: Response, token: str) -> None:
     response.set_cookie(
         COOKIE, token, httponly=True, samesite="lax", secure=settings.cookie_secure,
-        max_age=60 * 60 * 24 * 7, path="/",
+        # Match the JWT lifetime so the cookie doesn't outlive (or under-live) the
+        # token it carries.
+        max_age=settings.jwt_expire_minutes * 60, path="/",
     )
 
 
 @router.post("/register", response_model=Token)
 def register(creds: Credentials, response: Response, db: Session = Depends(get_db)) -> Token:
     user = User(
-        email=creds.email,
+        # Normalize so "A@b.com" and "a@b.com" can't become two accounts
+        # (EmailStr only lowercases the domain half).
+        email=creds.email.lower(),
         hashed_password=hash_password(creds.password),
         telegram_link_code=new_link_code(),
     )
@@ -53,7 +57,7 @@ def register(creds: Credentials, response: Response, db: Session = Depends(get_d
 
 @router.post("/login", response_model=Token)
 def login(creds: Credentials, response: Response, db: Session = Depends(get_db)) -> Token:
-    user = db.scalar(select(User).where(User.email == creds.email))
+    user = db.scalar(select(User).where(User.email == creds.email.lower()))
     if not user or not verify_password(creds.password, user.hashed_password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
     token = create_access_token(user.id)
@@ -69,4 +73,16 @@ def logout(response: Response) -> dict:
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)) -> User:
+    return user
+
+
+@router.post("/telegram-code", response_model=UserOut)
+def regenerate_telegram_code(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> User:
+    """Mint a fresh one-time Telegram link code. Needed because the old code is
+    burned on a successful /start link, so re-linking requires a new one."""
+    user.telegram_link_code = new_link_code()
+    db.commit()
+    db.refresh(user)
     return user
