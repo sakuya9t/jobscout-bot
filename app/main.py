@@ -9,7 +9,7 @@ from sqlalchemy import text
 from .config import settings
 from .db import init_db, session_scope
 from .logging_config import configure_logging, get_logger
-from .routers import auth, companies, interests, pages, positions, reports, resumes
+from .routers import admin, auth, companies, interests, pages, positions, reports, resumes
 from .services import evaluator, scheduler
 from .services.ollama_client import get_client
 
@@ -41,6 +41,7 @@ app.include_router(companies.router)
 app.include_router(interests.router)
 app.include_router(positions.router)
 app.include_router(reports.router)
+app.include_router(admin.router)
 app.include_router(pages.router)
 
 

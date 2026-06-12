@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import session_scope
-from ..models import Company, Interest, MatchResult, Position, Resume, User
+from ..models import Company, Interest, MatchResult, Position, Resume, Subscription, User
 from ..schemas import MatchVerdict
 from ..timeutil import utcnow
 from . import scraper
@@ -465,9 +465,35 @@ def clear_failed_markers(db: Session, user_id: int | None = None) -> int:
     return db.execute(stmt).rowcount or 0
 
 
+def _custom_companies(db: Session, user: User) -> list[Company]:
+    """The user's own custom companies (preset rows have a NULL user_id, so a
+    ``user_id == me`` filter already excludes them). These are the only companies a
+    user *scan* crawls; presets are crawled separately by crawl_presets."""
+    return list(
+        db.scalars(select(Company).where(Company.user_id == user.id, Company.is_active == True))  # noqa: E712
+    )
+
+
+def _user_companies(db: Session, user: User) -> list[Company]:
+    """All active companies whose jobs are matched for this user: their own custom
+    companies plus the global preset companies they subscribe to."""
+    by_id = {c.id: c for c in _custom_companies(db, user)}
+    subscribed = db.scalars(
+        select(Company)
+        .join(Subscription, Subscription.company_id == Company.id)
+        .where(
+            Subscription.user_id == user.id,
+            Subscription.is_active == True,  # noqa: E712
+            Company.is_active == True,  # noqa: E712
+        )
+    )
+    by_id.update({c.id: c for c in subscribed})
+    return list(by_id.values())
+
+
 def _active_inputs(db: Session, user: User) -> tuple[Resume | None, list[Interest], list[Company]]:
-    """Load the user's active resume, interests, and companies — the shared inputs
-    both scraping and scoring need."""
+    """Load the user's active resume, interests, and matched companies (custom +
+    subscribed presets) — the shared inputs scoring needs."""
     resume = db.scalar(
         select(Resume).where(Resume.user_id == user.id, Resume.is_active == True)  # noqa: E712
         .order_by(Resume.created_at.desc())
@@ -475,10 +501,7 @@ def _active_inputs(db: Session, user: User) -> tuple[Resume | None, list[Interes
     interests = list(
         db.scalars(select(Interest).where(Interest.user_id == user.id, Interest.is_active == True))  # noqa: E712
     )
-    companies = list(
-        db.scalars(select(Company).where(Company.user_id == user.id, Company.is_active == True))  # noqa: E712
-    )
-    return resume, interests, companies
+    return resume, interests, _user_companies(db, user)
 
 
 def _described(positions: list[Position]) -> list[Position]:
@@ -491,12 +514,13 @@ def _described(positions: list[Position]) -> list[Position]:
 
 
 def scrape_only(db: Session, user: User, res: RunResult | None = None) -> RunResult:
-    """Scrape + upsert all of a user's active companies, recording new_positions and
-    any per-company scrape errors on ``res``. Serialized per user by the scrape lock
-    so two concurrent scrapes can't race on uq_position_company_extid. Does NOT
-    score — that's ``score_to_completion``'s job (which the web path runs async)."""
+    """Scrape + upsert the user's CUSTOM companies, recording new_positions and any
+    per-company scrape errors on ``res``. Preset companies are global and crawled
+    once by ``crawler.crawl_presets`` (daily / on-demand), never on a user scan.
+    Serialized per user by the scrape lock so two concurrent scrapes can't race on
+    uq_position_company_extid. Does NOT score — that's ``score_to_completion``'s."""
     res = res or RunResult()
-    _, _, companies = _active_inputs(db, user)
+    companies = _custom_companies(db, user)
     undescribed = 0
     # Commit per company so we never hold a write lock across the whole scrape
     # (SQLite) and a later failure can't discard already-scraped postings.
@@ -706,8 +730,13 @@ def run_for_user(
 
 
 def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
-    """Entry point for the scheduler/CLI. Each user committed independently.
-    ``retry_failed`` clears prior error-markers first so failed pairs re-score."""
+    """Entry point for the scheduler/CLI. Crawl the shared preset catalog ONCE, then
+    score each user (which also scrapes that user's custom companies) — committed
+    independently. ``retry_failed`` clears prior error-markers first."""
+    from . import crawler
+
+    crawler.crawl_presets()  # shared, once — not per user
+
     summaries: dict[int, RunResult] = {}
     with session_scope() as db:
         user_ids = list(db.scalars(select(User.id)))

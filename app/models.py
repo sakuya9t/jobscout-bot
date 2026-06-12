@@ -35,7 +35,12 @@ class User(Base):
     telegram_link_code: Mapped[str | None] = mapped_column(String(32), index=True)
 
     resumes: Mapped[list[Resume]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    # Custom (user-owned) companies only; preset companies are global (user_id NULL)
+    # and followed via ``subscriptions``.
     companies: Mapped[list[Company]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    subscriptions: Mapped[list[Subscription]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     interests: Mapped[list[Interest]] = relationship(back_populates="user", cascade="all, delete-orphan")
     matches: Mapped[list[MatchResult]] = relationship(back_populates="user", cascade="all, delete-orphan")
     job_list_snapshots: Mapped[list[JobListSnapshot]] = relationship(
@@ -79,13 +84,23 @@ class Resume(Base):
 
 
 class Company(Base):
-    """A company whose career page we scan for new postings (per user)."""
+    """A company whose career page we crawl for postings.
+
+    Two kinds share this table:
+    - **Preset** (global): ``preset_key`` set, ``user_id`` NULL — one shared row per
+      ``company_presets.PRESETS`` entry, crawled once by ``crawl_presets`` and
+      matched against any user's resume. Users follow them via ``Subscription``.
+    - **Custom** (per-user): ``user_id`` set, ``preset_key`` NULL — owned by one
+      user and still crawled on that user's scan."""
 
     __tablename__ = "companies"
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_company_user_name"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # NULL for global preset companies; set for user-owned custom companies.
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    # Stable preset slug (company_presets) for global rows; NULL for custom ones.
+    preset_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255))
     careers_url: Mapped[str | None] = mapped_column(String(1024))
     # ATS-first scraping: "greenhouse" | "lever" | "ashby" | "html" | "auto"
@@ -97,10 +112,34 @@ class Company(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_scraped_at: Mapped[datetime | None] = mapped_column(DateTime)
 
-    user: Mapped[User] = relationship(back_populates="companies")
+    user: Mapped[User | None] = relationship(back_populates="companies")
     positions: Mapped[list[Position]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
+
+    @property
+    def is_preset(self) -> bool:
+        return self.preset_key is not None
+
+
+class Subscription(Base):
+    """A user following a global (preset) company so its shared jobs are matched
+    against their resume. Custom companies are owned via ``Company.user_id`` and
+    need no subscription."""
+
+    __tablename__ = "subscriptions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "company_id", name="uq_subscription_user_company"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="subscriptions")
+    company: Mapped[Company] = relationship()
 
 
 class Interest(Base):

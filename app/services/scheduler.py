@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ..config import settings
-from . import matcher, telegram_bot
+from . import crawler, matcher, telegram_bot
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +62,11 @@ def start() -> None:
         _scheduler.start()
         log.info("scheduler started: daily at %02d:%02d",
                  settings.daily_run_hour, settings.daily_run_minute)
+        # Populate the shared preset catalog now if it's empty/stale, so a freshly
+        # started service has jobs without waiting for the daily cron hour.
+        if crawler.presets_are_stale():
+            log.info("preset catalog stale on startup — kicking a background crawl")
+            crawler.crawl_presets_async()
 
     if settings.telegram_bot_token and _telegram_thread is None:
         _telegram_stop.clear()
@@ -73,6 +78,7 @@ def start() -> None:
 def shutdown() -> None:
     global _scheduler
     _telegram_stop.set()
+    crawler.shutdown()
     if _scheduler is not None:
         _scheduler.shutdown(wait=False)
         _scheduler = None

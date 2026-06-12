@@ -607,12 +607,15 @@ def test_job_list_snapshots_keep_previous_ranked_versions():
         assert "candidate evaluation cap" in reporter.job_list_errors(second)[0]
         assert "remain unevaluated" in reporter.job_list_errors(second)[0]
 
-        from app.routers.reports import _job_list_out
+        from app.routers.reports import get_job_list
 
-        response = _job_list_out(second, limit=1)
+        response = get_job_list(second.id, limit=1, offset=0, category="matching", user=user, db=db)
         assert response.total == 2
         assert len(response.items) == 1
         assert response.items[0].title == "Principal Backend"
+        # offset paginates over the stored snapshot items.
+        page2 = get_job_list(second.id, limit=1, offset=1, category="matching", user=user, db=db)
+        assert page2.items[0].title == "Backend Engineer"
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
@@ -698,6 +701,238 @@ def test_run_endpoint_returns_immediately_with_pending(monkeypatch):
         assert kicked  # background drain was kicked
         status = c.get("/api/evaluation/status", headers=h).json()
         assert status["pending"] == 1 and status["in_progress"] is False
+
+
+# ── Job list: categories + pagination ────────────────────────────────────────
+def _seed_match_mix(db, uid):
+    """Add a mix of matching, filter-rejected, keyword-excluded, and error-marker
+    rows so the category/pagination logic has something to slice."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    company = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+
+    def add(ext, title, *, passed, score, model):
+        pos = models.Position(company_id=company.id, external_id=ext, title=title, description="d")
+        db.add(pos); db.flush()
+        db.add(models.MatchResult(
+            user_id=uid, position_id=pos.id, resume_id=rid, interest_id=interest.id,
+            passed_filter=passed, match_score=score, win_probability=score,
+            reasoning="r", model=model))
+
+    add("a", "Match A", passed=True, score=90, model="good")
+    add("b", "Match B", passed=True, score=60, model="good")          # below min_score 70
+    add("c", "Rejected", passed=False, score=0, model="deepseek-flash")  # filter reject
+    add("d", "Excluded", passed=False, score=0, model=matcher.EXCLUDED_MODEL)
+    add("e", "Errored", passed=False, score=0, model=matcher.ERROR_MODEL)  # transient failure
+    db.flush()
+
+
+def test_build_job_list_categories_and_pagination():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+
+        matching, total_m = reporter.build_job_list(db, user, category="matching", limit=10)
+        assert total_m == 2 and [m["title"] for m in matching] == ["Match A", "Match B"]
+        assert all(not m["non_matching"] for m in matching)
+        assert matching[1]["below_threshold"] is True  # B (60) < interest min_score (70)
+
+        all_items, total_all = reporter.build_job_list(db, user, category="all", limit=50)
+        titles = [m["title"] for m in all_items]
+        assert total_all == 4 and "Errored" not in titles  # error markers excluded
+        assert {"Rejected", "Excluded"} <= set(titles)
+        assert titles[:2] == ["Match A", "Match B"]  # matches rank first
+        non = [m for m in all_items if m["non_matching"]]
+        assert len(non) == 2 and all(m["match_score"] == 0 for m in non)
+
+        page1, t = reporter.build_job_list(db, user, category="all", limit=2, offset=0)
+        page2, _ = reporter.build_job_list(db, user, category="all", limit=2, offset=2)
+        assert t == 4 and [m["title"] for m in page1] == ["Match A", "Match B"]
+        assert set(m["title"] for m in page1).isdisjoint(m["title"] for m in page2)
+
+
+def test_job_list_endpoint_paginates_and_filters_category(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        m = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert m["total"] == 2 and len(m["items"]) == 2
+        assert all(not it["non_matching"] for it in m["items"])
+
+        a = c.get("/api/job-lists/latest?category=all&limit=2&offset=0", headers=h).json()
+        assert a["total"] == 4 and len(a["items"]) == 2  # page size honored
+
+        a_all = c.get("/api/job-lists/latest?category=all&limit=50", headers=h).json()
+        assert any(it["non_matching"] for it in a_all["items"])  # non-matching visible in 'all'
+
+
+def test_build_job_list_score_and_win_filters():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)  # A: 90/90, B: 60/60 (win == score in the helper)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        # match score ≥ 75 keeps only A; B (60) drops.
+        hi, hi_total = reporter.build_job_list(db, user, category="matching", min_score=75, limit=50)
+        assert hi_total == 1 and [m["title"] for m in hi] == ["Match A"]
+        # win rate ≥ 75 likewise keeps only A.
+        _, win_total = reporter.build_job_list(db, user, category="matching", min_win=75)
+        assert win_total == 1
+        # the >0 default (1) keeps both real matches.
+        _, lo_total = reporter.build_job_list(db, user, category="matching", min_score=1, min_win=1)
+        assert lo_total == 2
+
+
+def test_score_filter_exempts_non_matching_in_all_category():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="all", min_score=75, limit=50)
+        titles = [m["title"] for m in items]
+        # Only A clears the score floor; the two non-matching rows are exempt.
+        assert "Match A" in titles and "Match B" not in titles
+        assert {"Rejected", "Excluded"} <= set(titles) and "Errored" not in titles
+        assert total == 3
+
+
+def test_job_list_endpoint_applies_score_win_filters(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        hi = c.get("/api/job-lists/latest?category=matching&min_score=75&limit=50", headers=h).json()
+        assert hi["total"] == 1 and hi["items"][0]["title"] == "Match A"
+        # Non-matching stays visible in 'all' even with a high score floor.
+        allhi = c.get("/api/job-lists/latest?category=all&min_score=90&limit=50", headers=h).json()
+        assert any(it["non_matching"] for it in allhi["items"])
+
+
+# ── Shared preset catalog + crawling ─────────────────────────────────────────
+def test_seed_presets_is_idempotent_and_global():
+    from app.company_presets import PRESETS
+    from app.db import seed_presets
+
+    with session_scope() as db:
+        seed_presets(db)
+        seed_presets(db)  # second pass must not duplicate
+    with session_scope() as db:
+        rows = list(db.scalars(matcher.select(models.Company).where(models.Company.preset_key.is_not(None))))
+        assert len(rows) == len(PRESETS)
+        assert all(c.user_id is None and c.is_preset for c in rows)
+
+
+def test_crawl_presets_populates_shared_positions(monkeypatch):
+    from app.company_presets import PRESETS
+    from app.db import seed_presets
+    from app.services import crawler, scraper
+
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: [
+        scraper.ScrapedPosition(external_id=f"{c.preset_key}-1", title=f"{c.name} Eng", description="build")
+    ])
+    with session_scope() as db:
+        seed_presets(db)
+    summary = crawler.crawl_presets()
+    assert summary["companies"] == len(PRESETS) and summary["new_positions"] == len(PRESETS)
+    with session_scope() as db:
+        positions = list(db.scalars(matcher.select(models.Position)))
+        assert len(positions) == len(PRESETS)
+        assert all(db.get(models.Company, p.company_id).is_preset for p in positions)
+
+
+def test_user_scan_does_not_crawl_presets(monkeypatch):
+    from app.db import seed_presets
+
+    crawled: list[str] = []
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: crawled.append(c.name) or [])
+    with session_scope() as db:
+        uid = _seed_user(db)  # has a custom company "Acme"
+        seed_presets(db)
+        anthropic = db.scalar(matcher.select(models.Company).where(models.Company.preset_key == "anthropic"))
+        db.add(models.Subscription(user_id=uid, company_id=anthropic.id))
+    with session_scope() as db:
+        matcher.scrape_only(db, db.get(models.User, uid))
+    # The user's scan crawls only their custom company, never the subscribed preset.
+    assert "Acme" in crawled and "Anthropic" not in crawled
+
+
+def test_two_subscribers_share_one_preset_position():
+    from app.db import seed_presets
+
+    with session_scope() as db:
+        seed_presets(db)
+        anthropic = db.scalar(matcher.select(models.Company).where(models.Company.preset_key == "anthropic"))
+        aid = anthropic.id
+        pos = models.Position(company_id=aid, external_id="x1", title="Backend Engineer", description="build")
+        db.add(pos); db.flush()
+        pid = pos.id
+        uids = []
+        for email in ("share1@x.com", "share2@x.com"):
+            u = models.User(email=email, hashed_password="h"); db.add(u); db.flush()
+            db.add(models.Resume(user_id=u.id, filename="r", content_text="python", is_active=True))
+            db.add(models.Interest(user_id=u.id, label="be", title_keywords="backend", is_active=True))
+            db.add(models.Subscription(user_id=u.id, company_id=aid))
+            uids.append(u.id)
+
+    with session_scope() as db:  # each subscriber's backlog is the one shared position
+        for uid in uids:
+            assert matcher.count_pending(db, db.get(models.User, uid)) == 1
+    for uid in uids:
+        with session_scope() as db:
+            matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:  # two MatchResults against the SAME position row
+        results = list(db.scalars(matcher.select(models.MatchResult).where(models.MatchResult.position_id == pid)))
+        assert len(results) == 2 and {r.user_id for r in results} == set(uids)
+
+
+def test_add_preset_subscribes_custom_creates(monkeypatch):
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'cat@x.com').json()['access_token']}"}
+        r = c.post("/api/companies", headers=h, json={
+            "name": "Anthropic", "ats_type": "greenhouse", "ats_token": "anthropic", "preset_key": "anthropic"})
+        assert r.status_code == 201 and r.json()["is_preset"] is True
+        # Subscribing again is a 409, not a duplicate.
+        assert c.post("/api/companies", headers=h, json={"name": "Anthropic", "preset_key": "anthropic"}).status_code == 409
+        # A non-preset is created as a per-user custom company.
+        r2 = c.post("/api/companies", headers=h, json={
+            "name": "Acme", "careers_url": "https://acme.example/careers", "ats_type": "html"})
+        assert r2.status_code == 201 and r2.json()["is_preset"] is False
+        assert {x["name"] for x in c.get("/api/companies", headers=h).json()} >= {"Anthropic", "Acme"}
+    with session_scope() as db:  # exactly one shared Anthropic row
+        rows = list(db.scalars(matcher.select(models.Company).where(models.Company.preset_key == "anthropic")))
+        assert len(rows) == 1
+
+
+def test_admin_crawl_endpoint_token_gated(monkeypatch):
+    from app.config import settings
+    from app.services import crawler
+
+    kicks: list[int] = []
+    monkeypatch.setattr(crawler, "crawl_presets_async", lambda: kicks.append(1))
+    with TestClient(app) as c:
+        monkeypatch.setattr(settings, "admin_token", "")  # disabled
+        assert c.post("/api/admin/crawl").status_code == 503
+        monkeypatch.setattr(settings, "admin_token", "s3cret")
+        assert c.post("/api/admin/crawl").status_code == 401  # missing token
+        r = c.post("/api/admin/crawl", headers={"X-Admin-Token": "s3cret"})
+        assert r.status_code == 202 and kicks
 
 
 # ── Health ───────────────────────────────────────────────────────────────────

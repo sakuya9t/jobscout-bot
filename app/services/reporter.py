@@ -5,13 +5,16 @@ import html
 import json
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import Company, Interest, JobListSnapshot, MatchResult, Position, User
+from .matcher import ERROR_MODEL
 
 
 JOB_LIST_SNAPSHOT_LIMIT = 500
+# Categories the dashboard job list can request (see build_job_list).
+JOB_CATEGORIES = ("matching", "all")
 
 
 def _loads(value: str | None) -> list[str]:
@@ -19,6 +22,26 @@ def _loads(value: str | None) -> list[str]:
         return json.loads(value) if value else []
     except json.JSONDecodeError:
         return []
+
+
+def _match_row(match: MatchResult, pos: Position, company: Company, *,
+               below_threshold: bool, non_matching: bool = False) -> dict:
+    """Build one dashboard/report row dict from a (match, position, company)."""
+    return {
+        "position_id": pos.id,
+        "company": company.name,
+        "title": pos.title,
+        "location": pos.location,
+        "url": pos.url,
+        "match_score": match.match_score,
+        "win_probability": match.win_probability,
+        "reasoning": match.reasoning,
+        "strengths": _loads(match.strengths),
+        "gaps": _loads(match.gaps),
+        "below_threshold": below_threshold,
+        "non_matching": non_matching,
+        "scored_at": match.created_at.isoformat() if match.created_at else None,
+    }
 
 
 def build_report(
@@ -62,29 +85,13 @@ def build_report(
     # Per-interest thresholds, for when min_score isn't overridden.
     thresholds = {i.id: i.min_score for i in db.scalars(select(Interest).where(Interest.user_id == user.id))}
 
-    def _row(match, pos, company, below: bool) -> dict:
-        return {
-            "position_id": pos.id,
-            "company": company.name,
-            "title": pos.title,
-            "location": pos.location,
-            "url": pos.url,
-            "match_score": match.match_score,
-            "win_probability": match.win_probability,
-            "reasoning": match.reasoning,
-            "strengths": _loads(match.strengths),
-            "gaps": _loads(match.gaps),
-            "below_threshold": below,
-            "scored_at": match.created_at.isoformat() if match.created_at else None,
-        }
-
     all_ranked: list[dict] = []
     above: list[dict] = []
     below: list[dict] = []
     for match, pos, company in rows:
         threshold = min_score if min_score is not None else thresholds.get(match.interest_id, 70)
         is_below = match.match_score < threshold
-        row = _row(match, pos, company, is_below)
+        row = _match_row(match, pos, company, below_threshold=is_below)
         all_ranked.append(row)
         (below if is_below else above).append(row)
 
@@ -99,10 +106,75 @@ def build_report(
     return report
 
 
+def build_job_list(
+    db: Session,
+    user: User,
+    *,
+    category: str = "matching",
+    min_score: int = 0,
+    min_win: int = 0,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """One page of the dashboard job list, plus the total count in that category.
+
+    ``category="matching"`` returns only jobs the AI judged a fit (passed_filter),
+    below-threshold ones tagged. ``category="all"`` additionally includes
+    non-matching jobs — filter-rejected and keyword-excluded — but never transient
+    scoring-error markers. Matches rank first (by score), then non-matching by
+    recency. Pagination is server-side via ``limit``/``offset``.
+
+    ``min_score`` / ``min_win`` keep only matches scoring at least that (0 = off).
+    They gate real matches; non-matching rows have no meaningful score, so in the
+    "all" category they're shown regardless of the thresholds."""
+    base = (
+        select(MatchResult, Position, Company)
+        .join(Position, MatchResult.position_id == Position.id)
+        .join(Company, Position.company_id == Company.id)
+        .where(MatchResult.user_id == user.id)
+    )
+    if category == "all":
+        # Everything except error markers (those are failures, not "non-matching").
+        base = base.where(MatchResult.model.is_distinct_from(ERROR_MODEL))
+        if min_score > 0 or min_win > 0:
+            base = base.where(
+                (MatchResult.passed_filter == False)  # noqa: E712 — non-matching: exempt
+                | ((MatchResult.match_score >= min_score) & (MatchResult.win_probability >= min_win))
+            )
+    else:
+        base = base.where(MatchResult.passed_filter == True)  # noqa: E712
+        if min_score > 0:
+            base = base.where(MatchResult.match_score >= min_score)
+        if min_win > 0:
+            base = base.where(MatchResult.win_probability >= min_win)
+
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+    rows = db.execute(
+        base.order_by(
+            MatchResult.passed_filter.desc(),
+            MatchResult.match_score.desc(),
+            MatchResult.win_probability.desc(),
+            MatchResult.created_at.desc(),
+        )
+        .offset(max(0, offset))
+        .limit(limit)
+    ).all()
+
+    thresholds = {i.id: i.min_score for i in db.scalars(select(Interest).where(Interest.user_id == user.id))}
+    items = []
+    for match, pos, company in rows:
+        non_matching = not match.passed_filter
+        below = (not non_matching) and match.match_score < thresholds.get(match.interest_id, 70)
+        items.append(_match_row(match, pos, company, below_threshold=below, non_matching=non_matching))
+    return items, total
+
+
 def _match_out_payload(match: dict) -> dict:
     keep = {
         "position_id", "company", "title", "location", "url", "match_score",
         "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
+        "non_matching",
     }
     return {k: v for k, v in match.items() if k in keep}
 

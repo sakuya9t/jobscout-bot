@@ -88,21 +88,26 @@ def get_job_list_runs(
 
 @router.get("/job-lists/latest", response_model=JobListOut)
 def get_latest_job_list(
-    limit: int = 5,
+    limit: int = 10,
+    offset: int = 0,
+    category: str = "matching",
+    min_score: int = 0,
+    min_win: int = 0,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """The default 'latest' view is **live** — a fresh ranked report over current
+    """The default 'latest' view is **live** — a fresh ranked page over current
     MatchResults — so matches appear progressively as the background evaluator
-    scores them, with ``pending`` counting what's left. Run stats and warnings come
-    from the most recent saved snapshot (the last completed drain); the browsable
-    frozen versions are served by ``/job-lists/runs`` and ``/job-lists/{id}``."""
-    items = _strip(
-        reporter.build_report(
-            db, user, limit=_JOB_LIST_RESPONSE_LIMIT, include_below_threshold=True
-        )
+    scores them, with ``pending`` counting what's left. ``category`` selects
+    matching-only or all (incl. non-matching) jobs; ``min_score``/``min_win`` keep
+    only matches at or above those thresholds; ``limit``/``offset`` paginate.
+    Run stats and warnings come from the most recent saved snapshot (the last
+    completed drain); frozen versions are served by ``/job-lists/{id}``."""
+    items, total = reporter.build_job_list(
+        db, user, category=_category(category),
+        min_score=max(0, min_score), min_win=max(0, min_win),
+        limit=_safe_limit(limit), offset=max(0, offset),
     )
-    safe_limit = _safe_limit(limit)
     snapshot = db.scalar(
         select(JobListSnapshot)
         .where(JobListSnapshot.user_id == user.id)
@@ -117,38 +122,36 @@ def get_latest_job_list(
         filtered=snapshot.filtered if snapshot else 0,
         errors=reporter.job_list_errors(snapshot) if snapshot else [],
         pending=matcher.count_pending(db, user),
-        total=len(items),
-        items=[MatchOut(**m) for m in items[:safe_limit]],
+        total=total,
+        items=[MatchOut(**m) for m in items],
     )
 
 
 @router.get("/job-lists/{snapshot_id}", response_model=JobListOut)
 def get_job_list(
     snapshot_id: int,
-    limit: int = 5,
+    limit: int = 10,
+    offset: int = 0,
+    category: str = "matching",
+    min_score: int = 0,
+    min_win: int = 0,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """A frozen saved version. Snapshots only store matching jobs, so the
+    'all'/non-matching category has nothing extra to show here — pagination just
+    pages over the stored matches, after the score/win thresholds are applied."""
     snapshot = db.get(JobListSnapshot, snapshot_id)
     if not snapshot or snapshot.user_id != user.id:
         raise HTTPException(status_code=404, detail="Job list not found")
-    return _job_list_out(snapshot, limit)
-
-
-def _strip(report: list[dict]) -> list[dict]:
-    """Drop reporter-only keys that aren't part of the MatchOut schema."""
-    keep = {"position_id", "company", "title", "location", "url", "match_score",
-            "win_probability", "reasoning", "strengths", "gaps", "below_threshold"}
-    return [{k: v for k, v in m.items() if k in keep} for m in report]
-
-
-def _safe_limit(limit: int) -> int:
-    return min(max(limit, 1), _JOB_LIST_RESPONSE_LIMIT)
-
-
-def _job_list_out(snapshot: JobListSnapshot, limit: int) -> JobListOut:
-    items = reporter.job_list_items(snapshot)
-    safe_limit = _safe_limit(limit)
+    all_items = reporter.job_list_items(snapshot)
+    if min_score > 0 or min_win > 0:
+        all_items = [
+            m for m in all_items
+            if m.get("match_score", 0) >= min_score and m.get("win_probability", 0) >= min_win
+        ]
+    start = max(0, offset)
+    page = all_items[start : start + _safe_limit(limit)]
     return JobListOut(
         id=snapshot.id,
         created_at=snapshot.created_at,
@@ -156,6 +159,23 @@ def _job_list_out(snapshot: JobListSnapshot, limit: int) -> JobListOut:
         scored=snapshot.scored,
         filtered=snapshot.filtered,
         errors=reporter.job_list_errors(snapshot),
-        total=len(items),
-        items=[MatchOut(**m) for m in items[:safe_limit]],
+        total=len(all_items),
+        items=[MatchOut(**m) for m in page],
     )
+
+
+def _strip(report: list[dict]) -> list[dict]:
+    """Drop reporter-only keys that aren't part of the MatchOut schema."""
+    keep = {"position_id", "company", "title", "location", "url", "match_score",
+            "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
+            "non_matching"}
+    return [{k: v for k, v in m.items() if k in keep} for m in report]
+
+
+def _safe_limit(limit: int) -> int:
+    return min(max(limit, 1), _JOB_LIST_RESPONSE_LIMIT)
+
+
+def _category(value: str) -> str:
+    """Clamp the requested job-list category to a known one (default matching)."""
+    return value if value in reporter.JOB_CATEGORIES else "matching"

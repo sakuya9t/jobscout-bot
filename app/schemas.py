@@ -71,6 +71,9 @@ class CompanyIn(BaseModel):
     ats_type: str = "auto"
     ats_token: str | None = None
     location_hint: str | None = None
+    # When set (or when the payload matches a preset), "adding" subscribes the user
+    # to the shared global preset company instead of creating a per-user duplicate.
+    preset_key: str | None = None
 
 
 class CompanyUpdate(BaseModel):
@@ -91,6 +94,9 @@ class CompanyOut(_ORM):
     location_hint: str | None
     is_active: bool
     last_scraped_at: datetime | None
+    # True for a global preset company the user is subscribed to (vs their own
+    # custom company). Deleting it unsubscribes rather than removing the catalog row.
+    is_preset: bool = False
 
 
 # ── Interest ─────────────────────────────────────────────────────────────────
@@ -149,6 +155,9 @@ class MatchOut(BaseModel):
     # True when this row is below the user's score threshold but shown anyway to
     # keep the dashboard non-empty (the daily Telegram report omits these).
     below_threshold: bool = False
+    # True for a non-matching job (filter-rejected or keyword-excluded) shown only
+    # in the dashboard's "all jobs" view — score fields are not meaningful for it.
+    non_matching: bool = False
 
 
 class JobListRunOut(BaseModel):

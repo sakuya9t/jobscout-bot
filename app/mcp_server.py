@@ -134,6 +134,9 @@ def list_resumes() -> list[dict]:
 def run_daily_scan() -> dict:
     """Scrape the user's companies, detect new positions, and score them with the
     Ollama model against the active resume. Returns counts, warnings, and the top matches."""
+    from .services import crawler
+
+    crawler.crawl_presets()  # refresh the shared preset catalog before scoring
     with session_scope() as db:
         user = _current_user(db)
         result = matcher.run_for_user(db, user)

@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # Set the session cookie's Secure flag (HTTPS-only). Leave off for localhost
     # dev; turn on (JOBSCOUT_COOKIE_SECURE=1) behind HTTPS in production.
     cookie_secure: bool = False
+    # Internal/admin endpoints (e.g. POST /api/admin/crawl) require this token in an
+    # X-Admin-Token header. Empty (default) disables them with 503 — never an open
+    # trigger. Set JOBSCOUT_ADMIN_TOKEN to a long random string to enable.
+    admin_token: str = ""
 
     @property
     def secret_is_default(self) -> bool:
