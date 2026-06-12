@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import Company, Interest, JobListSnapshot, MatchResult, Position, User
+from ..timeutil import utcnow
 from .matcher import ERROR_MODEL
 
 
@@ -24,9 +25,16 @@ def _loads(value: str | None) -> list[str]:
         return []
 
 
+def _listed_at(pos: Position) -> datetime | None:
+    """The job's effective 'listed' date: the ATS-reported post date when we have
+    one, else when our crawler first saw it (so undated sources still get a date)."""
+    return pos.posted_at or pos.first_seen_at
+
+
 def _match_row(match: MatchResult, pos: Position, company: Company, *,
                below_threshold: bool, non_matching: bool = False) -> dict:
     """Build one dashboard/report row dict from a (match, position, company)."""
+    listed = _listed_at(pos)
     return {
         "position_id": pos.id,
         "company": company.name,
@@ -41,6 +49,7 @@ def _match_row(match: MatchResult, pos: Position, company: Company, *,
         "below_threshold": below_threshold,
         "non_matching": non_matching,
         "scored_at": match.created_at.isoformat() if match.created_at else None,
+        "listed_at": listed.isoformat() if listed else None,
     }
 
 
@@ -113,6 +122,7 @@ def build_job_list(
     category: str = "matching",
     min_score: int = 0,
     min_win: int = 0,
+    posted_within_days: int | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
@@ -126,13 +136,24 @@ def build_job_list(
 
     ``min_score`` / ``min_win`` keep only matches scoring at least that (0 = off).
     They gate real matches; non-matching rows have no meaningful score, so in the
-    "all" category they're shown regardless of the thresholds."""
+    "all" category they're shown regardless of the thresholds.
+
+    ``posted_within_days`` keeps only postings listed within that many days
+    (None/<=0 = off), by the job's effective listed date — the ATS post date, or
+    our first-seen date when the source carries none. The filter is applied to the
+    query before counting/paging, so ``total`` and the top-N (e.g. top-5) selection
+    both reflect only the date-filtered pool."""
     base = (
         select(MatchResult, Position, Company)
         .join(Position, MatchResult.position_id == Position.id)
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id)
     )
+    if posted_within_days and posted_within_days > 0:
+        cutoff = utcnow() - timedelta(days=posted_within_days)
+        base = base.where(
+            func.coalesce(Position.posted_at, Position.first_seen_at) >= cutoff
+        )
     if category == "all":
         # Everything except error markers (those are failures, not "non-matching").
         base = base.where(MatchResult.model.is_distinct_from(ERROR_MODEL))
@@ -174,7 +195,7 @@ def _match_out_payload(match: dict) -> dict:
     keep = {
         "position_id", "company", "title", "location", "url", "match_score",
         "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
-        "non_matching",
+        "non_matching", "listed_at",
     }
     return {k: v for k, v in match.items() if k in keep}
 
@@ -206,6 +227,26 @@ def job_list_items(snapshot: JobListSnapshot) -> list[dict]:
     except json.JSONDecodeError:
         return []
     return data if isinstance(data, list) else []
+
+
+def filter_items_posted_within(items: list[dict], posted_within_days: int | None) -> list[dict]:
+    """Keep stored job-list items whose ``listed_at`` falls within the window.
+    No-op when the window is off (None/<=0). Items missing/with an unparseable
+    ``listed_at`` (e.g. snapshots saved before this field existed) are kept rather
+    than silently dropped."""
+    if not posted_within_days or posted_within_days <= 0:
+        return items
+    cutoff = utcnow() - timedelta(days=posted_within_days)
+    kept = []
+    for item in items:
+        raw = item.get("listed_at")
+        try:
+            listed = datetime.fromisoformat(raw) if raw else None
+        except (TypeError, ValueError):
+            listed = None
+        if listed is None or listed >= cutoff:
+            kept.append(item)
+    return kept
 
 
 def job_list_errors(snapshot: JobListSnapshot) -> list[str]:

@@ -15,11 +15,6 @@ from .config import settings
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
-# Dedicated logger for the Ollama wire log (every request/response). Named so it
-# can be filtered (`grep 'jobscout.ollama'`) or routed/silenced independently of
-# the rest of the app.
-OLLAMA_LOGGER = "jobscout.ollama"
-
 _configured = False
 
 

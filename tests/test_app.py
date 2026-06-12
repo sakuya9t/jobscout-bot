@@ -5,6 +5,7 @@ and the scraper is monkeypatched."""
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -134,6 +135,64 @@ def _seed_user(db, *, email="u@x.com", description="Build Python APIs", min_scor
 def _no_network(monkeypatch):
     """Never hit a real career page during pipeline tests."""
     monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: [])
+
+
+# ── Schema reconcile (micro-migration) ───────────────────────────────────────
+def test_reconcile_schema_adds_column_relaxes_notnull_and_keeps_data():
+    """An older on-disk DB whose ``companies`` table predates ``preset_key`` and
+    still has ``user_id NOT NULL`` is brought up to the current model: the column
+    and its unique index are added, the NOT NULL is relaxed, existing rows survive,
+    and a preset row (user_id NULL) can then be inserted."""
+    import tempfile
+    from sqlalchemy import create_engine, inspect, text
+    from app.db import _reconcile_schema
+
+    path = tempfile.mktemp(suffix=".db")
+    eng = create_engine(f"sqlite:///{path}")
+    try:
+        # Stand up an "old" companies table (no preset_key, user_id NOT NULL), then
+        # let create_all add the remaining current tables around it.
+        with eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE companies ("
+                " id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+                " name VARCHAR(255), careers_url VARCHAR(1024), ats_type VARCHAR(32),"
+                " ats_token VARCHAR(255), location_hint VARCHAR(255),"
+                " is_active BOOLEAN, created_at DATETIME, last_scraped_at DATETIME)"
+            ))
+            conn.execute(text(
+                "INSERT INTO companies (id, user_id, name, ats_type)"
+                " VALUES (1, 42, 'Acme', 'greenhouse')"
+            ))
+        models.Base.metadata.create_all(eng)  # creates the other tables; skips companies
+
+        _reconcile_schema(eng)
+
+        insp = inspect(eng)
+        cols = {c["name"]: c for c in insp.get_columns("companies")}
+        assert "preset_key" in cols                       # column added
+        assert cols["user_id"]["nullable"] is True        # NOT NULL relaxed
+        assert any(ix["name"] == "ix_companies_preset_key" for ix in insp.get_indexes("companies"))
+
+        with eng.begin() as conn:
+            # Existing row preserved through the rebuild...
+            assert conn.execute(text("SELECT name FROM companies WHERE id=1")).scalar() == "Acme"
+            # ...and a preset row (user_id NULL) now inserts, which the old schema forbade.
+            conn.execute(text(
+                "INSERT INTO companies (id, user_id, preset_key, name) VALUES (2, NULL, 'anthropic', 'Anthropic')"
+            ))
+            assert conn.execute(text("SELECT COUNT(*) FROM companies")).scalar() == 2
+
+        # Idempotent: a second pass is a no-op (no error, same shape).
+        _reconcile_schema(eng)
+    finally:
+        eng.dispose()
+        import os
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -791,6 +850,115 @@ def test_build_job_list_score_and_win_filters():
         assert lo_total == 2
 
 
+def _seed_dated_matches(db, uid):
+    """Matching positions across a range of listed dates. The two highest scorers
+    are *old* (20 and 40 days), so a recent-only window must replace them with
+    lower-scoring fresh roles. 'Undated' has no posted_at -> first_seen_at (now)
+    is its effective date. These are extra rows on top of _seed_user's base
+    position (which has no MatchResult and so never appears in the job list)."""
+    from app.timeutil import utcnow
+
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    company = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    now = utcnow()
+    specs = [  # (ext, title, score, days_ago | None -> undated)
+        ("old1", "OldHigh1", 99, 40), ("old2", "OldHigh2", 98, 20),
+        ("r0", "Recent0", 85, 0), ("r2", "Recent2", 84, 2),
+        ("r4", "Recent4", 83, 4), ("r6", "Recent6", 82, 6),
+        ("undated", "Undated", 70, None),
+    ]
+    for ext, title, score, days in specs:
+        posted = None if days is None else now - timedelta(days=days)
+        pos = models.Position(company_id=company.id, external_id=ext, title=title,
+                              description="d", posted_at=posted)
+        db.add(pos); db.flush()
+        db.add(models.MatchResult(user_id=uid, position_id=pos.id, resume_id=rid,
+                                  interest_id=interest.id, passed_filter=True,
+                                  match_score=score, win_probability=score,
+                                  reasoning="r", model="good"))
+    db.flush()
+
+
+def test_build_job_list_post_date_filter():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_dated_matches(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+
+        _, all_total = reporter.build_job_list(db, user, category="matching")
+        assert all_total == 7  # the 7 seeded matches (base position has no match)
+
+        # 24h window keeps only today's (Recent0) and the undated (first-seen now).
+        wk, total = reporter.build_job_list(db, user, category="matching", posted_within_days=1)
+        assert total == 2 and {m["title"] for m in wk} == {"Recent0", "Undated"}
+
+        # 7-day window: the four Recent* roles + Undated; both old highs excluded.
+        _, total7 = reporter.build_job_list(db, user, category="matching", posted_within_days=7)
+        assert total7 == 5
+
+        # 30-day window additionally lets the 20-day-old high back in; 40-day stays out.
+        _, total30 = reporter.build_job_list(db, user, category="matching", posted_within_days=30)
+        assert total30 == 6
+
+        # Every row carries an effective listed date for the UI.
+        page, _ = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert all(m["listed_at"] for m in page)
+
+
+def test_top5_backfills_from_date_filtered_pool():
+    """With a post-date window, the top-5 glance is drawn from the filtered pool —
+    the real highest scorers (here the 20- and 40-day-old ones) that fall outside
+    the window are replaced by fresh lower-scoring roles, not left as gaps."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_dated_matches(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(
+            db, user, category="matching", posted_within_days=7, limit=5
+        )
+        # 5 in-window matches, all returned, neither old high scorer among them.
+        assert total == 5 and len(items) == 5
+        assert {"OldHigh1", "OldHigh2"}.isdisjoint(m["title"] for m in items)
+
+
+def test_job_list_endpoint_accepts_post_date_filter(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_dated_matches(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        wide = c.get("/api/job-lists/latest?category=matching&limit=50", headers=h).json()
+        narrow = c.get(
+            "/api/job-lists/latest?category=matching&limit=50&posted_within_days=7", headers=h
+        ).json()
+        assert wide["total"] == 7 and narrow["total"] == 5
+        assert all(it["listed_at"] for it in narrow["items"])
+
+
+def test_filter_items_posted_within_keeps_undated():
+    """Frozen-snapshot date filtering keeps items missing listed_at (older saved
+    snapshots) and drops only those provably outside the window."""
+    from app.timeutil import utcnow
+
+    now = utcnow()
+    items = [
+        {"title": "fresh", "listed_at": (now - timedelta(days=1)).isoformat()},
+        {"title": "stale", "listed_at": (now - timedelta(days=20)).isoformat()},
+        {"title": "legacy"},  # no listed_at -> kept
+    ]
+    kept = {m["title"] for m in reporter.filter_items_posted_within(items, 7)}
+    assert kept == {"fresh", "legacy"}
+    # Window off -> everything passes through untouched.
+    assert reporter.filter_items_posted_within(items, None) == items
+
+
 def test_score_filter_exempts_non_matching_in_all_category():
     with session_scope() as db:
         uid = _seed_user(db)
@@ -948,10 +1116,11 @@ def test_health_states(monkeypatch, status, expected):
 
 
 # ── Ollama logging ───────────────────────────────────────────────────────────
-def test_ollama_logs_request_and_response(monkeypatch, caplog):
-    """Every Ollama call logs the outgoing prompt and the completion (correlated
-    by a request id) on the jobscout.ollama logger — and never the API key."""
+def test_ollama_logs_request_and_response(monkeypatch):
+    """Every Ollama call persists the outgoing prompt and the completion to the
+    llm_logs table (correlated by a request id) — and never the API key."""
     import app.services.ollama_client as oc
+    from app.services import llm_log
 
     class Resp:
         def json(self):
@@ -959,14 +1128,20 @@ def test_ollama_logs_request_and_response(monkeypatch, caplog):
                     "prompt_eval_count": 12, "eval_count": 3}
 
     monkeypatch.setattr(oc, "_post", lambda url, body, headers, timeout: Resp())
-    with caplog.at_level("INFO", logger=oc.OLLAMA_LOGGER):
-        out = oc.OllamaClient(api_key="super-secret-key").chat_text("be terse", "hi there")
+    out = oc.OllamaClient(api_key="super-secret-key").chat_text("be terse", "hi there")
+    llm_log.flush()
 
     assert out == "hello world"
-    text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "→ POST" in text and "hi there" in text          # request prompt logged
-    assert "assistant: hello world" in text                 # response logged
-    assert "super-secret-key" not in text                   # API key never logged
+    with session_scope() as db:
+        rows = list(db.scalars(matcher.select(models.LlmLog)))
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.status == "ok" and row.correlation_id
+        assert "hi there" in row.request_messages and "be terse" in row.request_messages
+        assert row.response_content == "hello world"
+        assert row.prompt_tokens == 12 and row.eval_tokens == 3 and row.done_reason == "stop"
+        # The API key lives only in the Authorization header, never in what we store.
+        assert "super-secret-key" not in row.request_messages
 
 
 @pytest.mark.parametrize("status,body,expected", [
@@ -997,21 +1172,31 @@ def test_ollama_budget_error_classification(monkeypatch, status, body, expected)
 
 
 def test_ollama_logs_failures(monkeypatch, caplog):
-    """A transport/HTTP error is logged (with the ✗ marker) before being raised."""
+    """A transport/HTTP error is recorded as an error row (and still logged to
+    stdout at WARNING with the ✗ marker) before being raised."""
     import app.services.ollama_client as oc
+    from app.services import llm_log
 
     def boom(*a, **k):
         raise oc.httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(oc, "_post", boom)
-    with caplog.at_level("WARNING", logger=oc.OLLAMA_LOGGER):
+    with caplog.at_level("WARNING", logger="app.services.ollama_client"):
         with pytest.raises(oc.OllamaError):
             oc.OllamaClient().chat_text("s", "u")
-    assert any("✗" in r.getMessage() for r in caplog.records)
+    llm_log.flush()
+
+    assert any("✗" in r.getMessage() for r in caplog.records)  # terse stdout warning
+    with session_scope() as db:
+        rows = list(db.scalars(matcher.select(models.LlmLog)))
+        assert len(rows) == 1
+        assert rows[0].status == "error" and "connection refused" in rows[0].error_detail
+        assert rows[0].response_content is None
 
 
-def test_ollama_logging_can_be_disabled(monkeypatch, caplog):
+def test_ollama_logging_can_be_disabled(monkeypatch):
     import app.services.ollama_client as oc
+    from app.services import llm_log
 
     class Resp:
         def json(self):
@@ -1019,6 +1204,7 @@ def test_ollama_logging_can_be_disabled(monkeypatch, caplog):
 
     monkeypatch.setattr(oc, "_post", lambda *a, **k: Resp())
     monkeypatch.setattr(oc.settings, "log_ollama", False)
-    with caplog.at_level("INFO", logger=oc.OLLAMA_LOGGER):
-        oc.OllamaClient().chat_text("s", "u")
-    assert caplog.records == []
+    oc.OllamaClient().chat_text("s", "u")
+    llm_log.flush()
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.LlmLog))) == []

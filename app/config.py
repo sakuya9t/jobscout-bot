@@ -42,12 +42,13 @@ class Settings(BaseSettings):
     log_file: str = ""
     log_max_bytes: int = 5_000_000
     log_backup_count: int = 3
-    # Log every Ollama request/response (full prompt + completion) on the
-    # "jobscout.ollama" logger. Prompts carry resume + job text, so they can be
-    # large and sensitive — set JOBSCOUT_LOG_OLLAMA=0 in shared environments.
+    # Persist every Ollama request/response (full prompt + completion) to the
+    # llm_logs table (see services/llm_log.py); stdout gets only a terse summary.
+    # Prompts carry resume + job text, so they can be large and sensitive — set
+    # JOBSCOUT_LOG_OLLAMA=0 in shared environments to disable the wire log.
     log_ollama: bool = True
-    # Truncate each logged prompt/response to this many chars (0 = no limit).
-    log_ollama_max_chars: int = 4000
+    # Truncate each stored prompt/response to this many chars (0 = store in full).
+    log_ollama_max_chars: int = 0
 
     # Ollama Cloud
     ollama_base_url: str = "https://ollama.com"
@@ -82,6 +83,10 @@ class Settings(BaseSettings):
     # Google careers has no ATS API; we page its server-rendered results (20/page).
     # Cap pages so a run pulls a bounded slice instead of all ~thousands of roles.
     scrape_google_max_pages: int = 20
+    # Eightfold (PCSX) pages 10 roles each, newest-first; paging stops early once
+    # postings predate scrape_max_age_days, so this only caps very high-volume
+    # boards (60 pages = 600 newest roles) to bound request count per crawl.
+    scrape_eightfold_max_pages: int = 60
     # Only pull postings posted/updated within this many days, to bound how much we
     # store and score. Applies only to sources that expose a date (greenhouse/
     # lever/ashby); Google careers and the HTML fallback carry no per-posting date,

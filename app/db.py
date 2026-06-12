@@ -1,13 +1,17 @@
 """Database engine and session management."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, inspect, select, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import settings
+
+log = logging.getLogger(__name__)
 
 _is_sqlite = settings.database_url.startswith("sqlite")
 _connect_args = {"check_same_thread": False} if _is_sqlite else {}
@@ -31,6 +35,159 @@ if _is_sqlite:
         # silently orphaning child rows.
         cur.execute("PRAGMA foreign_keys=ON")
         cur.close()
+
+
+def _literal_default(column) -> str | None:
+    """A SQL literal for a column's scalar Python default, or None when it has
+    none / isn't a simple constant we can safely render into DDL."""
+    default = column.default
+    if default is None or not getattr(default, "is_scalar", False):
+        return None
+    value = default.arg
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return None
+
+
+def _reconcile_schema(bind: Engine) -> None:
+    """Additive, idempotent micro-migration for SQLite dev/prod DBs.
+
+    ``Base.metadata.create_all`` creates absent *tables* but never adds *columns*
+    or indexes to a table that already exists, so adding a model field (e.g.
+    ``Company.preset_key``) leaves an older on-disk DB unable to start. This brings
+    such a DB up to the current models by ADDing any missing columns and creating
+    any missing indexes. It is deliberately limited to *safe, additive* changes —
+    new nullable columns (or ones with a literal default) and new indexes; column
+    drops, renames and type changes are out of scope and still need a real
+    migration. SQLite only (other backends should use Alembic)."""
+    if bind.dialect.name != "sqlite":
+        return
+    from . import models
+
+    insp = inspect(bind)
+    existing_tables = set(insp.get_table_names())
+    # 1) Add missing columns (ALTER TABLE ADD COLUMN).
+    with bind.begin() as conn:
+        for table in models.Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue  # create_all builds the whole (new) table itself
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in have:
+                    continue
+                default = _literal_default(column)
+                if not column.nullable and default is None:
+                    # Can't backfill a NOT NULL column with no default on existing
+                    # rows; surface it rather than silently corrupt the table.
+                    log.warning(
+                        "schema reconcile: skipping %s.%s (NOT NULL, no default)",
+                        table.name, column.name,
+                    )
+                    continue
+                coltype = column.type.compile(dialect=bind.dialect)
+                ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {coltype}'
+                if not column.nullable:
+                    ddl += " NOT NULL"
+                if default is not None:
+                    ddl += f" DEFAULT {default}"
+                log.info("schema reconcile: adding column %s.%s", table.name, column.name)
+                conn.execute(text(ddl))
+    # 2) Rebuild any table whose column constraints (e.g. a NOT NULL that the model
+    # relaxed to nullable) drifted — ALTER can't change those in SQLite.
+    insp = inspect(bind)  # refresh: the additive pass above changed the schema
+    for table in models.Base.metadata.sorted_tables:
+        if table.name in existing_tables and _nullability_drift(insp, table):
+            _rebuild_table(bind, table)
+    # 3) create_all skips existing tables entirely, so an index added alongside a
+    # column won't exist yet; checkfirst makes this a no-op for indexes present.
+    for table in models.Base.metadata.sorted_tables:
+        if table.name in existing_tables:
+            for index in table.indexes:
+                index.create(bind=bind, checkfirst=True)
+
+
+def _nullability_drift(insp, table) -> bool:
+    """True when the model relaxed a column from NOT NULL to nullable but the disk
+    table still enforces it — the one column-definition change we apply by rebuild.
+    Tightening (nullable -> NOT NULL) is deliberately left to a real migration; the
+    rebuild only ever relaxes, so it can never fail or drop rows."""
+    disk = {c["name"]: c for c in insp.get_columns(table.name)}
+    for column in table.columns:
+        d = disk.get(column.name)
+        if d is None:
+            continue
+        disk_notnull = not d["nullable"]
+        model_nullable = column.nullable and not column.primary_key
+        if disk_notnull and model_nullable:
+            return True
+    return False
+
+
+def _rebuild_table(bind: Engine, table) -> None:
+    """SQLite-safe table rebuild: create a fresh table with the model's schema,
+    copy the shared columns across, then swap it in and recreate its indexes. This
+    is how SQLite applies column-definition changes ALTER can't (e.g. relaxing a
+    NOT NULL constraint). FK enforcement is disabled across the swap so dropping a
+    referenced table is allowed; it must toggle outside a transaction.
+
+    The rebuilt table never *tightens* nullability: a column is NOT NULL only where
+    model and disk already agree, so copying existing rows can't violate a freshly
+    added constraint (tightening stays a real-migration concern)."""
+    from sqlalchemy import MetaData
+    from sqlalchemy.schema import CreateTable
+
+    insp = inspect(bind)
+    disk = {c["name"]: c for c in insp.get_columns(table.name)}
+    shared = [c.name for c in table.columns if c.name in disk]
+    cols_sql = ", ".join(f'"{c}"' for c in shared)
+    tmp = f"_recon_{table.name}"
+    # Copy into a fresh MetaData that also holds the tables this one references, so
+    # its foreign keys resolve when we compile CreateTable (only the temp table is
+    # compiled; the copied siblings are just there to satisfy FK targets).
+    tmp_meta = MetaData()
+    for sibling in table.metadata.sorted_tables:
+        sibling.to_metadata(tmp_meta, name=tmp if sibling.name == table.name else sibling.name)
+    tmp_table = tmp_meta.tables[tmp]
+    # Don't tighten: keep a column nullable wherever the disk already allows NULLs.
+    for col in tmp_table.columns:
+        d = disk.get(col.name)
+        if d is not None and d["nullable"]:
+            col.nullable = True
+    # CreateTable emits only the table (inline constraints), not the separate
+    # CREATE INDEX statements — so the temp table's creation can't collide with the
+    # still-present old indexes; we recreate those by name after the swap.
+    create_sql = str(CreateTable(tmp_table).compile(dialect=bind.dialect))
+
+    log.info("schema reconcile: rebuilding table %s to match model", table.name)
+    raw = bind.raw_connection()
+    try:
+        prev_iso = raw.isolation_level
+        raw.isolation_level = None  # take manual control of BEGIN/COMMIT
+        cur = raw.cursor()
+        cur.execute("PRAGMA foreign_keys=OFF")
+        cur.execute("BEGIN")
+        try:
+            cur.execute(create_sql)
+            cur.execute(f'INSERT INTO "{tmp}" ({cols_sql}) SELECT {cols_sql} FROM "{table.name}"')
+            cur.execute(f'DROP TABLE "{table.name}"')
+            cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table.name}"')
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+        finally:
+            cur.execute("PRAGMA foreign_keys=ON")
+            raw.isolation_level = prev_iso
+            cur.close()
+    finally:
+        raw.close()
+
+    for index in table.indexes:
+        index.create(bind=bind, checkfirst=True)
 
 
 def seed_presets(db: Session) -> None:
@@ -80,11 +237,13 @@ def _migrate_user_presets(db: Session) -> None:
 
 
 def init_db() -> None:
-    """Create all tables, seed preset companies, and run the one-time preset
-    migration. Import models first so they register with the metadata."""
+    """Create all tables, bring an existing DB up to the current schema, seed
+    preset companies, and run the one-time preset migration. Import models first
+    so they register with the metadata."""
     from . import models  # noqa: F401
 
     models.Base.metadata.create_all(bind=engine)
+    _reconcile_schema(engine)  # add columns/indexes create_all can't add to existing tables
     with session_scope() as db:
         seed_presets(db)
         _migrate_user_presets(db)

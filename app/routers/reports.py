@@ -93,6 +93,7 @@ def get_latest_job_list(
     category: str = "matching",
     min_score: int = 0,
     min_win: int = 0,
+    posted_within_days: int | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -100,12 +101,14 @@ def get_latest_job_list(
     MatchResults — so matches appear progressively as the background evaluator
     scores them, with ``pending`` counting what's left. ``category`` selects
     matching-only or all (incl. non-matching) jobs; ``min_score``/``min_win`` keep
-    only matches at or above those thresholds; ``limit``/``offset`` paginate.
-    Run stats and warnings come from the most recent saved snapshot (the last
-    completed drain); frozen versions are served by ``/job-lists/{id}``."""
+    only matches at or above those thresholds; ``posted_within_days`` keeps only
+    recently-listed jobs (None = all); ``limit``/``offset`` paginate. Run stats and
+    warnings come from the most recent saved snapshot (the last completed drain);
+    frozen versions are served by ``/job-lists/{id}``."""
     items, total = reporter.build_job_list(
         db, user, category=_category(category),
         min_score=max(0, min_score), min_win=max(0, min_win),
+        posted_within_days=posted_within_days,
         limit=_safe_limit(limit), offset=max(0, offset),
     )
     snapshot = db.scalar(
@@ -135,16 +138,19 @@ def get_job_list(
     category: str = "matching",
     min_score: int = 0,
     min_win: int = 0,
+    posted_within_days: int | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """A frozen saved version. Snapshots only store matching jobs, so the
     'all'/non-matching category has nothing extra to show here — pagination just
-    pages over the stored matches, after the score/win thresholds are applied."""
+    pages over the stored matches, after the score/win and post-date filters are
+    applied."""
     snapshot = db.get(JobListSnapshot, snapshot_id)
     if not snapshot or snapshot.user_id != user.id:
         raise HTTPException(status_code=404, detail="Job list not found")
     all_items = reporter.job_list_items(snapshot)
+    all_items = reporter.filter_items_posted_within(all_items, posted_within_days)
     if min_score > 0 or min_win > 0:
         all_items = [
             m for m in all_items
@@ -168,7 +174,7 @@ def _strip(report: list[dict]) -> list[dict]:
     """Drop reporter-only keys that aren't part of the MatchOut schema."""
     keep = {"position_id", "company", "title", "location", "url", "match_score",
             "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
-            "non_matching"}
+            "non_matching", "listed_at"}
     return [{k: v for k, v in m.items() if k in keep} for m in report]
 
 

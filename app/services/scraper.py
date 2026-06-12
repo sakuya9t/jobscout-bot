@@ -352,6 +352,99 @@ def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPositi
     return out
 
 
+# ── Eightfold (PCSX) careers ──────────────────────────────────────────────────
+# Eightfold-hosted boards (e.g. NVIDIA at jobs.nvidia.com) render their listing
+# client-side but expose an unauthenticated JSON search API. Two API flavours
+# exist — SmartApply (``/api/apply/v2/jobs``) and PCSX (``/api/pcsx/search``); a
+# given tenant serves one and 403s the other, and we target PCSX here. The board
+# is paged 10 at a time, newest-first by ``postedTs``, so rather than pull a whole
+# multi-thousand-role board we walk pages until we cross the age cutoff (or hit
+# ``max_pages``). The ``domain`` query param is the org's registrable domain
+# (``nvidia.com``), NOT the careers host (``jobs.nvidia.com``) — pass it via
+# ``ats_token``; if omitted we derive it by stripping a leading careers subdomain.
+_EIGHTFOLD_PAGE = 10
+_CAREERS_SUBDOMAINS = {"jobs", "careers", "career", "job", "apply", "talent", "recruiting"}
+
+
+def _eightfold_domain(careers_url: str, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    host = (urlparse(careers_url).hostname or "").lower()
+    labels = host.split(".")
+    if len(labels) >= 3 and labels[0] in _CAREERS_SUBDOMAINS:
+        return ".".join(labels[1:])  # jobs.nvidia.com -> nvidia.com
+    return host
+
+
+def _eightfold_position(rec: dict, origin: str) -> ScrapedPosition:
+    locs = rec.get("locations") or rec.get("standardizedLocations") or []
+    posted = rec.get("postedTs") or rec.get("creationTs")
+    posted_at = None
+    if isinstance(posted, (int, float)):
+        # PCSX timestamps are epoch *seconds* (unlike Lever/Ashby millis), so we
+        # convert here rather than via _parse_ts.
+        try:
+            posted_at = to_naive_utc(datetime.fromtimestamp(posted, tz=timezone.utc))
+        except (ValueError, OSError):
+            posted_at = None
+    rel = rec.get("positionUrl") or ""
+    return ScrapedPosition(
+        external_id=str(rec.get("id")),
+        title=(rec.get("name") or "Untitled")[:300],
+        location="; ".join(loc for loc in locs if loc) or None,
+        department=rec.get("department"),
+        employment_type=rec.get("workLocationOption"),  # onsite/remote/hybrid
+        url=_http_url(urljoin(origin, rel)) if rel else None,
+        posted_at=posted_at,
+    )
+
+
+def scrape_eightfold(
+    careers_url: str, domain: str | None, max_pages: int
+) -> list[ScrapedPosition]:
+    parsed = urlparse(careers_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    dom = _eightfold_domain(careers_url, domain)
+    cutoff = (
+        utcnow() - timedelta(days=settings.scrape_max_age_days)
+        if settings.scrape_max_age_days > 0
+        else None
+    )
+    out: list[ScrapedPosition] = []
+    seen: set[str] = set()
+    for page in range(max_pages):
+        start = page * _EIGHTFOLD_PAGE
+        api = (
+            f"{origin}/api/pcsx/search?domain={dom}"
+            f"&query=&location=&start={start}&num={_EIGHTFOLD_PAGE}"
+        )
+        data = _fetch_json(api)
+        positions = ((data or {}).get("data") or {}).get("positions") or []
+        if not positions:
+            break  # past the last page
+        added = 0
+        any_within_cutoff = False
+        for rec in positions:
+            if not isinstance(rec, dict):
+                continue
+            pos = _eightfold_position(rec, origin)
+            if not pos.external_id or pos.external_id in seen:
+                continue
+            seen.add(pos.external_id)
+            out.append(pos)
+            added += 1
+            if cutoff is None or pos.posted_at is None or pos.posted_at >= cutoff:
+                any_within_cutoff = True
+        if added == 0:
+            break  # a full page of already-seen ids: no progress, stop paging
+        # Results are newest-first; once a whole page predates the cutoff, every
+        # later page does too, so stop (the final _within_max_age filter is the
+        # authoritative trim — this just bounds how many pages we fetch).
+        if cutoff is not None and not any_within_cutoff:
+            break
+    return out
+
+
 # ── Generic HTML fallback ────────────────────────────────────────────────────
 _JOB_HINT = re.compile(r"(job|career|position|opening|vacanc|role|gh_jid|/jobs/)", re.I)
 
@@ -431,6 +524,12 @@ def _infer_ats(careers_url: str | None) -> tuple[str, str | None]:
         return "ashby", parts[0]
     if "google.com" in host and "careers" in path:
         return "google", None
+    if "eightfold.ai" in host:
+        # A *.eightfold.ai tenant URL; the org domain still must be supplied
+        # explicitly via ats_token (it isn't recoverable from the host), so the
+        # adapter will derive a best-effort default. Custom-domain Eightfold
+        # boards (e.g. jobs.nvidia.com) can't be inferred and need ats_type set.
+        return "eightfold", None
     return "html", None
 
 
@@ -458,6 +557,12 @@ def scrape_company(company) -> list[ScrapedPosition]:
         results = scrape_ashby(token)
     elif ats_type == "google":
         results = scrape_google(company.careers_url, settings.scrape_google_max_pages)
+    elif ats_type == "eightfold":
+        if not company.careers_url:
+            raise ScrapeError(f"{company.name}: eightfold scrape needs careers_url")
+        results = scrape_eightfold(
+            company.careers_url, token, settings.scrape_eightfold_max_pages
+        )
     elif ats_type == "html":
         if not company.careers_url:
             raise ScrapeError(f"{company.name}: html scrape needs careers_url")

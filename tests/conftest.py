@@ -15,6 +15,7 @@ import pytest  # noqa: E402
 
 from app.db import engine  # noqa: E402
 from app.models import Base  # noqa: E402
+from app.services import llm_log  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -23,4 +24,7 @@ def fresh_db():
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
+    # The Ollama wire log is written by a background thread; drain it before the
+    # next test so an in-flight record can't bleed into the next test's fresh DB.
+    llm_log.flush()
     Base.metadata.drop_all(engine)

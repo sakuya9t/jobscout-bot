@@ -16,12 +16,10 @@ import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from ..config import settings
-from ..logging_config import OLLAMA_LOGGER, get_logger
+from ..logging_config import get_logger
+from . import llm_log
 
 log = get_logger(__name__)
-# Every Ollama request/response is logged here (one correlated pair per call),
-# gated by settings.log_ollama. See app/logging_config.py.
-wire = get_logger(OLLAMA_LOGGER)
 
 
 class OllamaError(RuntimeError):
@@ -64,50 +62,60 @@ def _looks_like_budget(status_code: int, body: str | None) -> bool:
 
 
 def _clip(text: str) -> str:
-    """Truncate logged prompt/response content to keep the log bounded; 0 = full."""
+    """Truncate stored prompt/response content to keep the log table bounded;
+    ``log_ollama_max_chars`` = 0 stores the full text."""
     limit = settings.log_ollama_max_chars
     if limit and len(text) > limit:
         return f"{text[:limit]}… [+{len(text) - limit} chars]"
     return text
 
 
-def _log_request(url: str, body: dict) -> str:
-    """Log an outgoing chat request and return a short correlation id that ties it
-    to its response/failure line. Never logs the Authorization header/API key."""
-    xid = uuid.uuid4().hex[:8]
+def _record_exchange(
+    xid: str,
+    started: float,
+    url: str,
+    body: dict,
+    *,
+    status: str,
+    payload: dict | None = None,
+    error: str | None = None,
+) -> None:
+    """Persist one Ollama exchange to the ``llm_logs`` table (off the hot path) and
+    emit a single terse stdout line — never the full prompt/response, which used to
+    spam the console. Failures log at WARNING (so they stay visible); successes log
+    at DEBUG (quiet under the default INFO level). Gated by ``settings.log_ollama``;
+    the API key is never part of the body we record."""
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if status == "ok":
+        log.debug(
+            "ollama ✓ %s %dms tokens=%s/%s [%s]", body.get("model"), elapsed_ms,
+            (payload or {}).get("prompt_eval_count"), (payload or {}).get("eval_count"), xid,
+        )
+    else:
+        log.warning("ollama ✗ %s %dms %s [%s]", body.get("model"), elapsed_ms, error, xid)
+
     if not settings.log_ollama:
-        return xid
+        return
     msgs = body.get("messages", [])
-    wire.info(
-        "[%s] → POST %s model=%s temp=%s format=%s messages=%d prompt_chars=%d",
-        xid, url, body.get("model"),
-        (body.get("options") or {}).get("temperature"),
-        "json-schema" if body.get("format") else "text",
-        len(msgs), sum(len(m.get("content") or "") for m in msgs),
-    )
-    for m in msgs:
-        wire.info("[%s]   %s: %s", xid, m.get("role"), _clip(m.get("content") or ""))
-    return xid
-
-
-def _log_response(xid: str, started: float, payload: dict) -> None:
-    if not settings.log_ollama:
-        return
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    content = (payload.get("message") or {}).get("content") or ""
-    wire.info(
-        "[%s] ← %.0fms done_reason=%s prompt_tokens=%s eval_tokens=%s resp_chars=%d",
-        xid, elapsed_ms, payload.get("done_reason"),
-        payload.get("prompt_eval_count"), payload.get("eval_count"), len(content),
-    )
-    wire.info("[%s]   assistant: %s", xid, _clip(content))
-
-
-def _log_failure(xid: str, started: float, detail: str) -> None:
-    if not settings.log_ollama:
-        return
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    wire.warning("[%s] ✗ %.0fms %s", xid, elapsed_ms, detail)
+    content = (payload or {}).get("message", {}).get("content") or "" if payload else ""
+    llm_log.enqueue(llm_log.LlmLogRecord(
+        correlation_id=xid,
+        model=body.get("model"),
+        url=url,
+        temperature=(body.get("options") or {}).get("temperature"),
+        response_format="json-schema" if body.get("format") else "text",
+        prompt_chars=sum(len(m.get("content") or "") for m in msgs),
+        request_messages=json.dumps(
+            [{"role": m.get("role"), "content": _clip(m.get("content") or "")} for m in msgs]
+        ),
+        status=status,
+        elapsed_ms=elapsed_ms,
+        done_reason=(payload or {}).get("done_reason"),
+        prompt_tokens=(payload or {}).get("prompt_eval_count"),
+        eval_tokens=(payload or {}).get("eval_count"),
+        response_content=_clip(content) if content else None,
+        error_detail=error,
+    ))
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -161,29 +169,31 @@ class OllamaClient:
         parsed response payload. Shared by chat_json/chat_text so every Ollama
         communication is logged and error-handled the same way."""
         url = f"{self.base_url}/api/chat"
-        xid = _log_request(url, body)
+        xid = uuid.uuid4().hex[:8]
         started = time.perf_counter()
         try:
             resp = _post(url, body, self._headers, self.timeout)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             detail = f"Ollama returned {status}: {exc.response.text[:300]}"
-            _log_failure(xid, started, detail)
+            _record_exchange(xid, started, url, body, status="error", error=detail)
             if _looks_like_budget(status, exc.response.text):
                 raise OllamaBudgetError(
                     f"Ollama budget/quota exhausted (HTTP {status}): {exc.response.text[:300]}"
                 ) from exc
             raise OllamaError(detail) from exc
         except httpx.HTTPError as exc:
-            _log_failure(xid, started, f"transport error: {exc}")
+            _record_exchange(xid, started, url, body, status="error", error=f"transport error: {exc}")
             raise OllamaError(f"Could not reach Ollama at {url}: {exc}") from exc
 
         try:
             payload = resp.json()
         except json.JSONDecodeError as exc:
-            _log_failure(xid, started, f"non-JSON body: {resp.text[:300]}")
+            _record_exchange(
+                xid, started, url, body, status="error", error=f"non-JSON body: {resp.text[:300]}"
+            )
             raise OllamaError(f"Ollama returned a non-JSON body: {resp.text[:300]}") from exc
-        _log_response(xid, started, payload)
+        _record_exchange(xid, started, url, body, status="ok", payload=payload)
         return payload
 
     def chat_json(

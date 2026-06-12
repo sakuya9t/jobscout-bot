@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -228,3 +229,32 @@ class MatchResult(Base):
     position: Mapped[Position] = relationship(back_populates="matches")
     resume: Mapped[Resume | None] = relationship(back_populates="matches")
     interest: Mapped[Interest | None] = relationship(back_populates="matches")
+
+
+class LlmLog(Base):
+    """One Ollama request/response exchange, persisted for auditing/debugging.
+
+    Keeps the full prompt + completion out of stdout (where they were dumped per
+    call) and in a queryable table instead. Rows are written off the hot path by a
+    background writer (``services/llm_log.py``) so logging never blocks scoring or
+    contends with the matcher's open write transaction. Not tied to a user/run:
+    it's a low-level wire log, pruned by age/volume rather than cascaded."""
+
+    __tablename__ = "llm_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(16), index=True)
+    model: Mapped[str | None] = mapped_column(String(128))
+    url: Mapped[str | None] = mapped_column(String(512))
+    temperature: Mapped[float | None] = mapped_column(Float)
+    response_format: Mapped[str | None] = mapped_column(String(16))  # "json-schema" | "text"
+    prompt_chars: Mapped[int] = mapped_column(Integer, default=0)
+    request_messages: Mapped[str | None] = mapped_column(Text)  # JSON: [{role, content}, …]
+    status: Mapped[str] = mapped_column(String(16), default="ok")  # "ok" | "error"
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer)
+    done_reason: Mapped[str | None] = mapped_column(String(64))
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    eval_tokens: Mapped[int | None] = mapped_column(Integer)
+    response_content: Mapped[str | None] = mapped_column(Text)
+    error_detail: Mapped[str | None] = mapped_column(Text)

@@ -158,6 +158,9 @@ class MatchOut(BaseModel):
     # True for a non-matching job (filter-rejected or keyword-excluded) shown only
     # in the dashboard's "all jobs" view — score fields are not meaningful for it.
     non_matching: bool = False
+    # Effective "listed" date (ISO, naive UTC): the ATS post date when known, else
+    # when our crawler first saw it. Drives the dashboard's post-date filter/label.
+    listed_at: str | None = None
 
 
 class JobListRunOut(BaseModel):

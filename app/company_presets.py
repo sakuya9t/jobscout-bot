@@ -44,6 +44,26 @@ PRESETS: list[CompanyPreset] = [
         ats_token="openai",
     ),
     CompanyPreset(
+        # x.ai/careers/open-roles embeds a Greenhouse board; scrape the board
+        # directly (its API serves the full role list, ~200+ postings).
+        key="xai",
+        name="xAI",
+        careers_url="https://job-boards.greenhouse.io/xai",
+        ats_type="greenhouse",
+        ats_token="xai",
+    ),
+    CompanyPreset(
+        # NVIDIA's careers site is an Eightfold (PCSX) board: client-rendered, but
+        # it exposes an unauthenticated JSON search API the "eightfold" adapter
+        # pages over plain HTTP. ats_token carries the org's *registrable* domain
+        # (the API's ``domain`` param), which differs from the careers host.
+        key="nvidia",
+        name="NVIDIA",
+        careers_url="https://jobs.nvidia.com/careers",
+        ats_type="eightfold",
+        ats_token="nvidia.com",
+    ),
+    CompanyPreset(
         # Google has no public ATS API, but its careers site server-renders each
         # results page's jobs as embedded JSON; the dedicated "google" adapter
         # parses that over plain HTTP (see scrape_google in services/scraper.py).
