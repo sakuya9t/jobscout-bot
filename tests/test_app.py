@@ -275,6 +275,34 @@ def test_resume_is_account_level_and_overwritten():
         assert listing[0]["id"] == r2.json()["id"] and listing[0]["filename"] == "second.txt"
 
 
+def test_resume_preview_file_and_content():
+    """The résumé title's in-page preview is served two ways: the original file
+    (inline) and the extracted text fallback — both owner-scoped."""
+    with TestClient(app) as c:
+        ha = {"Authorization": f"Bearer {_register(c, 'pv@x.com').json()['access_token']}"}
+        rid = c.post("/api/resumes", headers=ha,
+                     files={"file": ("cv.txt", b"Senior Python engineer", "text/plain")}).json()["id"]
+
+        # Original file, served inline (not as an attachment) with its content type.
+        f = c.get(f"/api/resumes/{rid}/file", headers=ha)
+        assert f.status_code == 200 and f.content == b"Senior Python engineer"
+        assert f.headers["content-type"].startswith("text/plain")
+        assert "inline" in f.headers.get("content-disposition", "")
+
+        # Extracted-text fallback (for formats the browser can't render).
+        content = c.get(f"/api/resumes/{rid}/content", headers=ha).json()
+        assert content["filename"] == "cv.txt" and content["content_text"] == "Senior Python engineer"
+
+        # Another user can't preview it.
+        hb = {"Authorization": f"Bearer {_register(c, 'pv2@x.com').json()['access_token']}"}
+        assert c.get(f"/api/resumes/{rid}/file", headers=hb).status_code == 404
+        assert c.get(f"/api/resumes/{rid}/content", headers=hb).status_code == 404
+    # Auth required.
+    with TestClient(app) as c:
+        assert c.get("/api/resumes/1/file").status_code == 401
+        assert c.get("/api/resumes/1/content").status_code == 401
+
+
 def test_tenant_isolation():
     """User B must never see or mutate user A's data."""
     with TestClient(app) as c:
@@ -1817,6 +1845,199 @@ def test_kit_cascades_on_resume_and_user_delete():
         db.delete(db.get(models.User, uid))
     with session_scope() as db:
         assert list(db.scalars(matcher.select(models.ApplicationKit))) == []
+
+
+# ── Applicant profile (user-level autofill data) ─────────────────────────────
+def test_profile_defaults_email_when_absent(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="prof@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        p = c.get("/api/profile", headers=h).json()
+        # No profile saved yet -> blank default with the account email pre-filled.
+        assert p["email"] == "prof@x.com" and p["first_name"] is None
+        assert p["education"] == [] and p["experience"] == []
+    assert c.get("/api/profile").status_code == 401  # auth required
+
+
+def test_profile_upsert_and_replace_children(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="pu@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        body = {
+            "first_name": " Jane ", "last_name": "Doe", "phone": "555-1234",
+            "authorized_to_work": True, "requires_sponsorship": False,
+            "remote_preference": "remote", "gender": "Female",
+            "education": [{"school": "MIT", "degree": "BS", "field_of_study": "CS"}],
+            "experience": [
+                {"company": "Acme", "title": "Engineer", "is_current": True},
+                {"company": "Globex", "title": "Intern"},
+            ],
+        }
+        saved = c.put("/api/profile", headers=h, json=body).json()
+        assert saved["first_name"] == "Jane"  # trimmed
+        assert saved["authorized_to_work"] is True and saved["requires_sponsorship"] is False
+        assert saved["gender"] == "Female"
+        assert [e["school"] for e in saved["education"]] == ["MIT"]
+        assert [x["company"] for x in saved["experience"]] == ["Acme", "Globex"]
+        assert saved["experience"][0]["is_current"] is True
+
+        # A second save with fewer rows REPLACES the children (no leftovers).
+        replaced = c.put("/api/profile", headers=h, json={
+            "first_name": "Jane",
+            "education": [],
+            "experience": [{"company": "NewCo", "title": "Staff"}],
+        }).json()
+        assert replaced["education"] == []
+        assert [x["company"] for x in replaced["experience"]] == ["NewCo"]
+        # GET reflects the latest state.
+        got = c.get("/api/profile", headers=h).json()
+        assert [x["company"] for x in got["experience"]] == ["NewCo"]
+
+
+def test_profile_drops_blank_child_rows(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="pb@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        saved = c.put("/api/profile", headers=h, json={
+            "education": [{"school": "", "degree": ""}, {"school": "CMU"}],
+            "experience": [{"is_current": True}],  # only a flag -> not a real entry
+        }).json()
+        assert [e["school"] for e in saved["education"]] == ["CMU"]
+        assert saved["experience"] == []
+
+
+def test_profile_is_per_user(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid_a = _seed_user(db, email="pa@x.com")
+        uid_b = _seed_user(db, email="pbb@x.com")
+    ha = {"Authorization": f"Bearer {create_access_token(uid_a)}"}
+    hb = {"Authorization": f"Bearer {create_access_token(uid_b)}"}
+    with TestClient(app) as c:
+        c.put("/api/profile", headers=ha, json={"first_name": "AAA", "phone": "111"})
+        # B never sees A's data; B's default email is B's own.
+        pb = c.get("/api/profile", headers=hb).json()
+        assert pb["first_name"] is None and pb["email"] == "pbb@x.com"
+
+
+def test_profile_extract_normalizes_model_aliases():
+    """Models often ignore the field names we ask for and emit their own (name,
+    location, linkedin, work_experience, dates, role, highlights). The extractor
+    must still map them onto the profile shape — the real-world failure that made
+    import return an empty name and no experience."""
+    from app.services import profile_extract
+
+    class AliasClient:
+        model = "fake-extract"
+
+        def chat_text(self, system, user, temperature=0.4):
+            # Different keys than we asked for, plus prose around the JSON.
+            return (
+                "Here is the extracted profile:\n"
+                '{"name": "Jane Q Doe", "email": "jane@doe.dev", '
+                '"location": "Boston, MA, USA", "linkedin": "https://linkedin.com/in/jane", '
+                '"work_experience": [{"company": "Acme", "role": "Senior Engineer", '
+                '"dates": "2021 - Present", "highlights": ["Built APIs", "Led a team"]}], '
+                '"education": [{"school": "MIT", "degree": "BS", "field": "CS", "dates": "2016 - 2020"}]}'
+            )
+
+    with session_scope() as db:
+        uid = _seed_user(db, email="ex@x.com")
+    with session_scope() as db:
+        draft = profile_extract.extract_from_resume(db, db.get(models.User, uid), client=AliasClient())
+
+    assert draft["first_name"] == "Jane" and draft["last_name"] == "Q Doe"
+    assert draft["email"] == "jane@doe.dev"
+    assert (draft["city"], draft["state_region"], draft["country"]) == ("Boston", "MA", "USA")
+    assert draft["linkedin_url"] == "https://linkedin.com/in/jane"
+    exp = draft["experience"][0]
+    assert exp["company"] == "Acme" and exp["title"] == "Senior Engineer"
+    assert exp["start_date"] == "2021" and exp["is_current"] is True
+    # Bullets become one "- " line each.
+    assert exp["description"] == "- Built APIs\n- Led a team"
+    edu = draft["education"][0]
+    assert edu["school"] == "MIT" and edu["field_of_study"] == "CS"
+    assert edu["start_date"] == "2016" and edu["end_date"] == "2020"
+
+
+def test_format_description_bullets_and_ordered_lists():
+    from app.services.profile_extract import _format_description as fmt
+
+    # A list of bullets -> one "- " line each (existing markers stripped).
+    assert fmt(["Built APIs", "Led a team"]) == "- Built APIs\n- Led a team"
+    assert fmt(["• Built APIs", "- Led a team"]) == "- Built APIs\n- Led a team"
+    # Inline glyphs and newlines both split into "- " lines.
+    assert fmt("• Built APIs • Led a team") == "- Built APIs\n- Led a team"
+    assert fmt("Built APIs\nLed a team") == "- Built APIs\n- Led a team"
+    # Ordered list: each item on its own line, numbering preserved.
+    assert fmt("1. Built APIs 2. Led a team") == "1. Built APIs\n2. Led a team"
+    # Plain prose stays a single block — no spurious leading dash.
+    prose = "Led a team that shipped the billing platform."
+    assert fmt(prose) == prose
+    # Description priority + empties.
+    assert fmt(None, ["Did X"]) == "- Did X"
+    assert fmt("", None, []) == ""
+
+
+def test_profile_extract_requires_active_resume():
+    from app.services import profile_extract
+
+    with session_scope() as db:
+        uid = _seed_user(db, email="nr@x.com")
+        db.delete(db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)))
+    with session_scope() as db:
+        with pytest.raises(profile_extract.NoResumeError):
+            profile_extract.extract_from_resume(db, db.get(models.User, uid), client=object())
+
+
+def test_profile_import_endpoint(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, profile_extract
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    monkeypatch.setattr(profile_extract, "extract_from_resume",
+                        lambda db, user, **k: {"first_name": "Imported", "education": [], "experience": []})
+    with session_scope() as db:
+        uid = _seed_user(db, email="imp@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        out = c.post("/api/profile/import-from-resume", headers=h).json()
+        assert out["first_name"] == "Imported"
+        # Import does NOT persist — the saved profile is still empty.
+        assert c.get("/api/profile", headers=h).json()["first_name"] is None
+
+
+def test_profile_cascades_on_user_delete():
+    with session_scope() as db:
+        uid = _seed_user(db, email="pc@x.com")
+        db.add(models.ApplicantProfile(user_id=uid, first_name="Jane"))
+        db.add(models.ProfileEducation(user_id=uid, school="MIT"))
+        db.add(models.ProfileExperience(user_id=uid, company="Acme"))
+        db.flush()
+    with session_scope() as db:
+        db.delete(db.get(models.User, uid))
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.ApplicantProfile))) == []
+        assert list(db.scalars(matcher.select(models.ProfileEducation))) == []
+        assert list(db.scalars(matcher.select(models.ProfileExperience))) == []
 
 
 def test_job_list_surfaces_kit_status(monkeypatch):

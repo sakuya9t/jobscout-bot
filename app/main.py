@@ -18,6 +18,7 @@ from .routers import (
     llm_config,
     pages,
     positions,
+    profile,
     reports,
     resumes,
     telegram_config,
@@ -57,6 +58,7 @@ app.include_router(interests.router)
 app.include_router(positions.router)
 app.include_router(reports.router)
 app.include_router(applications.router)
+app.include_router(profile.router)
 app.include_router(llm_config.router)
 app.include_router(telegram_config.router)
 app.include_router(admin.router)

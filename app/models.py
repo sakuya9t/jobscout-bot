@@ -60,6 +60,17 @@ class User(Base):
     llm_config: Mapped[LlmConfig | None] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
     )
+    # User-level applicant profile (the autofill data source for phase-2
+    # auto-apply): one scalar record plus repeating education/experience rows.
+    profile: Mapped[ApplicantProfile | None] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
+    profile_education: Mapped[list[ProfileEducation]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    profile_experience: Mapped[list[ProfileExperience]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class JobListSnapshot(Base):
@@ -374,3 +385,108 @@ class ApplicationKit(Base):
     user: Mapped[User] = relationship(back_populates="application_kits")
     position: Mapped[Position] = relationship(back_populates="application_kits")
     resume: Mapped[Resume | None] = relationship(back_populates="application_kits")
+
+
+class ApplicantProfile(Base):
+    """The user-level information a job application asks for, kept once so it can
+    autofill the bulk of an application form (à la the Simplify extension) and feed
+    the phase-2 auto-apply. One row per user; repeating education/work history live
+    in their own tables. Free-text/nullable throughout — applications vary wildly,
+    so we store what the user gives and never force a shape."""
+
+    __tablename__ = "applicant_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+
+    # Identity + contact
+    first_name: Mapped[str | None] = mapped_column(String(128))
+    last_name: Mapped[str | None] = mapped_column(String(128))
+    preferred_name: Mapped[str | None] = mapped_column(String(128))
+    pronouns: Mapped[str | None] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(64))
+    address_line1: Mapped[str | None] = mapped_column(String(255))
+    address_line2: Mapped[str | None] = mapped_column(String(255))
+    city: Mapped[str | None] = mapped_column(String(128))
+    state_region: Mapped[str | None] = mapped_column(String(128))
+    postal_code: Mapped[str | None] = mapped_column(String(32))
+    country: Mapped[str | None] = mapped_column(String(128))
+
+    # Links
+    linkedin_url: Mapped[str | None] = mapped_column(String(512))
+    github_url: Mapped[str | None] = mapped_column(String(512))
+    portfolio_url: Mapped[str | None] = mapped_column(String(512))
+    other_url: Mapped[str | None] = mapped_column(String(512))
+
+    # Work authorization. The booleans are nullable on purpose: NULL = "not
+    # answered" (distinct from an explicit no), which application forms care about.
+    work_authorization: Mapped[str | None] = mapped_column(String(255))  # e.g. "US citizen", "H-1B"
+    authorized_to_work: Mapped[bool | None] = mapped_column(Boolean)
+    requires_sponsorship: Mapped[bool | None] = mapped_column(Boolean)
+    open_to_relocation: Mapped[bool | None] = mapped_column(Boolean)
+
+    # Job preferences
+    desired_salary: Mapped[str | None] = mapped_column(String(64))
+    salary_currency: Mapped[str | None] = mapped_column(String(16))
+    remote_preference: Mapped[str | None] = mapped_column(String(32))  # remote | hybrid | onsite | any
+    preferred_locations: Mapped[str | None] = mapped_column(Text)
+    earliest_start_date: Mapped[str | None] = mapped_column(String(64))
+    notice_period: Mapped[str | None] = mapped_column(String(64))
+
+    # Voluntary self-identification (EEO). Sensitive and optional — treat the DB as
+    # secret (as with tokens/keys). NULL throughout when the user declines.
+    gender: Mapped[str | None] = mapped_column(String(64))
+    race_ethnicity: Mapped[str | None] = mapped_column(String(128))
+    hispanic_latino: Mapped[str | None] = mapped_column(String(32))
+    # Standard self-ID phrasings are long ("I identify as one or more of the
+    # classifications of a protected veteran"), so these are wide.
+    veteran_status: Mapped[str | None] = mapped_column(String(128))
+    disability_status: Mapped[str | None] = mapped_column(String(128))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="profile")
+
+
+class ProfileEducation(Base):
+    """One education entry on a user's applicant profile. Dates are free text
+    ('Jun 2020 – Present', '2019'), since that's how résumés state them and how
+    application forms accept them. Replaced wholesale when the profile is saved."""
+
+    __tablename__ = "profile_education"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    school: Mapped[str | None] = mapped_column(String(255))
+    degree: Mapped[str | None] = mapped_column(String(255))
+    field_of_study: Mapped[str | None] = mapped_column(String(255))
+    start_date: Mapped[str | None] = mapped_column(String(64))
+    end_date: Mapped[str | None] = mapped_column(String(64))
+    gpa: Mapped[str | None] = mapped_column(String(32))
+    location: Mapped[str | None] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="profile_education")
+
+
+class ProfileExperience(Base):
+    """One work-experience entry on a user's applicant profile. Replaced wholesale
+    when the profile is saved (mirrors ProfileEducation)."""
+
+    __tablename__ = "profile_experience"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    company: Mapped[str | None] = mapped_column(String(255))
+    title: Mapped[str | None] = mapped_column(String(255))
+    location: Mapped[str | None] = mapped_column(String(255))
+    start_date: Mapped[str | None] = mapped_column(String(64))
+    end_date: Mapped[str | None] = mapped_column(String(64))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False)
+    description: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="profile_experience")

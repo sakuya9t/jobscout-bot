@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class _ORM(BaseModel):
@@ -145,6 +145,14 @@ class ResumeOut(_ORM):
     filename: str
     is_active: bool
     created_at: datetime
+
+
+class ResumeContentOut(_ORM):
+    """The résumé's extracted plain text, for the in-page preview fallback when the
+    browser can't render the original file (e.g. .docx)."""
+
+    filename: str
+    content_text: str
 
 
 # ── Company ──────────────────────────────────────────────────────────────────
@@ -364,3 +372,97 @@ class RunSummary(BaseModel):
     errors: list[str] = []
     # Positions handed to the background evaluator and not yet scored.
     pending: int = 0
+
+
+# ── Applicant profile (user-level autofill data) ─────────────────────────────
+class _BlankStrToNone(BaseModel):
+    """Coerce blank/whitespace-only string fields to None (and trim the rest) so the
+    profile stores clean nulls instead of empty strings from an untouched form."""
+
+    @model_validator(mode="after")
+    def _coerce_blanks(self):
+        for name, value in self.__dict__.items():
+            if isinstance(value, str):
+                setattr(self, name, value.strip() or None)
+        return self
+
+
+class ProfileEducationIn(_BlankStrToNone):
+    school: str | None = None
+    degree: str | None = None
+    field_of_study: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    gpa: str | None = None
+    location: str | None = None
+    description: str | None = None
+
+
+class ProfileEducationOut(ProfileEducationIn):
+    id: int | None = None
+
+
+class ProfileExperienceIn(_BlankStrToNone):
+    company: str | None = None
+    title: str | None = None
+    location: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    is_current: bool = False
+    description: str | None = None
+
+
+class ProfileExperienceOut(ProfileExperienceIn):
+    id: int | None = None
+
+
+class _ProfileScalars(BaseModel):
+    """The flat profile fields shared by the In (request) and Out (response) models.
+    Every field is optional — an application profile is filled incrementally."""
+
+    # Identity + contact
+    first_name: str | None = None
+    last_name: str | None = None
+    preferred_name: str | None = None
+    pronouns: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    address_line1: str | None = None
+    address_line2: str | None = None
+    city: str | None = None
+    state_region: str | None = None
+    postal_code: str | None = None
+    country: str | None = None
+    # Links
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    portfolio_url: str | None = None
+    other_url: str | None = None
+    # Work authorization (booleans tri-state: None = not answered)
+    work_authorization: str | None = None
+    authorized_to_work: bool | None = None
+    requires_sponsorship: bool | None = None
+    open_to_relocation: bool | None = None
+    # Job preferences
+    desired_salary: str | None = None
+    salary_currency: str | None = None
+    remote_preference: str | None = None
+    preferred_locations: str | None = None
+    earliest_start_date: str | None = None
+    notice_period: str | None = None
+    # Voluntary self-identification (EEO)
+    gender: str | None = None
+    race_ethnicity: str | None = None
+    hispanic_latino: str | None = None
+    veteran_status: str | None = None
+    disability_status: str | None = None
+
+
+class ApplicantProfileIn(_ProfileScalars, _BlankStrToNone):
+    education: list[ProfileEducationIn] = Field(default_factory=list)
+    experience: list[ProfileExperienceIn] = Field(default_factory=list)
+
+
+class ApplicantProfileOut(_ProfileScalars):
+    education: list[ProfileEducationOut] = Field(default_factory=list)
+    experience: list[ProfileExperienceOut] = Field(default_factory=list)

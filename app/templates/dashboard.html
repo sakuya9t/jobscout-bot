@@ -160,6 +160,7 @@
     <nav class="nav-stack" aria-label="Dashboard">
       <button class="nav-button" data-view="jobs" onclick="showView('jobs')">Job lists</button>
       <button class="nav-button" data-view="resume" onclick="showView('resume')">Check/update resume</button>
+      <button class="nav-button" data-view="profile" onclick="showView('profile')">Application profile</button>
       <button class="nav-button" data-view="companies" onclick="showView('companies')">Company watchlist management</button>
       <button class="nav-button" data-view="interests" onclick="showView('interests')">Interest management</button>
       <button class="nav-button" data-view="llm" onclick="showView('llm')">LLM provider</button>
@@ -267,6 +268,182 @@
           </div>
         </div>
         <div id="resumes" style="margin-top:14px;"></div>
+      </div>
+    </section>
+
+    <section id="view-profile" class="panel">
+      <div class="surface">
+        <div class="toolbar" style="justify-content:space-between;">
+          <p class="muted" style="margin:0;">Stored once and reused to autofill job applications. Nothing here is shared until you apply.</p>
+          <div class="flex">
+            <button class="ghost" onclick="importFromResume()">Import from resume</button>
+            <label class="flex" style="color:var(--ink); font-size:13px; gap:6px; white-space:nowrap;"
+                   title="When on, the import overwrites fields that already have a value; otherwise it only fills empty ones">
+              <input type="checkbox" id="importOverwrite" style="width:auto;" /> overwrite filled fields</label>
+            <button onclick="saveProfile()">Save profile</button>
+            <span id="profileStatus" class="muted"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <h2>Contact &amp; links</h2>
+        <div class="row">
+          <div><label>First name</label><input class="pf" data-field="first_name" /></div>
+          <div><label>Last name</label><input class="pf" data-field="last_name" /></div>
+        </div>
+        <div class="row">
+          <div><label>Preferred name</label><input class="pf" data-field="preferred_name" /></div>
+          <div><label>Pronouns</label><input class="pf" data-field="pronouns" /></div>
+        </div>
+        <div class="row">
+          <div><label>Email</label><input class="pf" data-field="email" /></div>
+          <div><label>Phone</label><input class="pf" data-field="phone" /></div>
+        </div>
+        <div class="row">
+          <div><label>Address line 1</label><input class="pf" data-field="address_line1" /></div>
+          <div><label>Address line 2</label><input class="pf" data-field="address_line2" /></div>
+        </div>
+        <div class="row">
+          <div><label>City</label><input class="pf" data-field="city" /></div>
+          <div><label>State / region</label><input class="pf" data-field="state_region" /></div>
+        </div>
+        <div class="row">
+          <div><label>Postal code</label><input class="pf" data-field="postal_code" /></div>
+          <div><label>Country</label><input class="pf" data-field="country" /></div>
+        </div>
+        <div class="row">
+          <div><label>LinkedIn URL</label><input class="pf" data-field="linkedin_url" placeholder="https://linkedin.com/in/…" /></div>
+          <div><label>GitHub URL</label><input class="pf" data-field="github_url" placeholder="https://github.com/…" /></div>
+        </div>
+        <div class="row">
+          <div><label>Portfolio / website</label><input class="pf" data-field="portfolio_url" /></div>
+          <div><label>Other link</label><input class="pf" data-field="other_url" /></div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <h2>Work authorization</h2>
+        <div class="row">
+          <div><label>Work authorization status</label><input class="pf" data-field="work_authorization" placeholder="e.g. US citizen, H-1B, EU national" /></div>
+          <div>
+            <label>Authorized to work (in the role's country)</label>
+            <select class="pf" data-field="authorized_to_work" data-type="bool">
+              <option value="">No answer</option><option value="true">Yes</option><option value="false">No</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Requires visa sponsorship</label>
+            <select class="pf" data-field="requires_sponsorship" data-type="bool">
+              <option value="">No answer</option><option value="true">Yes</option><option value="false">No</option>
+            </select>
+          </div>
+          <div>
+            <label>Open to relocation</label>
+            <select class="pf" data-field="open_to_relocation" data-type="bool">
+              <option value="">No answer</option><option value="true">Yes</option><option value="false">No</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <h2>Job preferences</h2>
+        <div class="row">
+          <div><label>Desired salary</label><input class="pf" data-field="desired_salary" placeholder="e.g. 140000" /></div>
+          <div><label>Currency</label><input class="pf" data-field="salary_currency" placeholder="USD" /></div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Remote preference</label>
+            <select class="pf" data-field="remote_preference">
+              <option value="">No preference</option><option value="remote">Remote</option>
+              <option value="hybrid">Hybrid</option><option value="onsite">Onsite</option>
+            </select>
+          </div>
+          <div><label>Preferred locations</label><input class="pf" data-field="preferred_locations" placeholder="Berlin, EU remote" /></div>
+        </div>
+        <div class="row">
+          <div><label>Earliest start date</label><input class="pf" data-field="earliest_start_date" placeholder="e.g. Immediately, 2026-08-01" /></div>
+          <div><label>Notice period</label><input class="pf" data-field="notice_period" placeholder="e.g. 4 weeks" /></div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <div class="flex" style="justify-content:space-between;">
+          <h2 style="margin:0;">Education</h2>
+          <button class="ghost" onclick="addEduRow()">Add education</button>
+        </div>
+        <div id="eduRows" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="surface">
+        <div class="flex" style="justify-content:space-between;">
+          <h2 style="margin:0;">Work history</h2>
+          <button class="ghost" onclick="addExpRow()">Add experience</button>
+        </div>
+        <div id="expRows" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="surface">
+        <h2>Voluntary self-identification (EEO)</h2>
+        <p class="muted">Optional. These use the standard options most US application
+          sites (Greenhouse, Lever, Workday) present; leave as “Prefer not to say” to skip.</p>
+        <div class="row">
+          <div>
+            <label>Gender</label>
+            <select class="pf" data-field="gender">
+              <option value="">Prefer not to say</option>
+              <option value="Male">Male</option>
+              <option value="Female">Female</option>
+              <option value="Non-binary">Non-binary</option>
+            </select>
+          </div>
+          <div>
+            <label>Race / ethnicity</label>
+            <select class="pf" data-field="race_ethnicity">
+              <option value="">Prefer not to say</option>
+              <option value="American Indian or Alaska Native">American Indian or Alaska Native</option>
+              <option value="Asian">Asian</option>
+              <option value="Black or African American">Black or African American</option>
+              <option value="Hispanic or Latino">Hispanic or Latino</option>
+              <option value="Native Hawaiian or Other Pacific Islander">Native Hawaiian or Other Pacific Islander</option>
+              <option value="White">White</option>
+              <option value="Two or More Races">Two or More Races</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Hispanic / Latino</label>
+            <select class="pf" data-field="hispanic_latino">
+              <option value="">Prefer not to say</option>
+              <option value="Yes">Yes</option>
+              <option value="No">No</option>
+            </select>
+          </div>
+          <div>
+            <label>Veteran status</label>
+            <select class="pf" data-field="veteran_status">
+              <option value="">Prefer not to say</option>
+              <option value="I am not a protected veteran">I am not a protected veteran</option>
+              <option value="I identify as one or more of the classifications of a protected veteran">I am a protected veteran</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Disability status</label>
+            <select class="pf" data-field="disability_status">
+              <option value="">Prefer not to say</option>
+              <option value="Yes, I have a disability, or have had one in the past">Yes, I have a disability (or have had one)</option>
+              <option value="No, I do not have a disability and have not had one in the past">No, I do not have a disability</option>
+            </select>
+          </div>
+          <div></div>
+        </div>
       </div>
     </section>
 
@@ -399,6 +576,7 @@ const val = id => document.getElementById(id).value.trim();
 const viewCopy = {
   jobs: ["Job lists", "Latest ranked positions from your scans"],
   resume: ["Check/update resume", "Current resume used for matching"],
+  profile: ["Application profile", "Key info reused to autofill job applications"],
   companies: ["Company watchlist management", "Career sites included in each scan"],
   interests: ["Interest management", "Role preferences and scoring thresholds"],
   llm: ["LLM provider", "Model provider, API key, and models used for scoring"],
@@ -581,15 +759,41 @@ async function uploadResume(){
   await loadResumes();
 }
 
+let activeResume = null;  // the current resume, for the click-to-preview toggle
+
 async function loadResumes(){
   const r = await api("/api/resumes"); const list = await r.json();
   const resume = list[0];
+  activeResume = resume || null;
   document.getElementById("resumes").innerHTML = resume
     ? `<div class="list-item flex" style="justify-content:space-between;">
-         <span><b>${esc(resume.filename)}</b> <span class="muted">active resume</span></span>
-         <button class="ghost" onclick="delResume(${resume.id})">Remove</button></div>`
+         <span><a href="#" onclick="toggleResumePreview(${resume.id}); return false;"><b>${esc(resume.filename)}</b></a>
+           <span class="muted">active resume · click to preview</span></span>
+         <button class="ghost" onclick="delResume(${resume.id})">Remove</button></div>
+       <div id="resumePreview" style="margin-top:12px;"></div>`
     : '<div class="empty">No resume uploaded yet.</div>';
   updateScanGate(!!resume);
+}
+
+// Toggle an in-page preview of the resume under its title. PDFs embed the real
+// file (rendered by the browser); other formats fall back to the extracted text.
+async function toggleResumePreview(id){
+  const box = document.getElementById("resumePreview");
+  if(!box){ return; }
+  if(box.dataset.open === String(id)){ box.innerHTML = ""; box.dataset.open = ""; return; }
+  box.dataset.open = String(id);
+  const name = ((activeResume && activeResume.filename) || "").toLowerCase();
+  if(name.endsWith(".pdf")){
+    box.innerHTML = `<iframe title="Resume preview" src="/api/resumes/${id}/file"
+      style="width:100%; height:78vh; border:1px solid var(--line); border-radius:8px; background:#fff;"></iframe>`;
+    return;
+  }
+  box.innerHTML = '<div class="muted">Loading preview…</div>';
+  const r = await api(`/api/resumes/${id}/content`);
+  if(!r.ok){ box.innerHTML = '<div class="empty">Could not load a preview.</div>'; return; }
+  const data = await r.json();
+  box.innerHTML = `<pre style="white-space:pre-wrap; word-wrap:break-word; background:#fbfdfc;
+    border:1px solid var(--line); border-radius:8px; padding:14px; max-height:78vh; overflow:auto;">${esc(data.content_text || "")}</pre>`;
 }
 
 function updateScanGate(hasResume){
@@ -985,12 +1189,225 @@ function maybePollKits(items){
   }
 }
 
+// ── Application profile (user-level autofill data) ──
+// Scalar inputs carry class "pf" + data-field; tri-state selects add data-type="bool".
+function fillProfile(p){
+  document.querySelectorAll("#view-profile .pf").forEach(el => {
+    const v = p[el.dataset.field];
+    if(el.dataset.type === "bool"){
+      el.value = v === true ? "true" : v === false ? "false" : "";
+    } else {
+      el.value = (v == null ? "" : v);
+    }
+  });
+  renderEduRows(p.education || []);
+  renderExpRows(p.experience || []);
+}
+
+function fieldRow(label, field, value, ph){
+  return `<div><label>${esc(label)}</label><input data-field="${field}" value="${esc(value)}" placeholder="${esc(ph||"")}" /></div>`;
+}
+
+// ── Month + Year date pickers (start/end on education & experience) ──
+const MONTH_NAMES = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
+const MONTH_IDX = {jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",
+                   jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12"};
+
+// Parse a stored/extracted date string into {year, month("01".."12")}. Handles
+// "2020-09", "2020/9", "2024.9", "09/2020", "Jun 2020", "September 2020", "2019",
+// and leaves "Present"/blank/unknown empty.
+function parseYM(value){
+  const s = (value || "").trim();
+  let m;
+  if((m = s.match(/^(\d{4})[-/.](\d{1,2})$/))) return {year:m[1], month:m[2].padStart(2,"0")};
+  if((m = s.match(/^(\d{1,2})[-/](\d{4})$/)))   return {year:m[2], month:m[1].padStart(2,"0")};
+  if((m = s.match(/^([A-Za-z]{3,})\.?\s+(\d{4})$/))) return {year:m[2], month: MONTH_IDX[m[1].slice(0,3).toLowerCase()] || ""};
+  if((m = s.match(/^(\d{4})$/)))                 return {year:m[1], month:""};
+  return {year:"", month:""};
+}
+
+function monthOptions(sel){
+  return `<option value="">Month</option>` + MONTH_NAMES.map((n,i) => {
+    const v = String(i+1).padStart(2,"0");
+    return `<option value="${v}"${v===sel?" selected":""}>${n}</option>`;
+  }).join("");
+}
+function yearOptions(sel){
+  const now = new Date().getFullYear();
+  let out = `<option value="">Year</option>`;
+  for(let y = now+6; y >= 1965; y--){ out += `<option value="${y}"${String(y)===sel?" selected":""}>${y}</option>`; }
+  return out;
+}
+function dateField(label, base, value, disabled){
+  const ym = parseYM(value), dis = disabled ? " disabled" : "";
+  return `<div><label>${esc(label)}</label>
+    <div class="flex" style="gap:8px;">
+      <select data-date="${base}" data-part="month" style="flex:1; min-width:0;"${dis}>${monthOptions(ym.month)}</select>
+      <select data-date="${base}" data-part="year" style="flex:1; min-width:0;"${dis}>${yearOptions(ym.year)}</select>
+    </div></div>`;
+}
+
+function eduRowHtml(e){
+  e = e || {};
+  return `<div class="edu-row surface" style="padding:12px; margin-bottom:12px;">
+    <div class="row">${fieldRow("School", "school", e.school)}${fieldRow("Degree", "degree", e.degree)}</div>
+    <div class="row">${fieldRow("Field of study", "field_of_study", e.field_of_study)}${fieldRow("GPA", "gpa", e.gpa)}</div>
+    <div class="row">${dateField("Start", "start", e.start_date)}${dateField("End", "end", e.end_date)}</div>
+    ${fieldRow("Location", "location", e.location)}
+    <div><label>Description</label><textarea data-field="description">${esc(e.description)}</textarea></div>
+    <div class="toolbar" style="margin-top:8px;"><button type="button" class="ghost" onclick="this.closest('.edu-row').remove()">Remove</button></div>
+  </div>`;
+}
+
+function expRowHtml(x){
+  x = x || {};
+  return `<div class="exp-row surface" style="padding:12px; margin-bottom:12px;">
+    <div class="row">${fieldRow("Company", "company", x.company)}${fieldRow("Title", "title", x.title)}</div>
+    <div class="row">${fieldRow("Location", "location", x.location)}
+      <div><label>&nbsp;</label><label class="flex" style="color:var(--ink);">
+        <input type="checkbox" data-field="is_current" data-type="bool" style="width:auto;" ${x.is_current ? "checked" : ""} onchange="toggleCurrent(this)" /> Current role</label></div>
+    </div>
+    <div class="row">${dateField("Start", "start", x.start_date)}${dateField("End", "end", x.end_date, x.is_current)}</div>
+    <div><label>Description</label><textarea data-field="description">${esc(x.description)}</textarea></div>
+    <div class="toolbar" style="margin-top:8px;"><button type="button" class="ghost" onclick="this.closest('.exp-row').remove()">Remove</button></div>
+  </div>`;
+}
+
+// "Current role" disables the End date pickers (an ongoing role has no end date).
+function toggleCurrent(cb){
+  cb.closest(".exp-row").querySelectorAll('[data-date="end"]').forEach(sel => {
+    sel.disabled = cb.checked;
+    if(cb.checked){ sel.value = ""; }
+  });
+}
+
+function renderEduRows(list){
+  const items = (list && list.length) ? list : [{}];
+  document.getElementById("eduRows").innerHTML = items.map(eduRowHtml).join("");
+}
+function renderExpRows(list){
+  const items = (list && list.length) ? list : [{}];
+  document.getElementById("expRows").innerHTML = items.map(expRowHtml).join("");
+}
+function addEduRow(){ document.getElementById("eduRows").insertAdjacentHTML("beforeend", eduRowHtml({})); }
+function addExpRow(){ document.getElementById("expRows").insertAdjacentHTML("beforeend", expRowHtml({})); }
+
+function gatherRow(row){
+  const o = {};
+  row.querySelectorAll("[data-field]").forEach(el => {
+    if(el.dataset.type === "bool"){ o[el.dataset.field] = el.checked; }
+    else { o[el.dataset.field] = el.value.trim() || null; }
+  });
+  // Combine each Month+Year picker pair into a "YYYY-MM" (or "YYYY") date string.
+  ["start", "end"].forEach(base => {
+    const mo = row.querySelector(`[data-date="${base}"][data-part="month"]`);
+    const yr = row.querySelector(`[data-date="${base}"][data-part="year"]`);
+    if(mo || yr){
+      const y = (yr && yr.value) || "", m = (mo && mo.value) || "";
+      o[base + "_date"] = y ? (m ? `${y}-${m}` : y) : null;
+    }
+  });
+  return o;
+}
+
+function gatherProfile(){
+  const body = {education: [], experience: []};
+  document.querySelectorAll("#view-profile .pf").forEach(el => {
+    const f = el.dataset.field, v = el.value.trim();
+    if(el.dataset.type === "bool"){ body[f] = v === "" ? null : (v === "true"); }
+    else { body[f] = v || null; }
+  });
+  document.querySelectorAll("#eduRows .edu-row").forEach(r => body.education.push(gatherRow(r)));
+  document.querySelectorAll("#expRows .exp-row").forEach(r => body.experience.push(gatherRow(r)));
+  return body;
+}
+
+async function loadProfile(){
+  const r = await api("/api/profile");
+  if(!r.ok){ return; }
+  fillProfile(await r.json());
+}
+
+async function saveProfile(){
+  const s = document.getElementById("profileStatus");
+  s.textContent = "Saving…";
+  const r = await api("/api/profile", {method:"PUT", body: JSON.stringify(gatherProfile())});
+  if(!r.ok){ const d = await r.json().catch(()=>({})); s.textContent = d.detail || "Save failed"; return; }
+  s.textContent = "Saved.";
+  fillProfile(await r.json());
+}
+
+const isEmptyVal = v => v == null || v === false || String(v).trim() === "";
+// A row object with no real content (the "Current role" flag alone doesn't count).
+const rowIsBlank = o => !Object.keys(o).some(k => k !== "is_current" && !isEmptyVal(o[k]));
+
+// Merge an imported draft into the form. "add" fills only empty fields; "replace"
+// overwrites the fields the import provides. Fields the import can't extract (work
+// auth, preferences, EEO) are left untouched in both modes.
+function applyImport(draft, mode){
+  document.querySelectorAll("#view-profile .pf").forEach(el => {
+    if(el.dataset.type === "bool"){ return; }   // import never extracts these
+    const dv = draft[el.dataset.field];
+    if(dv == null || String(dv).trim() === ""){ return; }   // nothing extracted
+    if(mode === "add" && el.value.trim() !== ""){ return; }  // keep existing value
+    el.value = dv;
+  });
+  applyImportList("eduRows", "edu-row", renderEduRows, "school", draft.education || [], mode);
+  applyImportList("expRows", "exp-row", renderExpRows, "company", draft.experience || [], mode);
+}
+
+// Addition merge for a list: for each imported entry, fill the EMPTY fields of the
+// existing entry it matches (by keyField, case-insensitive) — e.g. fill a missing
+// description on a role you already have — and append entries with no match.
+function mergeListAdd(current, imported, keyField){
+  const out = current.map(r => ({...r}));
+  const used = out.map(() => false);
+  const norm = v => (v == null ? "" : String(v).trim().toLowerCase());
+  imported.forEach(imp => {
+    const key = norm(imp[keyField]);
+    const idx = key ? out.findIndex((r, i) => !used[i] && norm(r[keyField]) === key) : -1;
+    if(idx >= 0){
+      used[idx] = true;
+      Object.keys(imp).forEach(f => { if(isEmptyVal(out[idx][f]) && !isEmptyVal(imp[f])){ out[idx][f] = imp[f]; } });
+    } else {
+      out.push(imp);
+    }
+  });
+  return out;
+}
+
+function applyImportList(containerId, rowClass, render, keyField, items, mode){
+  if(!items.length){ return; }                 // nothing to import
+  if(mode === "replace"){ render(items); return; }
+  const current = [...document.querySelectorAll(`#${containerId} .${rowClass}`)]
+    .map(gatherRow).filter(r => !rowIsBlank(r));
+  render(mergeListAdd(current, items, keyField));
+}
+
+async function importFromResume(){
+  const overwrite = document.getElementById("importOverwrite").checked;
+  const mode = overwrite ? "replace" : "add";
+  const msg = overwrite
+    ? "Overwrite fields that already have a value with information from your resume?"
+    : "Fill in the empty fields from your resume (existing values are kept)?";
+  if(!confirm(msg + " You can review and edit before saving.")){ return; }
+  const s = document.getElementById("profileStatus");
+  s.textContent = "Reading your resume…";
+  const r = await api("/api/profile/import-from-resume", {method:"POST"});
+  if(!r.ok){ const d = await r.json().catch(()=>({})); s.textContent = d.detail || "Import failed"; return; }
+  applyImport(await r.json(), mode);
+  s.textContent = (overwrite ? "Imported (overwrote filled fields)" : "Imported into empty fields")
+    + " — review the fields, then Save profile.";
+}
+
 const initialView = (location.hash || "#jobs").replace("#", "");
 showView(initialView);
 loadResumes();
 loadPresets();
 loadCompanies();
 loadInterests();
+loadProfile();
 loadLlmConfig();
 loadTelegramConfig();
 loadJobRuns().then(loadJobList);
