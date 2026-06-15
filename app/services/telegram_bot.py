@@ -1,11 +1,11 @@
-"""Minimal Telegram integration via the HTTP Bot API (no extra deps).
+"""Per-user Telegram integration via the HTTP Bot API (no extra deps).
 
-Two jobs:
-1. ``poll_updates`` — long-poll for ``/start <link-code>`` messages so users can
-   bind their Telegram chat to their JobScout account.
-2. ``send_daily_reports`` — push each user's ranked report to their linked chat.
-
-The bot is entirely optional: if no token is configured everything no-ops."""
+Telegram is per-user: each user creates their own bot (via @BotFather), saves its
+token in settings, and links the chat reports go to by DMing ``/start <code>`` to
+that bot. There is no global bot or background long-poll loop — linking is done on
+demand from the settings page (``find_start_chat`` reads the bot's recent updates
+once), and the daily scheduler pushes each user's report through that user's own
+bot. Everything no-ops gracefully for a user who hasn't configured a bot/chat."""
 from __future__ import annotations
 
 import logging
@@ -13,7 +13,6 @@ import logging
 import httpx
 from sqlalchemy import select
 
-from ..config import settings
 from ..db import session_scope
 from ..models import User
 from .reporter import build_report, report_to_telegram
@@ -21,12 +20,8 @@ from .reporter import build_report, report_to_telegram
 log = logging.getLogger(__name__)
 
 
-def _enabled() -> bool:
-    return bool(settings.telegram_bot_token)
-
-
-def _api(method: str) -> str:
-    return f"https://api.telegram.org/bot{settings.telegram_bot_token}/{method}"
+def _api(token: str, method: str) -> str:
+    return f"https://api.telegram.org/bot{token}/{method}"
 
 
 # Telegram rejects any sendMessage body over 4096 chars with a 400, which would
@@ -64,91 +59,99 @@ def _response_ok(resp: httpx.Response) -> bool:
         return False
 
 
-def send_message(chat_id: str, text: str) -> None:
-    if not _enabled():
-        return
+def send_message(token: str, chat_id: str, text: str) -> bool:
+    """Send (chunked) text to a chat via the given bot. Returns True iff every
+    chunk was accepted. Never raises — transport/API failures are logged and
+    reported as False so callers (the daily push and the settings "Test" button)
+    can surface the problem instead of silently dropping the report."""
+    if not token or not chat_id:
+        return False
     for chunk in _split_for_telegram(text):
         try:
             resp = httpx.post(
-                _api("sendMessage"),
+                _api(token, "sendMessage"),
                 json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML",
                       "disable_web_page_preview": True},
                 timeout=20,
             )
         except httpx.HTTPError as exc:
             log.warning("telegram send failed: %s", exc)
-            return
+            return False
         if not _response_ok(resp):
             # e.g. 400 "message is too long", 403 bot blocked — previously these
             # were silently dropped, so a user just never got their report.
             log.warning("telegram sendMessage rejected (HTTP %s): %s",
                         resp.status_code, resp.text[:200])
-            return
+            return False
+    return True
 
 
-def _link_account(link_code: str, chat_id: str) -> str:
-    with session_scope() as db:
-        user = db.scalar(select(User).where(User.telegram_link_code == link_code))
-        if not user:
-            return "That link code isn't valid. Copy it from your JobScout dashboard."
-        user.telegram_chat_id = str(chat_id)
-        # One-time: burn the code on use so a leaked code can't be replayed to
-        # re-bind someone else's chat. The dashboard can mint a fresh one.
-        user.telegram_link_code = None
-        return f"✅ Linked to {user.email}. You'll get your daily JobScout report here."
+def get_bot_username(token: str) -> tuple[bool, str]:
+    """Validate a bot token via getMe. Returns ``(ok, username)`` on success or
+    ``(False, reason)`` when the token is bad / Telegram is unreachable — used by
+    the settings "Test" button to check the token before trying to send."""
+    if not token:
+        return False, "no bot token"
+    try:
+        resp = httpx.get(_api(token, "getMe"), timeout=15)
+    except httpx.HTTPError as exc:
+        return False, f"could not reach Telegram ({exc})"
+    if not _response_ok(resp):
+        return False, f"Telegram rejected the token (HTTP {resp.status_code})"
+    username = (resp.json().get("result") or {}).get("username") or "your bot"
+    return True, username
 
 
-def poll_updates(offset: int | None = None) -> int | None:
-    """One long-poll cycle. Returns the next update offset. Handles /start <code>.
-
-    Raises on any transport/API failure (bad token → 401, non-JSON body, or an
-    ``ok: false`` envelope) so the caller can back off instead of hot-looping —
-    a 401 from a bad token returns *instantly*, with no long-poll delay."""
-    if not _enabled():
-        return offset
-    resp = httpx.get(
-        _api("getUpdates"),
-        params={"timeout": 30, "offset": offset} if offset else {"timeout": 30},
-        timeout=40,
-    )
+def get_updates(token: str, offset: int | None = None, timeout: int = 0) -> list[dict]:
+    """One getUpdates call for a single bot. ``timeout=0`` returns immediately with
+    whatever is buffered (we poll on demand, not in a long-poll loop). Raises on a
+    transport/API failure (bad token → 401, non-JSON body, ``ok: false``)."""
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    resp = httpx.get(_api(token, "getUpdates"), params=params, timeout=timeout + 15)
     resp.raise_for_status()
     payload = resp.json()
     if not payload.get("ok", False):
         raise RuntimeError(f"telegram getUpdates not ok: {str(payload)[:200]}")
+    return payload.get("result", [])
 
-    next_offset = offset
-    for update in payload.get("result", []):
-        next_offset = update["update_id"] + 1
+
+def find_start_chat(token: str, code: str) -> str | None:
+    """Scan the bot's recent updates for ``/start <code>`` and return the chat id
+    that sent it (newest wins), or None if the user hasn't DMed it yet. Requiring
+    the one-time code means only the chat that knows it gets linked, so a stranger
+    who happens to message the bot can't bind themselves to the account."""
+    chat_id: str | None = None
+    for update in get_updates(token):
         msg = update.get("message") or {}
         text = (msg.get("text") or "").strip()
-        chat_id = (msg.get("chat") or {}).get("id")
-        if not chat_id:
+        cid = (msg.get("chat") or {}).get("id")
+        if not cid:
             continue
-        if text.startswith("/start"):
-            parts = text.split(maxsplit=1)
-            if len(parts) == 2:
-                send_message(str(chat_id), _link_account(parts[1].strip(), str(chat_id)))
-            else:
-                send_message(str(chat_id), "Send <code>/start &lt;your-link-code&gt;</code> "
-                                           "(find the code on your JobScout dashboard).")
-    return next_offset
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2 and parts[0] == "/start" and parts[1].strip() == code:
+            chat_id = str(cid)  # keep scanning so the most recent match wins
+    return chat_id
 
 
 def send_daily_reports(error_by_user: dict[int, list[str]] | None = None) -> None:
-    """Push today's report to every user who has linked Telegram. ``error_by_user``
-    maps user id → that run's warnings so they're surfaced alongside the matches
-    instead of leaving a broken account staring at an empty report."""
-    if not _enabled():
-        return
+    """Push today's report to every user who has both a bot token and a linked
+    chat, each through their own bot. ``error_by_user`` maps user id → that run's
+    warnings so a broken account sees *why* there are no matches instead of a
+    silent empty report."""
     from ..timeutil import utcnow
 
     error_by_user = error_by_user or {}
     today_utc = utcnow().date()
     with session_scope() as db:
-        users = list(db.scalars(select(User).where(User.telegram_chat_id.isnot(None))))
+        users = list(db.scalars(select(User).where(
+            User.telegram_bot_token.isnot(None), User.telegram_chat_id.isnot(None)
+        )))
         for user in users:
             report = build_report(db, user, on_date=today_utc)
             send_message(
+                user.telegram_bot_token,
                 user.telegram_chat_id,
                 report_to_telegram(report, error_by_user.get(user.id)),
             )

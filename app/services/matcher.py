@@ -8,25 +8,35 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import session_scope
-from ..models import Company, Interest, MatchResult, Position, Resume, User
+from ..models import Company, Interest, MatchResult, Position, Resume, Subscription, User
 from ..schemas import MatchVerdict
 from ..timeutil import utcnow
-from . import scraper
-from .ollama_client import OllamaClient, OllamaError, get_client
+from . import llm, scraper
+from .ollama_client import OllamaBudgetError, OllamaClient, OllamaError
 
 log = logging.getLogger(__name__)
 
-# Structured-output schema the scoring model must fill (Ollama `format`). Derived
-# from the Pydantic model so the schema and the parser never drift apart.
-MATCH_SCHEMA = MatchVerdict.model_json_schema()
+class BatchMatchVerdict(MatchVerdict):
+    """One scoring verdict inside a batched response. ``id`` is the 1-based
+    posting number from the prompt so we can persist each result to the right row."""
+
+    id: int = Field(ge=1)
+
+
+class MatchBatchResponse(BaseModel):
+    results: list[BatchMatchVerdict]
+
+
+MATCH_BATCH_SCHEMA = MatchBatchResponse.model_json_schema()
 
 # Stage 1: a CHEAP model decides relevance (semantic, not substring) so we only
 # spend the expensive scoring model on postings that actually fit the interest.
@@ -69,16 +79,37 @@ SYSTEM_PROMPT = (
 )
 
 _RESUME_CHARS = 6000
-_DESC_CHARS = 4000
 _FILTER_DESC_CHARS = 800  # the cheap relevance filter only needs a short blurb per posting
+_SCORE_BATCH_DESC_CHARS = 1500  # batch scoring keeps one resume + N postings in context
 
 # Marker stored on the `model` column of a MatchResult when scoring terminally
 # failed, so the pair is skipped on re-runs rather than re-billed. Cleared by
 # `clear_failed_markers` (CLI: run-daily --retry-failed).
 ERROR_MODEL = "error"
+# Marker for a pair dropped by an explicit exclude keyword before any LLM call.
+# Persisting it (instead of just counting) means the pair leaves the evaluation
+# backlog, so the "positions unevaluated" count converges to zero and the
+# background drain terminates.
+EXCLUDED_MODEL = "excluded"
 
 
 _MAX_REPORTED_ERRORS = 5
+# Two per-user locks with distinct jobs (see plan): the SCRAPE lock (held briefly)
+# stops two concurrent scrapes racing on uq_position_company_extid; the SCORE lock
+# (held for a whole drain) ensures only one evaluator works a user at a time. They
+# are separate so /api/run can scrape while a background drain is scoring.
+_SCRAPE_LOCKS: dict[int, threading.Lock] = {}
+_SCORE_LOCKS: dict[int, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(registry: dict[int, threading.Lock], user_id: int) -> threading.Lock:
+    with _LOCKS_GUARD:
+        lock = registry.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            registry[user_id] = lock
+        return lock
 
 
 @dataclass
@@ -86,6 +117,12 @@ class RunResult:
     new_positions: int = 0
     scored: int = 0  # postings the good model fully scored (passed the cheap filter)
     filtered: int = 0  # postings the cheap model judged not a match
+    # Set when scoring stopped because the Ollama budget/quota was exhausted. The
+    # background drainer checks this to avoid re-arming against a dead quota.
+    budget_exhausted: bool = False
+    # False when score_to_completion couldn't acquire the score lock (another drain
+    # is already working this user), so the caller can skip recording a snapshot.
+    did_run: bool = True
     errors: list[str] = field(default_factory=list)
     match_ids: list[int] = field(default_factory=list)
     # Internal: total error count + de-dup set so one outage doesn't emit 200
@@ -127,28 +164,6 @@ def _passes_prefilter(pos: Position, interest: Interest) -> bool:
     return not any(x in haystack for x in excludes)
 
 
-def _build_user_prompt(resume: Resume, interest: Interest, pos: Position) -> str:
-    reqs = [f"- {k}: {v}" for k, v in {
-        "Desired titles": interest.title_keywords,
-        "Locations": interest.locations,
-        "Seniority": interest.seniority,
-        "Employment type": interest.employment_type,
-        "Exclusions": interest.exclude_keywords,
-        "Notes": interest.notes,
-    }.items() if v]
-    return (
-        "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
-        "## RESUME\n" + resume.content_text[:_RESUME_CHARS] + "\n\n"
-        "## JOB POSTING\n"
-        f"Company position id: {pos.external_id}\n"
-        f"Title: {pos.title}\n"
-        f"Location: {pos.location or 'n/a'}\n"
-        f"Department: {pos.department or 'n/a'}\n"
-        f"Employment type: {pos.employment_type or 'n/a'}\n"
-        f"Description:\n{(pos.description or '(no description scraped)')[:_DESC_CHARS]}\n"
-    )
-
-
 def _build_filter_batch_prompt(interest: Interest, positions: list[Position]) -> str:
     """Stage-1 prompt: interest requirements vs a NUMBERED batch of postings (no
     resume — relevance doesn't need it, and a short per-posting blurb keeps the
@@ -169,6 +184,39 @@ def _build_filter_batch_prompt(interest: Interest, positions: list[Position]) ->
     return (
         "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
         "## JOB POSTINGS (decide a match for each, by its number)\n" + "\n".join(blocks) + "\n"
+    )
+
+
+def _build_score_batch_prompt(resume: Resume, interest: Interest, positions: list[Position]) -> str:
+    """Stage-2 prompt: score multiple postings in one model call. The resume and
+    requirements are repeated once, then each posting is numbered so the JSON
+    response can be mapped back to DB rows."""
+    reqs = [f"- {k}: {v}" for k, v in {
+        "Desired titles": interest.title_keywords,
+        "Locations": interest.locations,
+        "Seniority": interest.seniority,
+        "Employment type": interest.employment_type,
+        "Exclusions": interest.exclude_keywords,
+        "Notes": interest.notes,
+    }.items() if v]
+    blocks = [
+        f"### Posting {i}\n"
+        f"Company position id: {pos.external_id}\n"
+        f"Title: {pos.title}\n"
+        f"Location: {pos.location or 'n/a'}\n"
+        f"Department: {pos.department or 'n/a'}\n"
+        f"Employment type: {pos.employment_type or 'n/a'}\n"
+        f"Description:\n{(pos.description or '(no description scraped)')[:_SCORE_BATCH_DESC_CHARS]}\n"
+        for i, pos in enumerate(positions, 1)
+    ]
+    return (
+        "Score every numbered posting independently against the same resume and "
+        "candidate requirements. Return JSON with a top-level `results` array. "
+        "Each result must include the posting's 1-based `id` and the same verdict "
+        "fields requested by the schema. Do not omit postings.\n\n"
+        "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
+        "## RESUME\n" + resume.content_text[:_RESUME_CHARS] + "\n\n"
+        "## JOB POSTINGS\n" + "\n".join(blocks) + "\n"
     )
 
 
@@ -222,6 +270,8 @@ def _filter_batch(
         return {}, None
     try:
         text = client.chat_text(FILTER_SYSTEM_PROMPT, _build_filter_batch_prompt(interest, positions))
+    except OllamaBudgetError:
+        raise  # recoverable: let the run abort cleanly without poisoning postings
     except OllamaError as exc:
         log.warning("batch filter failed (%d postings): %s", len(positions), exc)
         return {}, f"Filtering failed: {exc}"
@@ -254,6 +304,47 @@ def _persist_filter_reject(
         strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model,
     ))
     db.flush()
+
+
+def _persist_exclude_reject(
+    db: Session, user: User, resume: Resume, interest: Interest, pos: Position
+) -> None:
+    """Record a keyword-exclusion 'not a match' so the pair leaves the backlog and
+    ranks out of the report (passed_filter=False), without spending an LLM call."""
+    db.add(MatchResult(
+        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+        passed_filter=False, match_score=0, win_probability=0,
+        reasoning="Dropped by an interest exclude keyword.",
+        strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL,
+    ))
+    db.flush()
+
+
+def _persist_score_result(
+    db: Session,
+    user: User,
+    resume: Resume,
+    interest: Interest,
+    pos: Position,
+    verdict: MatchVerdict,
+    model: str,
+) -> int:
+    result = MatchResult(
+        user_id=user.id,
+        position_id=pos.id,
+        resume_id=resume.id,
+        interest_id=interest.id,
+        passed_filter=verdict.matches_requirements,
+        match_score=verdict.match_score,
+        win_probability=verdict.win_probability,
+        reasoning=verdict.reasoning,
+        strengths=json.dumps(verdict.strengths),
+        gaps=json.dumps(verdict.gaps),
+        model=model,
+    )
+    db.add(result)
+    db.flush()
+    return result.id
 
 
 def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], list[str]]:
@@ -295,59 +386,74 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
     return new_positions, errors
 
 
-def _score_position(
+def _score_batch(
     client: OllamaClient,
     db: Session,
     user: User,
     resume: Resume,
     interest: Interest,
-    pos: Position,
-) -> tuple[int | None, str | None]:
-    """Call the LLM for one (position, resume) pair and persist a MatchResult.
-    Returns ``(match_id, error)``: the id on success, or ``(None, message)`` so
-    the caller can surface the failure in the run summary instead of swallowing
-    it. The error message is intentionally not position-specific so identical
-    outages (e.g. a bad API key) de-dup into a single reported line.
+    positions: list[Position],
+) -> tuple[list[int], str | None]:
+    """Call the scoring model once for a batch of postings and persist one
+    MatchResult per posting. This is the main request-count reducer: after the
+    cheap relevance filter, survivors are scored N-at-a-time instead of one call
+    per posting."""
+    if not positions:
+        return [], None
 
-    On terminal failure (the HTTP layer already retried transient errors) a
-    marker row is persisted with ``model=ERROR_MODEL`` so this (position,
-    interest) pair lands in the ``already`` set and isn't re-billed every run.
-    Clear markers with ``jobscout run-daily --retry-failed`` to retry them."""
+    prompt = _build_score_batch_prompt(resume, interest, positions)
     try:
-        data = client.chat_json(SYSTEM_PROMPT, _build_user_prompt(resume, interest, pos), MATCH_SCHEMA)
-        verdict = MatchVerdict.model_validate(data)
-    except (OllamaError, ValidationError) as exc:
-        log.warning("scoring failed for position %s: %s", pos.id, exc)
-        # Keep the verbose error in the marker row for debugging, but report a
-        # stable summary so identical failures de-dup in the run summary:
-        # transport/auth errors share text; per-position validation noise doesn't.
-        summary = str(exc) if isinstance(exc, OllamaError) else "model returned an invalid result"
-        marker = MatchResult(
-            user_id=user.id, position_id=pos.id, resume_id=resume.id,
-            interest_id=interest.id, passed_filter=False, match_score=0,
-            win_probability=0, reasoning=f"Scoring failed: {exc}"[:1000],
-            model=ERROR_MODEL,
-        )
-        db.add(marker)
-        db.flush()
-        return None, f"Scoring failed: {summary}"
+        data = client.chat_json(SYSTEM_PROMPT, prompt, MATCH_BATCH_SCHEMA)
+    except OllamaBudgetError:
+        # Recoverable — don't write error-markers, or these postings would be
+        # skipped until --retry-failed even after the user tops up. Propagate so
+        # the run loop stops and reports it once.
+        raise
+    except OllamaError as exc:
+        log.warning("batch scoring failed for %d postings: %s", len(positions), exc)
+        message = f"Scoring failed: {exc}"
+        for pos in positions:
+            _persist_error_marker(db, user, resume, interest, pos, message)
+        return [], f"Scoring failed: {exc}"
 
-    result = MatchResult(
-        user_id=user.id,
-        position_id=pos.id,
-        resume_id=resume.id,
-        interest_id=interest.id,
-        passed_filter=verdict.matches_requirements,
-        match_score=verdict.match_score,
-        win_probability=verdict.win_probability,
-        reasoning=verdict.reasoning,
-        strengths=json.dumps(verdict.strengths),
-        gaps=json.dumps(verdict.gaps),
-        model=client.model,
-    )
-    db.add(result)
-    db.flush()
-    return result.id, None
+    raw_results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(raw_results, list):
+        message = "Scoring failed: model returned an invalid batch result"
+        log.warning("batch scoring returned invalid top-level payload for %d postings", len(positions))
+        for pos in positions:
+            _persist_error_marker(db, user, resume, interest, pos, message)
+        return [], message
+
+    verdicts: dict[int, BatchMatchVerdict] = {}
+    invalid = 0
+    for raw in raw_results:
+        try:
+            verdict = BatchMatchVerdict.model_validate(raw)
+        except ValidationError:
+            invalid += 1
+            continue
+        if verdict.id > len(positions) or verdict.id in verdicts:
+            invalid += 1
+            continue
+        verdicts[verdict.id] = verdict
+
+    match_ids: list[int] = []
+    missing = 0
+    marker_message = "Scoring failed: model omitted or invalidated this posting in the batch"
+    for idx, pos in enumerate(positions, 1):
+        verdict = verdicts.get(idx)
+        if verdict is None:
+            missing += 1
+            _persist_error_marker(db, user, resume, interest, pos, marker_message)
+            continue
+        match_ids.append(_persist_score_result(db, user, resume, interest, pos, verdict, client.model))
+
+    if invalid or missing:
+        return (
+            match_ids,
+            f"Scoring failed for {invalid + missing} posting(s): model returned an incomplete batch result",
+        )
+    return match_ids, None
 
 
 def clear_failed_markers(db: Session, user_id: int | None = None) -> int:
@@ -359,23 +465,35 @@ def clear_failed_markers(db: Session, user_id: int | None = None) -> int:
     return db.execute(stmt).rowcount or 0
 
 
-def run_for_user(
-    db: Session,
-    user: User,
-    client: OllamaClient | None = None,
-    filter_client: OllamaClient | None = None,
-) -> RunResult:
-    """Scrape all of a user's companies and score newly-seen / unscored positions
-    against their active resume. Idempotent: positions already scored for the
-    active resume are skipped, so re-running the same day costs nothing extra.
+def _custom_companies(db: Session, user: User) -> list[Company]:
+    """The user's own custom companies (preset rows have a NULL user_id, so a
+    ``user_id == me`` filter already excludes them). These are the only companies a
+    user *scan* crawls; presets are crawled separately by crawl_presets."""
+    return list(
+        db.scalars(select(Company).where(Company.user_id == user.id, Company.is_active == True))  # noqa: E712
+    )
 
-    Two-stage scoring: a cheap model triages relevance, then the good (scoring)
-    model — ``client`` if injected, else ``get_client()`` — only scores the
-    survivors. A per-run cap bounds how many postings are evaluated."""
-    score_client = client or get_client()
-    filter_client = filter_client or OllamaClient(model=settings.ollama_filter_model)
-    res = RunResult()
 
+def _user_companies(db: Session, user: User) -> list[Company]:
+    """All active companies whose jobs are matched for this user: their own custom
+    companies plus the global preset companies they subscribe to."""
+    by_id = {c.id: c for c in _custom_companies(db, user)}
+    subscribed = db.scalars(
+        select(Company)
+        .join(Subscription, Subscription.company_id == Company.id)
+        .where(
+            Subscription.user_id == user.id,
+            Subscription.is_active == True,  # noqa: E712
+            Company.is_active == True,  # noqa: E712
+        )
+    )
+    by_id.update({c.id: c for c in subscribed})
+    return list(by_id.values())
+
+
+def _active_inputs(db: Session, user: User) -> tuple[Resume | None, list[Interest], list[Company]]:
+    """Load the user's active resume, interests, and matched companies (custom +
+    subscribed presets) — the shared inputs scoring needs."""
     resume = db.scalar(
         select(Resume).where(Resume.user_id == user.id, Resume.is_active == True)  # noqa: E712
         .order_by(Resume.created_at.desc())
@@ -383,38 +501,130 @@ def run_for_user(
     interests = list(
         db.scalars(select(Interest).where(Interest.user_id == user.id, Interest.is_active == True))  # noqa: E712
     )
-    companies = list(
-        db.scalars(select(Company).where(Company.user_id == user.id, Company.is_active == True))  # noqa: E712
+    return resume, interests, _user_companies(db, user)
+
+
+def _described(positions: list[Position]) -> list[Position]:
+    """Postings with a real scraped description, newest first. Description-less
+    postings (generic HTML-fallback nav links) are never scored — the LLM would
+    only read "(no description scraped)" — so they're excluded from the backlog."""
+    described = [p for p in positions if (p.description or "").strip()]
+    described.sort(key=lambda p: p.first_seen_at or utcnow(), reverse=True)
+    return described
+
+
+def scrape_only(db: Session, user: User, res: RunResult | None = None) -> RunResult:
+    """Scrape + upsert the user's CUSTOM companies, recording new_positions and any
+    per-company scrape errors on ``res``. Preset companies are global and crawled
+    once by ``crawler.crawl_presets`` (daily / on-demand), never on a user scan.
+    Serialized per user by the scrape lock so two concurrent scrapes can't race on
+    uq_position_company_extid. Does NOT score — that's ``score_to_completion``'s."""
+    res = res or RunResult()
+    companies = _custom_companies(db, user)
+    undescribed = 0
+    # Commit per company so we never hold a write lock across the whole scrape
+    # (SQLite) and a later failure can't discard already-scraped postings.
+    with _lock_for(_SCRAPE_LOCKS, user.id):
+        for company in companies:
+            new_positions, errs = _upsert_positions(db, company)
+            for e in errs:
+                res.add_error(e)
+            res.new_positions += len(new_positions)
+            undescribed += sum(1 for p in new_positions if not (p.description or "").strip())
+            db.commit()
+    if undescribed:
+        res.add_error(
+            f"{undescribed} posting(s) had no scraped description and were skipped — "
+            "set the company's ATS (greenhouse/lever/ashby) for full job text."
+        )
+    return res
+
+
+def count_pending(db: Session, user: User) -> int:
+    """Size of the evaluation backlog: (described position × active interest) pairs
+    of the user's active companies that still lack a MatchResult for the active
+    resume. 0 when there's no active resume/interests/companies (nothing to score).
+    This is the number the dashboard shows as "positions still being evaluated"."""
+    resume, interests, companies = _active_inputs(db, user)
+    if not resume or not interests or not companies:
+        return 0
+    company_ids = [c.id for c in companies]
+    described_ids = {
+        p.id for p in db.scalars(select(Position).where(Position.company_id.in_(company_ids)))
+        if (p.description or "").strip()
+    }
+    if not described_ids:
+        return 0
+    interest_ids = [i.id for i in interests]
+    filled = sum(
+        1
+        for pid, iid in db.execute(
+            select(MatchResult.position_id, MatchResult.interest_id).where(
+                MatchResult.user_id == user.id,
+                MatchResult.resume_id == resume.id,
+                MatchResult.interest_id.in_(interest_ids),
+            )
+        )
+        if pid in described_ids
     )
+    return len(described_ids) * len(interest_ids) - filled
+
+
+def score_to_completion(
+    db: Session,
+    user: User,
+    res: RunResult | None = None,
+    *,
+    client: OllamaClient | None = None,
+    filter_client: OllamaClient | None = None,
+) -> RunResult:
+    """Score the user's entire current evaluation backlog, draining it to completion
+    (no per-run cap). Two-stage batched scoring: a cheap model triages relevance,
+    then the good model scores survivors. Guarded by the non-blocking score lock so
+    only one drain runs per user; if another already holds it, returns immediately
+    with ``res.did_run = False``. Stops early and sets ``res.budget_exhausted`` if
+    the Ollama budget runs out — without writing markers, so the backlog re-scores
+    automatically once quota returns."""
+    res = res or RunResult()
+    lock = _lock_for(_SCORE_LOCKS, user.id)
+    if not lock.acquire(blocking=False):
+        log.debug("score_to_completion: a drain is already running for user %s — skipping", user.id)
+        res.did_run = False
+        return res
+    try:
+        _score_locked(db, user, res, client=client, filter_client=filter_client)
+    finally:
+        lock.release()
+    return res
+
+
+def _score_locked(
+    db: Session,
+    user: User,
+    res: RunResult,
+    *,
+    client: OllamaClient | None = None,
+    filter_client: OllamaClient | None = None,
+) -> None:
+    # Build the scoring + relevance-filter clients from this user's effective LLM
+    # config (their provider/key/models, else the global defaults), unless a caller
+    # injected clients (tests, or a future override).
+    if client is None or filter_client is None:
+        default_score, default_filter = llm.clients_for_user(db, user)
+    score_client = client or default_score
+    filter_client = filter_client or default_filter
+
+    resume, interests, companies = _active_inputs(db, user)
     if not resume:
         res.add_error("No active resume uploaded — cannot score.")
     if not interests:
         res.add_error("No active interests configured — nothing to match against.")
+    if not resume or not interests or not companies:
+        return
 
-    # 1) Scrape + upsert. Track which positions are brand-new this run.
-    #    Commit per company so we never hold a write lock across the whole run
-    #    (SQLite) and so a later failure can't discard already-scraped postings.
-    new_ids: set[int] = set()
-    for company in companies:
-        new_positions, errs = _upsert_positions(db, company)
-        for e in errs:
-            res.add_error(e)
-        res.new_positions += len(new_positions)
-        new_ids.update(p.id for p in new_positions)
-        db.commit()
-
-    if not resume or not interests:
-        res.finalize_errors()
-        return res
-
-    # 2) Candidate set = every position of the user's companies that lacks a
-    #    MatchResult for the active resume (covers new + any never-scored).
     company_ids = [c.id for c in companies]
-    if not company_ids:
-        res.finalize_errors()
-        return res
-    all_positions = list(
-        db.scalars(select(Position).where(Position.company_id.in_(company_ids)))
+    described = _described(
+        list(db.scalars(select(Position).where(Position.company_id.in_(company_ids))))
     )
     already = {
         (m.position_id, m.interest_id)
@@ -425,89 +635,76 @@ def run_for_user(
         )
     }
 
-    # Newest first so the per-run cap spends its budget on the freshest postings.
-    all_positions.sort(key=lambda p: p.first_seen_at or utcnow(), reverse=True)
-    # Postings with no scraped description come from the generic HTML fallback (nav
-    # links etc.). Scoring them just bills the LLM to read "(no description scraped)"
-    # and yields meaningless numbers, so skip them and (for newly-seen ones) nudge
-    # the user to configure a real ATS instead.
-    described = [p for p in all_positions if (p.description or "").strip()]
-    undescribed = sum(
-        1 for p in all_positions if p.id in new_ids and not (p.description or "").strip()
-    )
-
-    # Per-run budget on how many postings we evaluate; bounds the cheap-filter and
-    # scoring work alike. 0 = unlimited.
-    budget = settings.score_max_per_run
     batch_size = max(1, settings.score_filter_batch_size)
-    evaluated = 0
-    truncated = False
-    excluded = 0  # pairs dropped by an explicit exclude keyword (before any LLM call)
-    filter_model = settings.ollama_filter_model
+    score_batch_size = max(1, settings.score_batch_size)
+    filter_model = filter_client.model  # the model name we tag filter-rejects with
+    excluded = 0  # pairs dropped by an explicit exclude keyword (no LLM call)
 
-    # Evaluate each interest against the postings it hasn't been scored for. The
-    # cheap relevance filter is BATCHED (one call screens up to batch_size postings);
-    # only survivors get the expensive per-posting scoring.
-    for interest in interests:
-        if truncated:
-            break
-        candidates: list[Position] = []
-        for pos in described:
-            if (pos.id, interest.id) in already:
-                continue
-            if not _passes_prefilter(pos, interest):  # explicit exclude keyword
-                excluded += 1
-                continue
-            candidates.append(pos)
-
-        idx = 0
-        while idx < len(candidates):
-            if budget and evaluated >= budget:
-                truncated = True
-                break
-            room = min(batch_size, budget - evaluated) if budget else batch_size
-            batch = candidates[idx : idx + room]
-            idx += len(batch)
-            evaluated += len(batch)
-
-            # Stage 1 — batched cheap relevance filter.
-            verdicts, ferr = _filter_batch(filter_client, interest, batch)
-            if ferr is not None:
-                res.add_error(ferr)
-                for pos in batch:  # marker so the batch isn't re-billed every run
-                    _persist_error_marker(db, user, resume, interest, pos, ferr)
-                db.commit()
-                continue
-            for pos in batch:
-                matches, reason = verdicts[pos.id]
-                if not matches:
-                    _persist_filter_reject(db, user, resume, interest, pos, reason, filter_model)
-                    res.filtered += 1
+    # Evaluate every active interest against the postings it hasn't been scored for.
+    # Both LLM stages are batched. Every processed pair gets *some* MatchResult row
+    # (score / filter-reject / exclude / error-marker), so the backlog strictly
+    # shrinks and the drain terminates.
+    try:
+        for interest in interests:
+            candidates: list[Position] = []
+            for pos in described:
+                if (pos.id, interest.id) in already:
                     continue
-                # Stage 2 — expensive resume<->role scoring for survivors only.
-                match_id, serr = _score_position(score_client, db, user, resume, interest, pos)
-                if match_id is not None:
-                    res.scored += 1
-                    res.match_ids.append(match_id)
-                if serr is not None:
-                    res.add_error(serr)
-            # Commit per batch so the write lock is released between calls and
-            # partial progress (incl. markers) survives a crash mid-run.
-            db.commit()
+                if not _passes_prefilter(pos, interest):  # explicit exclude keyword
+                    _persist_exclude_reject(db, user, resume, interest, pos)
+                    excluded += 1
+                    continue
+                candidates.append(pos)
+            db.commit()  # persist exclude markers (so they leave the backlog)
 
-    if undescribed:
+            idx = 0
+            while idx < len(candidates):
+                batch = candidates[idx : idx + batch_size]
+                idx += len(batch)
+
+                # Stage 1 — batched cheap relevance filter.
+                verdicts, ferr = _filter_batch(filter_client, interest, batch)
+                if ferr is not None:
+                    res.add_error(ferr)
+                    for pos in batch:  # marker so the batch isn't re-billed every run
+                        _persist_error_marker(db, user, resume, interest, pos, ferr)
+                    db.commit()
+                    continue
+                survivors: list[Position] = []
+                for pos in batch:
+                    matches, reason = verdicts[pos.id]
+                    if not matches:
+                        _persist_filter_reject(db, user, resume, interest, pos, reason, filter_model)
+                        res.filtered += 1
+                        continue
+                    survivors.append(pos)
+
+                # Stage 2 — expensive resume<->role scoring for survivors only.
+                for start in range(0, len(survivors), score_batch_size):
+                    score_batch = survivors[start : start + score_batch_size]
+                    match_ids, serr = _score_batch(score_client, db, user, resume, interest, score_batch)
+                    res.scored += len(match_ids)
+                    res.match_ids.extend(match_ids)
+                    if serr is not None:
+                        res.add_error(serr)
+                # Commit per batch so the write lock is released between calls and
+                # partial progress (incl. markers) survives a crash mid-drain.
+                db.commit()
+    except OllamaBudgetError as exc:
+        # Quota ran out. Discard the half-processed batch (no markers written, so the
+        # remaining postings re-score automatically once quota is back), then surface
+        # one clear message. Earlier committed batches + exclude markers are kept.
+        res.budget_exhausted = True
+        db.rollback()
         res.add_error(
-            f"{undescribed} posting(s) had no scraped description and were skipped — "
-            "set the company's ATS (greenhouse/lever/ashby) for full job text."
+            "Ollama budget/quota appears to be exhausted, so scoring stopped early. "
+            "No results were lost — the remaining postings will be scored "
+            "automatically on the next run once your Ollama account has quota again. "
+            f"(Ollama said: {exc})"
         )
-    if truncated:
-        res.add_error(
-            f"Reached this run's scoring cap ({budget}) — more postings remain "
-            "unscored. Click Run again to continue, or raise JOBSCOUT_SCORE_MAX_PER_RUN."
-        )
-    # Explain a "0 scored" run instead of leaving it silent (cf. the pre-filter was
-    # silent by design). Order matters: the relevance filter is the usual culprit.
-    if res.scored == 0 and not truncated:
+
+    # Explain a "0 scored" outcome instead of leaving it silent.
+    if res.scored == 0 and not res.budget_exhausted:
         if res.filtered:
             res.add_error(
                 f"The relevance filter judged none of the {res.filtered} evaluated "
@@ -519,13 +716,32 @@ def run_for_user(
                 f"{excluded} posting(s) were dropped by your interest's exclude "
                 "keywords before scoring. Loosen the exclude list if that's too broad."
             )
+
+
+def run_for_user(
+    db: Session,
+    user: User,
+    client: OllamaClient | None = None,
+    filter_client: OllamaClient | None = None,
+) -> RunResult:
+    """Synchronous full run: scrape, then drain the entire scoring backlog to
+    completion. Used by the daily scheduler, CLI, MCP, and tests. (The web path
+    scrapes here too but defers scoring to the background evaluator.)"""
+    res = RunResult()
+    scrape_only(db, user, res)
+    score_to_completion(db, user, res, client=client, filter_client=filter_client)
     res.finalize_errors()
     return res
 
 
 def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
-    """Entry point for the scheduler/CLI. Each user committed independently.
-    ``retry_failed`` clears prior error-markers first so failed pairs re-score."""
+    """Entry point for the scheduler/CLI. Crawl the shared preset catalog ONCE, then
+    score each user (which also scrapes that user's custom companies) — committed
+    independently. ``retry_failed`` clears prior error-markers first."""
+    from . import crawler
+
+    crawler.crawl_presets()  # shared, once — not per user
+
     summaries: dict[int, RunResult] = {}
     with session_scope() as db:
         user_ids = list(db.scalars(select(User.id)))

@@ -5,13 +5,25 @@ import html
 import json
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..models import Company, Interest, JobListSnapshot, MatchResult, Position, User
+from ..models import (
+    Application,
+    Company,
+    Interest,
+    JobListSnapshot,
+    MatchResult,
+    Position,
+    User,
+)
+from ..timeutil import utcnow
+from .matcher import ERROR_MODEL
 
 
 JOB_LIST_SNAPSHOT_LIMIT = 500
+# Categories the dashboard job list can request (see build_job_list).
+JOB_CATEGORIES = ("matching", "all")
 
 
 def _loads(value: str | None) -> list[str]:
@@ -19,6 +31,54 @@ def _loads(value: str | None) -> list[str]:
         return json.loads(value) if value else []
     except json.JSONDecodeError:
         return []
+
+
+def _listed_at(pos: Position) -> datetime | None:
+    """The job's effective 'listed' date: the ATS-reported post date when we have
+    one, else when our crawler first saw it (so undated sources still get a date)."""
+    return pos.posted_at or pos.first_seen_at
+
+
+def _match_row(match: MatchResult, pos: Position, company: Company, *,
+               below_threshold: bool, non_matching: bool = False) -> dict:
+    """Build one dashboard/report row dict from a (match, position, company)."""
+    listed = _listed_at(pos)
+    return {
+        "position_id": pos.id,
+        "company": company.name,
+        "title": pos.title,
+        "location": pos.location,
+        "url": pos.url,
+        "match_score": match.match_score,
+        "win_probability": match.win_probability,
+        "reasoning": match.reasoning,
+        "strengths": _loads(match.strengths),
+        "gaps": _loads(match.gaps),
+        "below_threshold": below_threshold,
+        "non_matching": non_matching,
+        "scored_at": match.created_at.isoformat() if match.created_at else None,
+        "listed_at": listed.isoformat() if listed else None,
+        "applied": False,  # overlaid per-user by tag_applied (live, not stored)
+    }
+
+
+def tag_applied(db: Session, user: User, items: list[dict]) -> list[dict]:
+    """Set each item's ``applied`` flag from the user's Application rows. Done at
+    render time (not stored) so the toggle reflects the latest status even on a
+    frozen saved list. Mutates and returns ``items``."""
+    ids = [m["position_id"] for m in items if m.get("position_id") is not None]
+    if not ids:
+        return items
+    applied = set(
+        db.scalars(
+            select(Application.position_id).where(
+                Application.user_id == user.id, Application.position_id.in_(ids)
+            )
+        )
+    )
+    for m in items:
+        m["applied"] = m.get("position_id") in applied
+    return items
 
 
 def build_report(
@@ -62,29 +122,13 @@ def build_report(
     # Per-interest thresholds, for when min_score isn't overridden.
     thresholds = {i.id: i.min_score for i in db.scalars(select(Interest).where(Interest.user_id == user.id))}
 
-    def _row(match, pos, company, below: bool) -> dict:
-        return {
-            "position_id": pos.id,
-            "company": company.name,
-            "title": pos.title,
-            "location": pos.location,
-            "url": pos.url,
-            "match_score": match.match_score,
-            "win_probability": match.win_probability,
-            "reasoning": match.reasoning,
-            "strengths": _loads(match.strengths),
-            "gaps": _loads(match.gaps),
-            "below_threshold": below,
-            "scored_at": match.created_at.isoformat() if match.created_at else None,
-        }
-
     all_ranked: list[dict] = []
     above: list[dict] = []
     below: list[dict] = []
     for match, pos, company in rows:
         threshold = min_score if min_score is not None else thresholds.get(match.interest_id, 70)
         is_below = match.match_score < threshold
-        row = _row(match, pos, company, is_below)
+        row = _match_row(match, pos, company, below_threshold=is_below)
         all_ranked.append(row)
         (below if is_below else above).append(row)
 
@@ -99,10 +143,88 @@ def build_report(
     return report
 
 
+def build_job_list(
+    db: Session,
+    user: User,
+    *,
+    category: str = "matching",
+    min_score: int = 0,
+    min_win: int = 0,
+    posted_within_days: int | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """One page of the dashboard job list, plus the total count in that category.
+
+    ``category="matching"`` returns only jobs the AI judged a fit (passed_filter),
+    below-threshold ones tagged. ``category="all"`` additionally includes
+    non-matching jobs — filter-rejected and keyword-excluded — but never transient
+    scoring-error markers. Matches rank first (by score), then non-matching by
+    recency. Pagination is server-side via ``limit``/``offset``.
+
+    ``min_score`` / ``min_win`` keep only matches scoring at least that (0 = off).
+    They gate real matches; non-matching rows have no meaningful score, so in the
+    "all" category they're shown regardless of the thresholds.
+
+    ``posted_within_days`` keeps only postings listed within that many days
+    (None/<=0 = off), by the job's effective listed date — the ATS post date, or
+    our first-seen date when the source carries none. The filter is applied to the
+    query before counting/paging, so ``total`` and the top-N (e.g. top-5) selection
+    both reflect only the date-filtered pool."""
+    base = (
+        select(MatchResult, Position, Company)
+        .join(Position, MatchResult.position_id == Position.id)
+        .join(Company, Position.company_id == Company.id)
+        .where(MatchResult.user_id == user.id)
+    )
+    if posted_within_days and posted_within_days > 0:
+        cutoff = utcnow() - timedelta(days=posted_within_days)
+        base = base.where(
+            func.coalesce(Position.posted_at, Position.first_seen_at) >= cutoff
+        )
+    if category == "all":
+        # Everything except error markers (those are failures, not "non-matching").
+        base = base.where(MatchResult.model.is_distinct_from(ERROR_MODEL))
+        if min_score > 0 or min_win > 0:
+            base = base.where(
+                (MatchResult.passed_filter == False)  # noqa: E712 — non-matching: exempt
+                | ((MatchResult.match_score >= min_score) & (MatchResult.win_probability >= min_win))
+            )
+    else:
+        base = base.where(MatchResult.passed_filter == True)  # noqa: E712
+        if min_score > 0:
+            base = base.where(MatchResult.match_score >= min_score)
+        if min_win > 0:
+            base = base.where(MatchResult.win_probability >= min_win)
+
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+    rows = db.execute(
+        base.order_by(
+            MatchResult.passed_filter.desc(),
+            MatchResult.match_score.desc(),
+            MatchResult.win_probability.desc(),
+            MatchResult.created_at.desc(),
+        )
+        .offset(max(0, offset))
+        .limit(limit)
+    ).all()
+
+    thresholds = {i.id: i.min_score for i in db.scalars(select(Interest).where(Interest.user_id == user.id))}
+    items = []
+    for match, pos, company in rows:
+        non_matching = not match.passed_filter
+        below = (not non_matching) and match.match_score < thresholds.get(match.interest_id, 70)
+        items.append(_match_row(match, pos, company, below_threshold=below, non_matching=non_matching))
+    tag_applied(db, user, items)
+    return items, total
+
+
 def _match_out_payload(match: dict) -> dict:
     keep = {
         "position_id", "company", "title", "location", "url", "match_score",
         "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
+        "non_matching", "listed_at",
     }
     return {k: v for k, v in match.items() if k in keep}
 
@@ -136,12 +258,62 @@ def job_list_items(snapshot: JobListSnapshot) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+def filter_items_posted_within(items: list[dict], posted_within_days: int | None) -> list[dict]:
+    """Keep stored job-list items whose ``listed_at`` falls within the window.
+    No-op when the window is off (None/<=0). Items missing/with an unparseable
+    ``listed_at`` (e.g. snapshots saved before this field existed) are kept rather
+    than silently dropped."""
+    if not posted_within_days or posted_within_days <= 0:
+        return items
+    cutoff = utcnow() - timedelta(days=posted_within_days)
+    kept = []
+    for item in items:
+        raw = item.get("listed_at")
+        try:
+            listed = datetime.fromisoformat(raw) if raw else None
+        except (TypeError, ValueError):
+            listed = None
+        if listed is None or listed >= cutoff:
+            kept.append(item)
+    return kept
+
+
+# Substrings that mark a run warning as an LLM-communication failure (vs a scrape
+# or config warning) — the matcher tags these with "Filtering failed"/"Scoring
+# failed", and budget/quota exhaustion names Ollama. Used to raise the dashboard's
+# "LLM requests failed" banner.
+_LLM_FAILURE_HINTS = ("filtering failed", "scoring failed", "ollama", "quota", "budget")
+
+
+def is_llm_failure(message: str) -> bool:
+    low = (message or "").lower()
+    return any(hint in low for hint in _LLM_FAILURE_HINTS)
+
+
+def llm_failed(errors: list[str]) -> bool:
+    """Whether any run warning indicates an LLM request failed (bad key/model,
+    unreachable provider, or exhausted quota)."""
+    return any(is_llm_failure(e) for e in errors)
+
+
 def job_list_errors(snapshot: JobListSnapshot) -> list[str]:
     try:
         data = json.loads(snapshot.errors or "[]")
     except json.JSONDecodeError:
         return []
-    return [str(item) for item in data] if isinstance(data, list) else []
+    return [_normalize_snapshot_error(str(item)) for item in data] if isinstance(data, list) else []
+
+
+def _normalize_snapshot_error(message: str) -> str:
+    """Older snapshots used 'scoring cap' for the candidate-screening budget.
+    Normalize on display so historical runs match the current wording."""
+    if message.startswith("Reached this run's scoring cap "):
+        return (
+            message
+            .replace("scoring cap", "candidate evaluation cap", 1)
+            .replace("remain unscored", "remain unevaluated", 1)
+        )
+    return message
 
 
 def report_to_markdown(user_email: str, report: list[dict]) -> str:

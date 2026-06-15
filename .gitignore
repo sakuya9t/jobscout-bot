@@ -23,10 +23,11 @@ htmlcov/
 .env.*
 !.env.example
 
-# Runtime data: SQLite DBs and uploaded resumes
+# Runtime data: SQLite DBs (incl. ad-hoc *.db.bak backups) and uploaded resumes
 *.db
 *.db-wal
 *.db-shm
+*.db.bak
 /data/
 
 # Editor / OS

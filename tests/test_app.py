@@ -5,6 +5,7 @@ and the scraper is monkeypatched."""
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,18 @@ class GoodClient:
 
     def chat_json(self, system, user, schema, temperature=0.2):
         self.calls += 1
+        if "results" in schema.get("properties", {}):
+            n = user.count("### Posting ")
+            return {
+                "results": [
+                    {
+                        "id": i + 1, "matches_requirements": True,
+                        "match_score": self.score, "win_probability": 50,
+                        "reasoning": "Solid fit.", "strengths": ["Python"], "gaps": [],
+                    }
+                    for i in range(n)
+                ]
+            }
         return {
             "matches_requirements": True, "match_score": self.score,
             "win_probability": 50, "reasoning": "Solid fit.",
@@ -40,6 +53,16 @@ class FailClient:
 
     def chat_json(self, *a, **k):
         raise OllamaError("Ollama returned 500: server error")
+
+
+class BudgetClient:
+    """Scoring stub that simulates Ollama quota/budget exhaustion (HTTP 402)."""
+    model = "fake-budget"
+
+    def chat_json(self, *a, **k):
+        from app.services.ollama_client import OllamaBudgetError
+
+        raise OllamaBudgetError("Ollama budget/quota exhausted (HTTP 402): no remaining credits")
 
 
 class BoomClient:
@@ -112,6 +135,64 @@ def _seed_user(db, *, email="u@x.com", description="Build Python APIs", min_scor
 def _no_network(monkeypatch):
     """Never hit a real career page during pipeline tests."""
     monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: [])
+
+
+# ── Schema reconcile (micro-migration) ───────────────────────────────────────
+def test_reconcile_schema_adds_column_relaxes_notnull_and_keeps_data():
+    """An older on-disk DB whose ``companies`` table predates ``preset_key`` and
+    still has ``user_id NOT NULL`` is brought up to the current model: the column
+    and its unique index are added, the NOT NULL is relaxed, existing rows survive,
+    and a preset row (user_id NULL) can then be inserted."""
+    import tempfile
+    from sqlalchemy import create_engine, inspect, text
+    from app.db import _reconcile_schema
+
+    path = tempfile.mktemp(suffix=".db")
+    eng = create_engine(f"sqlite:///{path}")
+    try:
+        # Stand up an "old" companies table (no preset_key, user_id NOT NULL), then
+        # let create_all add the remaining current tables around it.
+        with eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE companies ("
+                " id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+                " name VARCHAR(255), careers_url VARCHAR(1024), ats_type VARCHAR(32),"
+                " ats_token VARCHAR(255), location_hint VARCHAR(255),"
+                " is_active BOOLEAN, created_at DATETIME, last_scraped_at DATETIME)"
+            ))
+            conn.execute(text(
+                "INSERT INTO companies (id, user_id, name, ats_type)"
+                " VALUES (1, 42, 'Acme', 'greenhouse')"
+            ))
+        models.Base.metadata.create_all(eng)  # creates the other tables; skips companies
+
+        _reconcile_schema(eng)
+
+        insp = inspect(eng)
+        cols = {c["name"]: c for c in insp.get_columns("companies")}
+        assert "preset_key" in cols                       # column added
+        assert cols["user_id"]["nullable"] is True        # NOT NULL relaxed
+        assert any(ix["name"] == "ix_companies_preset_key" for ix in insp.get_indexes("companies"))
+
+        with eng.begin() as conn:
+            # Existing row preserved through the rebuild...
+            assert conn.execute(text("SELECT name FROM companies WHERE id=1")).scalar() == "Acme"
+            # ...and a preset row (user_id NULL) now inserts, which the old schema forbade.
+            conn.execute(text(
+                "INSERT INTO companies (id, user_id, preset_key, name) VALUES (2, NULL, 'anthropic', 'Anthropic')"
+            ))
+            assert conn.execute(text("SELECT COUNT(*) FROM companies")).scalar() == 2
+
+        # Idempotent: a second pass is a no-op (no error, same shape).
+        _reconcile_schema(eng)
+    finally:
+        eng.dispose()
+        import os
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -248,6 +329,28 @@ def test_failure_persists_marker_and_is_not_rebilled():
         assert matcher.clear_failed_markers(db, user_id=uid) == 1
 
 
+def test_budget_exhaustion_stops_run_and_auto_recovers():
+    """An exhausted Ollama budget surfaces a clear warning, writes NO error-markers
+    (unlike a generic failure), and lets the postings re-score on the next run once
+    quota is back — without a manual --retry-failed."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        res = matcher.run_for_user(db, db.get(models.User, uid),
+                                   client=BudgetClient(), filter_client=FilterPass())
+    assert res.scored == 0
+    assert any("budget" in e.lower() or "quota" in e.lower() for e in res.errors)
+    # The half-processed batch was rolled back: no markers, no rows at all — so the
+    # score-dedup `already` set won't skip these postings next run.
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.MatchResult))) == []
+    # Quota restored: the same postings now score (proving they weren't skipped).
+    with session_scope() as db:
+        res2 = matcher.run_for_user(db, db.get(models.User, uid),
+                                    client=GoodClient(), filter_client=FilterPass())
+    assert res2.scored >= 1
+
+
 def test_descriptionless_position_skipped_with_warning(monkeypatch):
     from app.services import scraper
 
@@ -299,8 +402,6 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
         [["New York, NY, USA", ["New York, NY, USA"], "New York", None, "NY", "US"]],
     ]
     page1 = "AF_initDataCallback({key:'ds:0', data:" + json.dumps([[rec]]) + ", sideChannel: {}});"
-    pages: dict[str, str] = {}
-
     def fake_fetch(url: str) -> str:
         return page1 if "page=1" in url else "<html>no jobs here</html>"
 
@@ -392,6 +493,27 @@ def test_filter_batch_one_call_mixed_verdicts(monkeypatch):
     assert res.scored == 1 and res.filtered == 3 and good.calls == 1
 
 
+def test_scoring_batch_scores_multiple_survivors_in_one_call(monkeypatch):
+    """When several postings survive the cheap filter, the expensive model gets
+    one batched request instead of one request per posting."""
+    from app.services import scraper
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    fresh = [scraper.ScrapedPosition(external_id=f"b{i}", title=f"Backend Engineer {i}",
+                                     location="Remote", description="Build APIs") for i in range(4)]
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: fresh)
+    monkeypatch.setattr(matcher.settings, "score_filter_batch_size", 10)
+    monkeypatch.setattr(matcher.settings, "score_batch_size", 10)
+    good = GoodClient()
+    flt = FilterPass()
+    with session_scope() as db:
+        res = matcher.run_for_user(db, db.get(models.User, uid), client=good, filter_client=flt)
+    assert flt.calls == 1
+    assert res.scored == 5
+    assert good.calls == 1
+
+
 def test_resume_reupload_same_content_is_noop():
     """Re-uploading identical resume content reuses the existing resume (same id),
     so scores cached against it aren't recomputed; new content replaces it."""
@@ -410,9 +532,9 @@ def test_resume_reupload_same_content_is_noop():
         assert len(c.get("/api/resumes", headers=h).json()) == 1
 
 
-def test_scoring_capped_per_run(monkeypatch):
-    """The per-run cap bounds how many postings get evaluated; the rest wait for
-    the next run, and the run says it was truncated."""
+def test_run_drains_whole_backlog_to_zero(monkeypatch):
+    """There is no per-run cap: one run scores the entire backlog, and count_pending
+    drops to 0. (Replaces the old 'capped, click Run again' behavior.)"""
     from app.services import scraper
 
     with session_scope() as db:
@@ -420,12 +542,35 @@ def test_scoring_capped_per_run(monkeypatch):
     fresh = [scraper.ScrapedPosition(external_id=f"f{i}", title="Backend Engineer",
                                      location="Remote", description="Build APIs") for i in range(4)]
     monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: fresh)
-    monkeypatch.setattr(matcher.settings, "score_max_per_run", 2)
     good = GoodClient()
     with session_scope() as db:
-        res = matcher.run_for_user(db, db.get(models.User, uid), client=good, filter_client=FilterPass())
-    assert res.scored == 2 and good.calls == 2
-    assert any("cap" in e.lower() for e in res.errors)
+        user = db.get(models.User, uid)
+        # Backlog before a run = (4 fresh + 1 seeded) described positions × 1 interest.
+        res = matcher.run_for_user(db, user, client=good, filter_client=FilterPass())
+        assert res.scored == 5
+        assert not any("cap" in e.lower() for e in res.errors)  # no cap message anymore
+        assert matcher.count_pending(db, user) == 0  # fully drained
+
+
+def test_excluded_pairs_leave_the_backlog(monkeypatch):
+    """A keyword-excluded pair gets an 'excluded' marker row (so the backlog
+    converges to 0 and the drain terminates) instead of being silently dropped."""
+    from app.services import scraper
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        # Exclude anything mentioning "backend" — the seeded position's title.
+        db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid)
+                  ).exclude_keywords = "backend"
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda company: [])
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        res = matcher.run_for_user(db, user, client=BoomClient(), filter_client=BoomClient())
+        assert res.scored == 0  # excluded before any LLM call (BoomClient never raises)
+        assert matcher.count_pending(db, user) == 0  # the exclude marker emptied the backlog
+        markers = list(db.scalars(matcher.select(models.MatchResult).where(
+            models.MatchResult.model == matcher.EXCLUDED_MODEL)))
+        assert len(markers) == 1 and markers[0].passed_filter is False
 
 
 def test_report_min_results_backfills_below_threshold():
@@ -502,38 +647,119 @@ def test_job_list_snapshots_keep_previous_ranked_versions():
         db.flush()
         matcher.run_for_user(db, user, client=GoodClient(score=97), filter_client=FilterPass())
         second = reporter.record_job_list_snapshot(
-            db, user, SimpleNamespace(new_positions=1, scored=1, filtered=0, errors=["cap reached"])
+            db,
+            user,
+            SimpleNamespace(
+                new_positions=1,
+                scored=1,
+                filtered=0,
+                errors=[
+                    "Reached this run's scoring cap (50) — more postings remain "
+                    "unscored. Click Run again to continue, or raise JOBSCOUT_SCORE_MAX_PER_RUN."
+                ],
+            ),
         )
 
         assert reporter.job_list_items(first)[0]["title"] == "Backend Engineer"
         latest_items = reporter.job_list_items(second)
         assert [item["title"] for item in latest_items] == ["Principal Backend", "Backend Engineer"]
-        assert reporter.job_list_errors(second) == ["cap reached"]
+        assert "candidate evaluation cap" in reporter.job_list_errors(second)[0]
+        assert "remain unevaluated" in reporter.job_list_errors(second)[0]
 
-        from app.routers.reports import _job_list_out
+        from app.routers.reports import get_job_list
 
-        response = _job_list_out(second, limit=1)
+        response = get_job_list(second.id, limit=1, offset=0, category="matching", user=user, db=db)
         assert response.total == 2
         assert len(response.items) == 1
         assert response.items[0].title == "Principal Backend"
+        # offset paginates over the stored snapshot items.
+        page2 = get_job_list(second.id, limit=1, offset=1, category="matching", user=user, db=db)
+        assert page2.items[0].title == "Backend Engineer"
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-def test_telegram_link_code_is_one_time():
-    """A link code is burned on use so a leaked code can't re-bind the chat."""
+def test_telegram_link_binds_chat_and_burns_code(monkeypatch):
+    """On-demand linking reads the bot's /start <code> once, binds the chat, and
+    burns the one-time code so a leaked code can't re-bind the chat."""
+    from app.auth import create_access_token
+    from app.services import evaluator
     import app.services.telegram_bot as tg
 
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
     with session_scope() as db:
-        u = models.User(email="t@x.com", hashed_password="h", telegram_link_code="abc123")
+        u = models.User(email="t@x.com", hashed_password="h",
+                        telegram_bot_token="bot-123", telegram_link_code="abc123")
         db.add(u)
         db.flush()
         uid = u.id
-    assert "Linked" in tg._link_account("abc123", "555")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # Nothing DMed yet -> not linked, code intact.
+        monkeypatch.setattr(tg, "find_start_chat", lambda token, code: None)
+        r = c.post("/api/telegram-config/link", headers=h).json()
+        assert r["ok"] is False and "abc123" in r["detail"]
+        assert c.get("/api/telegram-config", headers=h).json()["linked"] is False
+
+        # User DMs /start abc123 -> chat bound (only for the matching code), code burned.
+        monkeypatch.setattr(tg, "find_start_chat",
+                            lambda token, code: "555" if code == "abc123" else None)
+        ok = c.post("/api/telegram-config/link", headers=h).json()
+        assert ok["ok"] is True and "555" in ok["detail"]
+        cfg = c.get("/api/telegram-config", headers=h).json()
+        assert cfg["linked"] is True and cfg["chat_id"] == "555"
     with session_scope() as db:
         u = db.get(models.User, uid)
         assert u.telegram_chat_id == "555" and u.telegram_link_code is None
-    # Replaying the now-dead code is rejected.
-    assert "isn't valid" in tg._link_account("abc123", "999")
+
+
+def test_telegram_config_saves_token_and_tests(monkeypatch):
+    """Token is saved (never echoed), the link code is minted on demand, and Test
+    validates the token then only sends once a chat is linked."""
+    from app.auth import create_access_token
+    from app.services import evaluator
+    import app.services.telegram_bot as tg
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="tg@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    sent = {"called": False}
+    monkeypatch.setattr(tg, "get_bot_username", lambda token: (True, "scout_bot"))
+
+    def _send(token, chat_id, text):
+        sent["called"] = True
+        return True
+
+    monkeypatch.setattr(tg, "send_message", _send)
+    with TestClient(app) as c:
+        # Fresh user: no token, but a link code is minted so there's one to DM.
+        first = c.get("/api/telegram-config", headers=h).json()
+        assert first["has_token"] is False and first["linked"] is False and first["link_code"]
+
+        # Test with no token reports it and sends nothing.
+        none = c.post("/api/telegram-config/test", headers=h).json()
+        assert none["ok"] is False and "bot token" in none["detail"].lower()
+        assert sent["called"] is False
+
+        # Save a token (never echoed back).
+        saved = c.put("/api/telegram-config", headers=h, json={"bot_token": "bot-xyz"}).json()
+        assert saved["has_token"] is True and "bot_token" not in saved
+
+        # Valid token but no chat linked yet -> Test reports it, still no send.
+        nochat = c.post("/api/telegram-config/test", headers=h).json()
+        assert nochat["ok"] is False and "linked" in nochat["detail"] and sent["called"] is False
+
+        # Link a chat, then a successful Test actually sends via the user's bot.
+        monkeypatch.setattr(tg, "find_start_chat", lambda token, code: "777")
+        c.post("/api/telegram-config/link", headers=h)
+        ok = c.post("/api/telegram-config/test", headers=h).json()
+        assert ok["ok"] is True and sent["called"] is True and "scout_bot" in ok["detail"]
+
+        # Blank token on re-save keeps the stored one.
+        c.put("/api/telegram-config", headers=h, json={})
+    with session_scope() as db:
+        assert db.get(models.User, uid).telegram_bot_token == "bot-xyz"
+    assert c.get("/api/telegram-config").status_code == 401  # auth required
 
 
 def test_telegram_report_warnings_and_chunking():
@@ -549,6 +775,720 @@ def test_telegram_report_warnings_and_chunking():
     assert "and 3 more" in report_to_telegram([], errors=errors)
 
 
+# ── Async evaluation drain ───────────────────────────────────────────────────
+def test_count_pending_ignores_undescribed():
+    """Description-less postings are never scored, so they're not in the backlog."""
+    with session_scope() as db:
+        uid = _seed_user(db, description=None)
+    with session_scope() as db:
+        assert matcher.count_pending(db, db.get(models.User, uid)) == 0
+
+
+def test_evaluator_drains_backlog_and_records_snapshot(monkeypatch):
+    """The background drain body scores the whole backlog to completion and records
+    one snapshot. (Run synchronously here for determinism.)"""
+    from app.services import evaluator
+
+    with session_scope() as db:
+        uid = _seed_user(db)  # 1 described position × 1 interest = backlog of 1
+    monkeypatch.setattr(matcher.llm, "clients_for_user", lambda db, user: (GoodClient(), FilterPass()))
+
+    evaluator._run(uid)
+
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        assert matcher.count_pending(db, user) == 0
+        snaps = list(db.scalars(matcher.select(models.JobListSnapshot)
+                                .where(models.JobListSnapshot.user_id == uid)))
+        assert len(snaps) == 1 and snaps[0].scored == 1
+
+
+def test_run_endpoint_returns_immediately_with_pending(monkeypatch):
+    """/api/run scrapes, hands scoring to the background worker, and returns the
+    pending backlog without scoring inline (scored=0)."""
+    from app.services import evaluator
+
+    kicked: list[int] = []
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: kicked.append(uid))
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'async@x.com').json()['access_token']}"}
+        with session_scope() as db:
+            user = db.scalar(matcher.select(models.User).where(models.User.email == "async@x.com"))
+            db.add(models.Resume(user_id=user.id, filename="r.txt",
+                                 content_text="Senior Python", is_active=True))
+            comp = models.Company(user_id=user.id, name="Acme"); db.add(comp); db.flush()
+            db.add(models.Position(company_id=comp.id, external_id="1",
+                                   title="Backend Engineer", description="Build APIs"))
+            db.add(models.Interest(user_id=user.id, label="be", title_keywords="backend",
+                                   is_active=True))
+        body = c.post("/api/run", headers=h).json()
+        assert body["pending"] == 1 and body["scored"] == 0
+        assert kicked  # background drain was kicked
+        status = c.get("/api/evaluation/status", headers=h).json()
+        assert status["pending"] == 1 and status["in_progress"] is False
+
+
+# ── Job list: categories + pagination ────────────────────────────────────────
+def _seed_match_mix(db, uid):
+    """Add a mix of matching, filter-rejected, keyword-excluded, and error-marker
+    rows so the category/pagination logic has something to slice."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    company = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+
+    def add(ext, title, *, passed, score, model):
+        pos = models.Position(company_id=company.id, external_id=ext, title=title, description="d")
+        db.add(pos); db.flush()
+        db.add(models.MatchResult(
+            user_id=uid, position_id=pos.id, resume_id=rid, interest_id=interest.id,
+            passed_filter=passed, match_score=score, win_probability=score,
+            reasoning="r", model=model))
+
+    add("a", "Match A", passed=True, score=90, model="good")
+    add("b", "Match B", passed=True, score=60, model="good")          # below min_score 70
+    add("c", "Rejected", passed=False, score=0, model="deepseek-flash")  # filter reject
+    add("d", "Excluded", passed=False, score=0, model=matcher.EXCLUDED_MODEL)
+    add("e", "Errored", passed=False, score=0, model=matcher.ERROR_MODEL)  # transient failure
+    db.flush()
+
+
+def test_build_job_list_categories_and_pagination():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+
+        matching, total_m = reporter.build_job_list(db, user, category="matching", limit=10)
+        assert total_m == 2 and [m["title"] for m in matching] == ["Match A", "Match B"]
+        assert all(not m["non_matching"] for m in matching)
+        assert matching[1]["below_threshold"] is True  # B (60) < interest min_score (70)
+
+        all_items, total_all = reporter.build_job_list(db, user, category="all", limit=50)
+        titles = [m["title"] for m in all_items]
+        assert total_all == 4 and "Errored" not in titles  # error markers excluded
+        assert {"Rejected", "Excluded"} <= set(titles)
+        assert titles[:2] == ["Match A", "Match B"]  # matches rank first
+        non = [m for m in all_items if m["non_matching"]]
+        assert len(non) == 2 and all(m["match_score"] == 0 for m in non)
+
+        page1, t = reporter.build_job_list(db, user, category="all", limit=2, offset=0)
+        page2, _ = reporter.build_job_list(db, user, category="all", limit=2, offset=2)
+        assert t == 4 and [m["title"] for m in page1] == ["Match A", "Match B"]
+        assert set(m["title"] for m in page1).isdisjoint(m["title"] for m in page2)
+
+
+def test_job_list_endpoint_paginates_and_filters_category(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        m = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert m["total"] == 2 and len(m["items"]) == 2
+        assert all(not it["non_matching"] for it in m["items"])
+
+        a = c.get("/api/job-lists/latest?category=all&limit=2&offset=0", headers=h).json()
+        assert a["total"] == 4 and len(a["items"]) == 2  # page size honored
+
+        a_all = c.get("/api/job-lists/latest?category=all&limit=50", headers=h).json()
+        assert any(it["non_matching"] for it in a_all["items"])  # non-matching visible in 'all'
+
+
+def test_build_job_list_score_and_win_filters():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)  # A: 90/90, B: 60/60 (win == score in the helper)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        # match score ≥ 75 keeps only A; B (60) drops.
+        hi, hi_total = reporter.build_job_list(db, user, category="matching", min_score=75, limit=50)
+        assert hi_total == 1 and [m["title"] for m in hi] == ["Match A"]
+        # win rate ≥ 75 likewise keeps only A.
+        _, win_total = reporter.build_job_list(db, user, category="matching", min_win=75)
+        assert win_total == 1
+        # the >0 default (1) keeps both real matches.
+        _, lo_total = reporter.build_job_list(db, user, category="matching", min_score=1, min_win=1)
+        assert lo_total == 2
+
+
+def _seed_dated_matches(db, uid):
+    """Matching positions across a range of listed dates. The two highest scorers
+    are *old* (20 and 40 days), so a recent-only window must replace them with
+    lower-scoring fresh roles. 'Undated' has no posted_at -> first_seen_at (now)
+    is its effective date. These are extra rows on top of _seed_user's base
+    position (which has no MatchResult and so never appears in the job list)."""
+    from app.timeutil import utcnow
+
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    company = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    now = utcnow()
+    specs = [  # (ext, title, score, days_ago | None -> undated)
+        ("old1", "OldHigh1", 99, 40), ("old2", "OldHigh2", 98, 20),
+        ("r0", "Recent0", 85, 0), ("r2", "Recent2", 84, 2),
+        ("r4", "Recent4", 83, 4), ("r6", "Recent6", 82, 6),
+        ("undated", "Undated", 70, None),
+    ]
+    for ext, title, score, days in specs:
+        posted = None if days is None else now - timedelta(days=days)
+        pos = models.Position(company_id=company.id, external_id=ext, title=title,
+                              description="d", posted_at=posted)
+        db.add(pos); db.flush()
+        db.add(models.MatchResult(user_id=uid, position_id=pos.id, resume_id=rid,
+                                  interest_id=interest.id, passed_filter=True,
+                                  match_score=score, win_probability=score,
+                                  reasoning="r", model="good"))
+    db.flush()
+
+
+def test_build_job_list_post_date_filter():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_dated_matches(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+
+        _, all_total = reporter.build_job_list(db, user, category="matching")
+        assert all_total == 7  # the 7 seeded matches (base position has no match)
+
+        # 24h window keeps only today's (Recent0) and the undated (first-seen now).
+        wk, total = reporter.build_job_list(db, user, category="matching", posted_within_days=1)
+        assert total == 2 and {m["title"] for m in wk} == {"Recent0", "Undated"}
+
+        # 7-day window: the four Recent* roles + Undated; both old highs excluded.
+        _, total7 = reporter.build_job_list(db, user, category="matching", posted_within_days=7)
+        assert total7 == 5
+
+        # 30-day window additionally lets the 20-day-old high back in; 40-day stays out.
+        _, total30 = reporter.build_job_list(db, user, category="matching", posted_within_days=30)
+        assert total30 == 6
+
+        # Every row carries an effective listed date for the UI.
+        page, _ = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert all(m["listed_at"] for m in page)
+
+
+def test_top5_backfills_from_date_filtered_pool():
+    """With a post-date window, the top-5 glance is drawn from the filtered pool —
+    the real highest scorers (here the 20- and 40-day-old ones) that fall outside
+    the window are replaced by fresh lower-scoring roles, not left as gaps."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_dated_matches(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(
+            db, user, category="matching", posted_within_days=7, limit=5
+        )
+        # 5 in-window matches, all returned, neither old high scorer among them.
+        assert total == 5 and len(items) == 5
+        assert {"OldHigh1", "OldHigh2"}.isdisjoint(m["title"] for m in items)
+
+
+def test_job_list_endpoint_accepts_post_date_filter(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_dated_matches(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        wide = c.get("/api/job-lists/latest?category=matching&limit=50", headers=h).json()
+        narrow = c.get(
+            "/api/job-lists/latest?category=matching&limit=50&posted_within_days=7", headers=h
+        ).json()
+        assert wide["total"] == 7 and narrow["total"] == 5
+        assert all(it["listed_at"] for it in narrow["items"])
+
+
+def test_filter_items_posted_within_keeps_undated():
+    """Frozen-snapshot date filtering keeps items missing listed_at (older saved
+    snapshots) and drops only those provably outside the window."""
+    from app.timeutil import utcnow
+
+    now = utcnow()
+    items = [
+        {"title": "fresh", "listed_at": (now - timedelta(days=1)).isoformat()},
+        {"title": "stale", "listed_at": (now - timedelta(days=20)).isoformat()},
+        {"title": "legacy"},  # no listed_at -> kept
+    ]
+    kept = {m["title"] for m in reporter.filter_items_posted_within(items, 7)}
+    assert kept == {"fresh", "legacy"}
+    # Window off -> everything passes through untouched.
+    assert reporter.filter_items_posted_within(items, None) == items
+
+
+# ── Application status ("Mark applied") ──────────────────────────────────────
+def _first_matched_position_id(db, uid):
+    return db.scalar(
+        matcher.select(models.MatchResult.position_id)
+        .where(models.MatchResult.user_id == uid)
+        .limit(1)
+    )
+
+
+def _add_match(db, uid, position_id, score=80):
+    """Give user ``uid`` a (passing) MatchResult on an existing position, so that
+    position shows in their job list and is markable-applied."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    db.add(models.MatchResult(
+        user_id=uid, position_id=position_id, resume_id=rid, interest_id=interest.id,
+        passed_filter=True, match_score=score, win_probability=score, reasoning="r", model="good"))
+    db.flush()
+
+
+def test_mark_and_unmark_applied(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        listed = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert all(it["applied"] is False for it in listed["items"])  # nothing applied yet
+
+        r = c.post(f"/api/applications/{pid}", headers=h)
+        assert r.status_code == 201 and r.json()["position_id"] == pid and r.json()["status"] == "applied"
+        assert c.post(f"/api/applications/{pid}", headers=h).status_code == 201  # idempotent
+
+        after = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and it["applied"] for it in after["items"])
+        assert [a["position_id"] for a in c.get("/api/applications", headers=h).json()] == [pid]
+
+        assert c.delete(f"/api/applications/{pid}", headers=h).status_code == 204
+        assert c.delete(f"/api/applications/{pid}", headers=h).status_code == 204  # idempotent
+        cleared = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert all(not it["applied"] for it in cleared["items"])
+        assert c.get("/api/applications", headers=h).json() == []
+
+
+def test_mark_applied_rejects_position_not_in_job_list(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # A position the user has no MatchResult for is invisible to them -> 404.
+        assert c.post("/api/applications/999999", headers=h).status_code == 404
+        assert c.get("/api/applications", headers=h).json() == []
+
+
+def test_applied_status_is_per_user(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid_a = _seed_user(db, email="a@x.com")
+        _seed_match_mix(db, uid_a)
+        pid = _first_matched_position_id(db, uid_a)
+        uid_b = _seed_user(db, email="b@x.com")
+        _add_match(db, uid_b, pid)  # B is matched on the SAME position
+    ha = {"Authorization": f"Bearer {create_access_token(uid_a)}"}
+    hb = {"Authorization": f"Bearer {create_access_token(uid_b)}"}
+    with TestClient(app) as c:
+        assert c.post(f"/api/applications/{pid}", headers=ha).status_code == 201
+        # B sees the same position but it's NOT applied for them, and B has no apps.
+        mb = c.get("/api/job-lists/latest?category=matching&limit=50", headers=hb).json()
+        assert any(it["position_id"] == pid and it["applied"] is False for it in mb["items"])
+        assert c.get("/api/applications", headers=hb).json() == []
+
+
+def test_applied_overlaid_on_frozen_snapshot():
+    from app.routers.reports import get_job_list
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        matcher.run_for_user(db, user, client=GoodClient(score=88), filter_client=FilterPass())
+        snap = reporter.record_job_list_snapshot(
+            db, user, SimpleNamespace(new_positions=0, scored=1, filtered=0, errors=[])
+        )
+        pid = reporter.job_list_items(snap)[0]["position_id"]
+
+        before = get_job_list(snap.id, user=user, db=db)
+        assert before.items and all(not it.applied for it in before.items)
+
+        db.add(models.Application(user_id=uid, position_id=pid))
+        db.commit()
+        after = get_job_list(snap.id, user=user, db=db)
+        assert any(it.position_id == pid and it.applied for it in after.items)
+
+
+def test_applications_cascade_on_user_delete():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+        db.add(models.Application(user_id=uid, position_id=_first_matched_position_id(db, uid)))
+        db.commit()
+        assert len(list(db.scalars(matcher.select(models.Application)))) == 1
+        db.delete(db.get(models.User, uid))
+        db.commit()
+        assert list(db.scalars(matcher.select(models.Application))) == []
+
+
+# ── LLM provider config (per-user) ───────────────────────────────────────────
+def test_effective_llm_config_defaults_to_provider_with_no_key():
+    from app.llm_providers import DEFAULT_PROVIDER_OBJ as p
+    from app.services import llm
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        eff = llm.effective_config(db, user)
+        assert eff.provider == p.key and eff.base_url == p.base_url
+        assert eff.main_model == p.default_main_model
+        assert eff.light_model == p.default_light_model
+        assert eff.api_key is None  # no per-user key, no global fallback anymore
+
+
+def test_effective_llm_config_uses_user_overrides():
+    from app.services import llm
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.LlmConfig(user_id=uid, provider="ollama_cloud", api_key="sk-user",
+                                main_model="big-model", light_model="small-model"))
+        db.commit()
+        eff = llm.effective_config(db, db.get(models.User, uid))
+        assert eff.base_url == "https://ollama.com"  # from the provider registry
+        assert eff.api_key == "sk-user"
+        assert eff.main_model == "big-model" and eff.light_model == "small-model"
+
+
+def test_clients_built_from_user_config(monkeypatch):
+    from app.services import llm
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, base_url=None, api_key=None, model=None, timeout=None):
+            captured.append((base_url, api_key, model))
+            self.model = model
+
+    monkeypatch.setattr(llm, "OllamaClient", FakeClient)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.LlmConfig(user_id=uid, provider="ollama_cloud", api_key="sk-x",
+                                main_model="big", light_model="small"))
+        db.commit()
+        llm.clients_for_user(db, db.get(models.User, uid))
+    assert ("https://ollama.com", "sk-x", "big") in captured     # scoring client
+    assert ("https://ollama.com", "sk-x", "small") in captured   # relevance-filter client
+
+
+def test_llm_config_endpoints_roundtrip(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        cfg = c.get("/api/llm-config", headers=h).json()
+        assert cfg["provider"] == "ollama_cloud"
+        assert any(p["key"] == "ollama_cloud" and p["base_url"] == "https://ollama.com"
+                   for p in cfg["providers"])
+
+        r = c.put("/api/llm-config", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "small",
+            "api_key": "sk-123"})
+        assert r.status_code == 200
+        got = r.json()
+        assert got["main_model"] == "big" and got["light_model"] == "small"
+        assert got["has_api_key"] is True and "api_key" not in got  # key never echoed back
+
+        again = c.get("/api/llm-config", headers=h).json()
+        assert again["main_model"] == "big" and again["base_url"] == "https://ollama.com"
+        assert again["has_api_key"] is True
+    assert c.get("/api/llm-config").status_code == 401  # auth required
+
+
+def test_llm_config_keeps_key_when_blank_and_rejects_unknown_provider(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        c.put("/api/llm-config", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "m", "light_model": "l", "api_key": "sk-keep"})
+        # Re-saving without api_key keeps the stored one.
+        c.put("/api/llm-config", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "m2", "light_model": "l2"})
+        assert c.get("/api/llm-config", headers=h).json()["has_api_key"] is True
+        # Unknown provider is rejected.
+        assert c.put("/api/llm-config", headers=h, json={
+            "provider": "openai", "main_model": "m", "light_model": "l"}).status_code == 400
+    with session_scope() as db:
+        cfg = db.scalar(matcher.select(models.LlmConfig).where(models.LlmConfig.user_id == uid))
+        assert cfg.api_key == "sk-keep" and cfg.main_model == "m2"
+
+
+def test_matcher_resolves_clients_per_user(monkeypatch):
+    """run_for_user with no injected clients resolves them from the user's config."""
+    called = {}
+
+    def fake_clients(db, user):
+        called["uid"] = user.id
+        return GoodClient(score=91), FilterPass()
+
+    monkeypatch.setattr(matcher.llm, "clients_for_user", fake_clients)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        res = matcher.run_for_user(db, db.get(models.User, uid))  # no clients injected
+        assert called.get("uid") == uid and res.scored == 1
+
+
+def test_llm_config_test_button(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+    import app.routers.llm_config as rc
+    from app.services.ollama_client import OllamaError
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+
+    built: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **k):
+            self.model = k.get("model")
+            built.append(self.model)
+
+        def chat_text(self, *a, **k):
+            if self.model == "bad":
+                raise OllamaError("Ollama returned 401: invalid api key")
+            return "OK"
+
+    monkeypatch.setattr(rc, "OllamaClient", FakeClient)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # Distinct models -> both probed, both pass.
+        built.clear()
+        ok = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "small",
+            "api_key": "sk-1"}).json()
+        assert ok["ok"] is True and built == ["big", "small"]
+        assert {r["role"] for r in ok["results"]} == {"main", "light"}
+
+        # Same model for both -> probed once.
+        built.clear()
+        same = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "big",
+            "api_key": "sk-1"}).json()
+        assert same["ok"] is True and built == ["big"] and len(same["results"]) == 1
+
+        # One model fails -> overall not ok, the failing model named with its error.
+        built.clear()
+        bad = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "bad",
+            "api_key": "sk-1"}).json()
+        assert bad["ok"] is False and built == ["big", "bad"]
+        light = next(r for r in bad["results"] if r["role"] == "light")
+        assert light["ok"] is False and "401" in light["detail"]
+        assert next(r for r in bad["results"] if r["role"] == "main")["ok"] is True
+
+        # No key supplied and none saved -> reported, and no client is even built.
+        built.clear()
+        nokey = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "small"}).json()
+        assert nokey["ok"] is False and "API key" in nokey["detail"] and built == []
+
+
+def test_llm_failed_classifier():
+    assert reporter.llm_failed(["Scoring failed: Ollama returned 401"]) is True
+    assert reporter.llm_failed(["Filtering failed: read timeout"]) is True
+    assert reporter.llm_failed(["Ollama budget/quota appears to be exhausted"]) is True
+    assert reporter.llm_failed(["Acme: refusing to fetch private host"]) is False
+    assert reporter.llm_failed([]) is False
+
+
+def test_job_list_surfaces_llm_error(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        reporter.record_job_list_snapshot(db, db.get(models.User, uid), SimpleNamespace(
+            new_positions=0, scored=0, filtered=0,
+            errors=["Scoring failed: Ollama returned 401: invalid api key"]))
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.get("/api/job-lists/latest", headers=h).json()["llm_error"] is True
+    # A later clean snapshot clears the banner.
+    with session_scope() as db:
+        reporter.record_job_list_snapshot(db, db.get(models.User, uid), SimpleNamespace(
+            new_positions=0, scored=1, filtered=0, errors=[]))
+    with TestClient(app) as c:
+        assert c.get("/api/job-lists/latest", headers=h).json()["llm_error"] is False
+
+
+def test_score_filter_exempts_non_matching_in_all_category():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="all", min_score=75, limit=50)
+        titles = [m["title"] for m in items]
+        # Only A clears the score floor; the two non-matching rows are exempt.
+        assert "Match A" in titles and "Match B" not in titles
+        assert {"Rejected", "Excluded"} <= set(titles) and "Errored" not in titles
+        assert total == 3
+
+
+def test_job_list_endpoint_applies_score_win_filters(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        hi = c.get("/api/job-lists/latest?category=matching&min_score=75&limit=50", headers=h).json()
+        assert hi["total"] == 1 and hi["items"][0]["title"] == "Match A"
+        # Non-matching stays visible in 'all' even with a high score floor.
+        allhi = c.get("/api/job-lists/latest?category=all&min_score=90&limit=50", headers=h).json()
+        assert any(it["non_matching"] for it in allhi["items"])
+
+
+# ── Shared preset catalog + crawling ─────────────────────────────────────────
+def test_seed_presets_is_idempotent_and_global():
+    from app.company_presets import PRESETS
+    from app.db import seed_presets
+
+    with session_scope() as db:
+        seed_presets(db)
+        seed_presets(db)  # second pass must not duplicate
+    with session_scope() as db:
+        rows = list(db.scalars(matcher.select(models.Company).where(models.Company.preset_key.is_not(None))))
+        assert len(rows) == len(PRESETS)
+        assert all(c.user_id is None and c.is_preset for c in rows)
+
+
+def test_crawl_presets_populates_shared_positions(monkeypatch):
+    from app.company_presets import PRESETS
+    from app.db import seed_presets
+    from app.services import crawler, scraper
+
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: [
+        scraper.ScrapedPosition(external_id=f"{c.preset_key}-1", title=f"{c.name} Eng", description="build")
+    ])
+    with session_scope() as db:
+        seed_presets(db)
+    summary = crawler.crawl_presets()
+    assert summary["companies"] == len(PRESETS) and summary["new_positions"] == len(PRESETS)
+    with session_scope() as db:
+        positions = list(db.scalars(matcher.select(models.Position)))
+        assert len(positions) == len(PRESETS)
+        assert all(db.get(models.Company, p.company_id).is_preset for p in positions)
+
+
+def test_user_scan_does_not_crawl_presets(monkeypatch):
+    from app.db import seed_presets
+
+    crawled: list[str] = []
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: crawled.append(c.name) or [])
+    with session_scope() as db:
+        uid = _seed_user(db)  # has a custom company "Acme"
+        seed_presets(db)
+        anthropic = db.scalar(matcher.select(models.Company).where(models.Company.preset_key == "anthropic"))
+        db.add(models.Subscription(user_id=uid, company_id=anthropic.id))
+    with session_scope() as db:
+        matcher.scrape_only(db, db.get(models.User, uid))
+    # The user's scan crawls only their custom company, never the subscribed preset.
+    assert "Acme" in crawled and "Anthropic" not in crawled
+
+
+def test_two_subscribers_share_one_preset_position():
+    from app.db import seed_presets
+
+    with session_scope() as db:
+        seed_presets(db)
+        anthropic = db.scalar(matcher.select(models.Company).where(models.Company.preset_key == "anthropic"))
+        aid = anthropic.id
+        pos = models.Position(company_id=aid, external_id="x1", title="Backend Engineer", description="build")
+        db.add(pos); db.flush()
+        pid = pos.id
+        uids = []
+        for email in ("share1@x.com", "share2@x.com"):
+            u = models.User(email=email, hashed_password="h"); db.add(u); db.flush()
+            db.add(models.Resume(user_id=u.id, filename="r", content_text="python", is_active=True))
+            db.add(models.Interest(user_id=u.id, label="be", title_keywords="backend", is_active=True))
+            db.add(models.Subscription(user_id=u.id, company_id=aid))
+            uids.append(u.id)
+
+    with session_scope() as db:  # each subscriber's backlog is the one shared position
+        for uid in uids:
+            assert matcher.count_pending(db, db.get(models.User, uid)) == 1
+    for uid in uids:
+        with session_scope() as db:
+            matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:  # two MatchResults against the SAME position row
+        results = list(db.scalars(matcher.select(models.MatchResult).where(models.MatchResult.position_id == pid)))
+        assert len(results) == 2 and {r.user_id for r in results} == set(uids)
+
+
+def test_add_preset_subscribes_custom_creates(monkeypatch):
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'cat@x.com').json()['access_token']}"}
+        r = c.post("/api/companies", headers=h, json={
+            "name": "Anthropic", "ats_type": "greenhouse", "ats_token": "anthropic", "preset_key": "anthropic"})
+        assert r.status_code == 201 and r.json()["is_preset"] is True
+        # Subscribing again is a 409, not a duplicate.
+        assert c.post("/api/companies", headers=h, json={"name": "Anthropic", "preset_key": "anthropic"}).status_code == 409
+        # A non-preset is created as a per-user custom company.
+        r2 = c.post("/api/companies", headers=h, json={
+            "name": "Acme", "careers_url": "https://acme.example/careers", "ats_type": "html"})
+        assert r2.status_code == 201 and r2.json()["is_preset"] is False
+        assert {x["name"] for x in c.get("/api/companies", headers=h).json()} >= {"Anthropic", "Acme"}
+    with session_scope() as db:  # exactly one shared Anthropic row
+        rows = list(db.scalars(matcher.select(models.Company).where(models.Company.preset_key == "anthropic")))
+        assert len(rows) == 1
+
+
+def test_admin_crawl_endpoint_token_gated(monkeypatch):
+    from app.config import settings
+    from app.services import crawler
+
+    kicks: list[int] = []
+    monkeypatch.setattr(crawler, "crawl_presets_async", lambda: kicks.append(1))
+    with TestClient(app) as c:
+        monkeypatch.setattr(settings, "admin_token", "")  # disabled
+        assert c.post("/api/admin/crawl").status_code == 503
+        monkeypatch.setattr(settings, "admin_token", "s3cret")
+        assert c.post("/api/admin/crawl").status_code == 401  # missing token
+        r = c.post("/api/admin/crawl", headers={"X-Admin-Token": "s3cret"})
+        assert r.status_code == 202 and kicks
+
+
 # ── Health ───────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("status,expected", [(200, "ok"), (401, "unauthorized"), (503, "unreachable")])
 def test_health_states(monkeypatch, status, expected):
@@ -559,3 +1499,98 @@ def test_health_states(monkeypatch, status, expected):
 
     monkeypatch.setattr(oc.httpx, "get", lambda *a, **k: Resp())
     assert oc.OllamaClient().health() == expected
+
+
+# ── Ollama logging ───────────────────────────────────────────────────────────
+def test_ollama_logs_request_and_response(monkeypatch):
+    """Every Ollama call persists the outgoing prompt and the completion to the
+    llm_logs table (correlated by a request id) — and never the API key."""
+    import app.services.ollama_client as oc
+    from app.services import llm_log
+
+    class Resp:
+        def json(self):
+            return {"message": {"content": "hello world"}, "done_reason": "stop",
+                    "prompt_eval_count": 12, "eval_count": 3}
+
+    monkeypatch.setattr(oc, "_post", lambda url, body, headers, timeout: Resp())
+    out = oc.OllamaClient(api_key="super-secret-key").chat_text("be terse", "hi there")
+    llm_log.flush()
+
+    assert out == "hello world"
+    with session_scope() as db:
+        rows = list(db.scalars(matcher.select(models.LlmLog)))
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.status == "ok" and row.correlation_id
+        assert "hi there" in row.request_messages and "be terse" in row.request_messages
+        assert row.response_content == "hello world"
+        assert row.prompt_tokens == 12 and row.eval_tokens == 3 and row.done_reason == "stop"
+        # The API key lives only in the Authorization header, never in what we store.
+        assert "super-secret-key" not in row.request_messages
+
+
+@pytest.mark.parametrize("status,body,expected", [
+    (402, "Payment Required", "budget"),       # 402 is always budget
+    (429, "monthly quota exceeded", "budget"),  # 429 naming a cap = budget
+    (429, "too many requests", "generic"),      # bare 429 = transient rate limit
+    (403, "insufficient credits", "budget"),
+    (500, "internal error", "generic"),
+])
+def test_ollama_budget_error_classification(monkeypatch, status, body, expected):
+    """A budget/quota rejection raises OllamaBudgetError so the matcher can react;
+    everything else stays a generic OllamaError."""
+    import app.services.ollama_client as oc
+
+    class Resp:
+        status_code = status
+        text = body
+
+        def raise_for_status(self):
+            raise oc.httpx.HTTPStatusError("err", request=None, response=self)
+
+    # Bypass the retry/backoff wrapper: post raises the status error directly.
+    monkeypatch.setattr(oc.httpx, "post", lambda *a, **k: Resp())
+    with pytest.raises(oc.OllamaError) as ei:
+        oc.OllamaClient().chat_text("s", "u")
+    is_budget = isinstance(ei.value, oc.OllamaBudgetError)
+    assert is_budget == (expected == "budget")
+
+
+def test_ollama_logs_failures(monkeypatch, caplog):
+    """A transport/HTTP error is recorded as an error row (and still logged to
+    stdout at WARNING with the ✗ marker) before being raised."""
+    import app.services.ollama_client as oc
+    from app.services import llm_log
+
+    def boom(*a, **k):
+        raise oc.httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(oc, "_post", boom)
+    with caplog.at_level("WARNING", logger="app.services.ollama_client"):
+        with pytest.raises(oc.OllamaError):
+            oc.OllamaClient().chat_text("s", "u")
+    llm_log.flush()
+
+    assert any("✗" in r.getMessage() for r in caplog.records)  # terse stdout warning
+    with session_scope() as db:
+        rows = list(db.scalars(matcher.select(models.LlmLog)))
+        assert len(rows) == 1
+        assert rows[0].status == "error" and "connection refused" in rows[0].error_detail
+        assert rows[0].response_content is None
+
+
+def test_ollama_logging_can_be_disabled(monkeypatch):
+    import app.services.ollama_client as oc
+    from app.services import llm_log
+
+    class Resp:
+        def json(self):
+            return {"message": {"content": "quiet"}}
+
+    monkeypatch.setattr(oc, "_post", lambda *a, **k: Resp())
+    monkeypatch.setattr(oc.settings, "log_ollama", False)
+    oc.OllamaClient().chat_text("s", "u")
+    llm_log.flush()
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.LlmLog))) == []

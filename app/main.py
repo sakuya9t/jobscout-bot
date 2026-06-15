@@ -1,7 +1,6 @@
 """FastAPI application entrypoint."""
 from __future__ import annotations
 
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,12 +8,25 @@ from sqlalchemy import text
 
 from .config import settings
 from .db import init_db, session_scope
-from .routers import auth, companies, interests, pages, positions, reports, resumes
-from .services import scheduler
+from .logging_config import configure_logging, get_logger
+from .routers import (
+    admin,
+    applications,
+    auth,
+    companies,
+    interests,
+    llm_config,
+    pages,
+    positions,
+    reports,
+    resumes,
+    telegram_config,
+)
+from .services import evaluator, scheduler
 from .services.ollama_client import get_client
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger(__name__)
+configure_logging()
+log = get_logger(__name__)
 
 
 @asynccontextmanager
@@ -26,8 +38,11 @@ async def lifespan(app: FastAPI):
         )
     init_db()
     scheduler.start()
+    # Resume any evaluation backlog left unfinished by a prior process.
+    evaluator.resume_pending_on_startup()
     yield
     scheduler.shutdown()
+    evaluator.shutdown()
 
 
 app = FastAPI(title="JobScout", version="0.1.0", lifespan=lifespan)
@@ -38,6 +53,10 @@ app.include_router(companies.router)
 app.include_router(interests.router)
 app.include_router(positions.router)
 app.include_router(reports.router)
+app.include_router(applications.router)
+app.include_router(llm_config.router)
+app.include_router(telegram_config.router)
+app.include_router(admin.router)
 app.include_router(pages.router)
 
 

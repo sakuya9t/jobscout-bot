@@ -29,8 +29,6 @@ def register_page(request: Request):
 def dashboard(request: Request, user: User | None = Depends(get_optional_user)):
     if user is None:
         return RedirectResponse("/login")
-    return templates.TemplateResponse(
-        request,
-        "dashboard.html",
-        {"user": user, "link_code": user.telegram_link_code},
-    )
+    # Telegram state (token/link status) is loaded client-side from
+    # /api/telegram-config, so the template only needs the user for the header.
+    return templates.TemplateResponse(request, "dashboard.html", {"user": user})

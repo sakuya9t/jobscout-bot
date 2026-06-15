@@ -5,6 +5,7 @@ offline / when JOBSCOUT_SKIP_NET=1."""
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -90,8 +91,108 @@ def test_infer_ats():
     assert _infer_ats("https://jobs.ashbyhq.com/openai") == ("ashby", "openai")
     # Google careers has no ATS token; it routes to the dedicated "google" adapter.
     assert _infer_ats("https://www.google.com/about/careers/applications/jobs/results/") == ("google", None)
+    # A *.eightfold.ai tenant routes to the eightfold adapter (domain via ats_token).
+    assert _infer_ats("https://nvidia.eightfold.ai/careers") == ("eightfold", None)
+    # A custom-domain Eightfold board can't be inferred — needs explicit ats_type.
+    assert _infer_ats("https://jobs.nvidia.com/careers") == ("html", None)
     assert _infer_ats("https://example.com/careers") == ("html", None)
     assert _infer_ats(None) == ("html", None)
+
+
+def test_eightfold_domain_derivation():
+    from app.services.scraper import _eightfold_domain
+
+    # Explicit ats_token always wins.
+    assert _eightfold_domain("https://jobs.nvidia.com/careers", "nvidia.com") == "nvidia.com"
+    # Otherwise strip a leading careers subdomain to get the registrable domain.
+    assert _eightfold_domain("https://jobs.nvidia.com/careers", None) == "nvidia.com"
+    assert _eightfold_domain("https://careers.acme.co.uk/x", None) == "acme.co.uk"
+    # An already-registrable host is left alone.
+    assert _eightfold_domain("https://acme.com/careers", None) == "acme.com"
+
+
+def _eightfold_page(ids_and_days):
+    """Build a PCSX search payload: each (id, days_ago) becomes one position."""
+    from app.timeutil import utcnow
+
+    now = utcnow()
+    return {
+        "status": 200,
+        "data": {
+            "count": 999,
+            "positions": [
+                {
+                    "id": jid,
+                    "name": f"Role {jid}",
+                    "locations": ["Remote, US"],
+                    "department": "Eng",
+                    "workLocationOption": "remote",
+                    "postedTs": int((now - timedelta(days=days)).timestamp()),
+                    "positionUrl": f"/careers/job/{jid}",
+                }
+                for jid, days in ids_and_days
+            ],
+        },
+    }
+
+
+def test_eightfold_parses_and_builds_absolute_urls(monkeypatch):
+    import app.services.scraper as scraper
+
+    monkeypatch.setattr(
+        scraper, "_fetch_json",
+        lambda url: _eightfold_page([(111, 1)]) if "start=0" in url else _eightfold_page([]),
+    )
+    out = scraper.scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 60)
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "111" and p.title == "Role 111"
+    assert p.location == "Remote, US" and p.department == "Eng"
+    # positionUrl is relative; it must resolve against the careers host.
+    assert p.url == "https://jobs.nvidia.com/careers/job/111"
+    assert p.posted_at is not None
+
+
+def test_eightfold_paginates_and_stops_past_age_cutoff(monkeypatch):
+    import app.services.scraper as scraper
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "scrape_max_age_days", 30)
+    # Page 0: recent. Page 1: all older than the 30-day cutoff -> stop, don't page 2.
+    pages = {
+        "start=0": _eightfold_page([(1, 2), (2, 5)]),
+        "start=10": _eightfold_page([(3, 90), (4, 120)]),
+        "start=20": _eightfold_page([(5, 1)]),  # must never be fetched
+    }
+    fetched = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        for key, payload in pages.items():
+            if key in url:
+                return payload
+        return _eightfold_page([])
+
+    monkeypatch.setattr(scraper, "_fetch_json", fake_fetch)
+    out = scraper.scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 60)
+    ids = {p.external_id for p in out}
+    # Both pages are pulled (the stale page is trimmed later by _within_max_age),
+    # but paging stops before start=20.
+    assert ids == {"1", "2", "3", "4"}
+    assert not any("start=20" in u for u in fetched)
+
+
+@pytest.mark.skipif(os.environ.get("JOBSCOUT_SKIP_NET") == "1", reason="network disabled")
+def test_live_eightfold():
+    from app.services.scraper import scrape_eightfold
+
+    try:
+        jobs = scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 2)
+    except Exception as exc:  # network / board changes shouldn't hard-fail CI
+        pytest.skip(f"network unavailable: {exc}")
+    assert isinstance(jobs, list)
+    if jobs:
+        assert jobs[0].title and jobs[0].external_id and jobs[0].url
 
 
 def test_scrape_company_does_not_cap_ats_results(monkeypatch):
@@ -105,6 +206,39 @@ def test_scrape_company_does_not_cap_ats_results(monkeypatch):
     )
     out = scraper.scrape_company(company)
     assert len(out) == 60  # default per-company cap is 40 — must NOT truncate ATS results
+
+
+def test_scrape_company_filters_stale_postings(monkeypatch):
+    """Only postings dated within scrape_max_age_days are pulled; undated postings
+    (Google/HTML carry no date) are always kept."""
+    import app.services.scraper as scraper
+    from datetime import timedelta
+
+    from app.timeutil import utcnow
+
+    recent = scraper.ScrapedPosition(external_id="new", title="Fresh",
+                                     posted_at=utcnow() - timedelta(days=5))
+    stale = scraper.ScrapedPosition(external_id="old", title="Stale",
+                                    posted_at=utcnow() - timedelta(days=90))
+    undated = scraper.ScrapedPosition(external_id="undated", title="No date")  # posted_at=None
+    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: [recent, stale, undated])
+    monkeypatch.setattr(scraper.settings, "scrape_max_age_days", 30)
+
+    company = SimpleNamespace(name="Acme", ats_type="greenhouse", ats_token="acme", careers_url=None)
+    kept = {p.external_id for p in scraper.scrape_company(company)}
+    assert kept == {"new", "undated"}  # stale dropped; recent + undated kept
+
+
+def test_within_max_age_zero_disables_filter():
+    """max_age_days=0 keeps everything, however old."""
+    import app.services.scraper as scraper
+    from datetime import timedelta
+
+    from app.timeutil import utcnow
+
+    ancient = scraper.ScrapedPosition(external_id="x", title="Ancient",
+                                      posted_at=utcnow() - timedelta(days=900))
+    assert scraper._within_max_age([ancient], 0) == [ancient]
 
 
 def test_greenhouse_parse_offline(monkeypatch):
@@ -183,7 +317,7 @@ def test_dispatch_uses_inferred_token(monkeypatch):
     import app.services.scraper as scraper
 
     captured = {}
-    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: captured.setdefault("t", token) or [])
+    monkeypatch.setattr(scraper, "scrape_greenhouse", lambda token: captured.update(t=token) or [])
     company = SimpleNamespace(
         name="Acme", ats_type="auto", ats_token=None,
         careers_url="https://boards.greenhouse.io/acme",

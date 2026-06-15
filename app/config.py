@@ -26,24 +26,39 @@ class Settings(BaseSettings):
     # Set the session cookie's Secure flag (HTTPS-only). Leave off for localhost
     # dev; turn on (JOBSCOUT_COOKIE_SECURE=1) behind HTTPS in production.
     cookie_secure: bool = False
+    # Internal/admin endpoints (e.g. POST /api/admin/crawl) require this token in an
+    # X-Admin-Token header. Empty (default) disables them with 503 — never an open
+    # trigger. Set JOBSCOUT_ADMIN_TOKEN to a long random string to enable.
+    admin_token: str = ""
 
     @property
     def secret_is_default(self) -> bool:
         return self.secret_key == DEFAULT_SECRET
 
-    # Ollama Cloud
-    ollama_base_url: str = "https://ollama.com"
-    ollama_api_key: str = ""
-    # Two models: a cheap one triages relevance (does this posting match the
-    # interest?), and the main one does the expensive resume<->role scoring only
-    # for postings that pass. Keeping a strong cheap default here means matching
-    # doesn't silently inherit whatever the user set as the scoring model.
-    ollama_model: str = "gpt-oss:120b-cloud"  # scoring model (the "good" one)
-    ollama_filter_model: str = "deepseek-v4-flash"  # cheap relevance filter
+    # Logging
+    # Central logging is configured by app/logging_config.py:configure_logging().
+    log_level: str = "INFO"
+    # Optional rotating log file. Empty = log to stderr only.
+    log_file: str = ""
+    log_max_bytes: int = 5_000_000
+    log_backup_count: int = 3
+    # Persist every Ollama request/response (full prompt + completion) to the
+    # llm_logs table (see services/llm_log.py); stdout gets only a terse summary.
+    # Prompts carry resume + job text, so they can be large and sensitive — set
+    # JOBSCOUT_LOG_OLLAMA=0 in shared environments to disable the wire log.
+    log_ollama: bool = True
+    # Truncate each stored prompt/response to this many chars (0 = store in full).
+    log_ollama_max_chars: int = 0
+
+    # Ollama / LLM
+    # Provider base URL, API key, and the main/light model names are now per-user
+    # (see app/llm_providers.py + the LlmConfig table); only the request timeout
+    # stays a deployment-wide setting.
     ollama_timeout: int = 120
 
-    # Telegram
-    telegram_bot_token: str = ""
+    # Telegram is now per-user (each user brings their own bot token + linked chat;
+    # see app/models.py:User and routers/telegram_config.py) — no deployment-wide
+    # token. The scheduler still pushes the daily report, through each user's bot.
 
     # Scheduler
     daily_run_hour: int = 8
@@ -64,16 +79,27 @@ class Settings(BaseSettings):
     # Google careers has no ATS API; we page its server-rendered results (20/page).
     # Cap pages so a run pulls a bounded slice instead of all ~thousands of roles.
     scrape_google_max_pages: int = 20
+    # Eightfold (PCSX) pages 10 roles each, newest-first; paging stops early once
+    # postings predate scrape_max_age_days, so this only caps very high-volume
+    # boards (60 pages = 600 newest roles) to bound request count per crawl.
+    scrape_eightfold_max_pages: int = 60
+    # Only pull postings posted/updated within this many days, to bound how much we
+    # store and score. Applies only to sources that expose a date (greenhouse/
+    # lever/ashby); Google careers and the HTML fallback carry no per-posting date,
+    # so their postings are always kept. 0 = no age filter.
+    scrape_max_age_days: int = 30
 
     # Scoring
-    # The LLM (not a keyword filter) decides relevance, so a run could otherwise
-    # score every scraped posting. Cap LLM calls per run to keep "Run scan now"
-    # responsive and costs bounded; remaining postings score on the next run.
-    # 0 = unlimited.
-    score_max_per_run: int = 50
     # Stage-1 relevance filtering is batched: one cheap call screens this many
     # postings at once (returns a verdict per posting), cutting filter calls ~Nx.
     score_filter_batch_size: int = 10
+    # Stage-2 scoring is also batched: after the cheap filter passes postings,
+    # one expensive request scores this many postings against the resume.
+    score_batch_size: int = 10
+    # Background evaluation: a worker drains each user's whole scoring backlog to
+    # completion off the request path (see app/services/evaluator.py). This bounds
+    # how many users drain concurrently. Internal — not a user-facing knob.
+    eval_max_workers: int = 2
 
     @property
     def resume_dir(self) -> Path:
