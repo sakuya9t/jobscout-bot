@@ -9,7 +9,6 @@ import tempfile
 os.environ.setdefault("JOBSCOUT_DATABASE_URL", "sqlite:///" + tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("JOBSCOUT_SECRET_KEY", "test-secret-key-at-least-32-bytes-long!!")
 os.environ.setdefault("JOBSCOUT_SCHEDULER_ENABLED", "0")
-os.environ.setdefault("JOBSCOUT_TELEGRAM_BOT_TOKEN", "")
 
 import pytest  # noqa: E402
 

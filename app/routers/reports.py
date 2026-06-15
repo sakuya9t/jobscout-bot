@@ -117,14 +117,16 @@ def get_latest_job_list(
         .order_by(JobListSnapshot.created_at.desc(), JobListSnapshot.id.desc())
         .limit(1)
     )
+    errors = reporter.job_list_errors(snapshot) if snapshot else []
     return JobListOut(
         id=snapshot.id if snapshot else None,
         created_at=snapshot.created_at if snapshot else None,
         new_positions=snapshot.new_positions if snapshot else 0,
         scored=snapshot.scored if snapshot else 0,
         filtered=snapshot.filtered if snapshot else 0,
-        errors=reporter.job_list_errors(snapshot) if snapshot else [],
+        errors=errors,
         pending=matcher.count_pending(db, user),
+        llm_error=reporter.llm_failed(errors),
         total=total,
         items=[MatchOut(**m) for m in items],
     )
@@ -159,13 +161,15 @@ def get_job_list(
     start = max(0, offset)
     page = all_items[start : start + _safe_limit(limit)]
     reporter.tag_applied(db, user, page)  # overlay live applied status onto the frozen list
+    errors = reporter.job_list_errors(snapshot)
     return JobListOut(
         id=snapshot.id,
         created_at=snapshot.created_at,
         new_positions=snapshot.new_positions,
         scored=snapshot.scored,
         filtered=snapshot.filtered,
-        errors=reporter.job_list_errors(snapshot),
+        errors=errors,
+        llm_error=reporter.llm_failed(errors),
         total=len(all_items),
         items=[MatchOut(**m) for m in page],
     )

@@ -16,6 +16,7 @@ import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from ..config import settings
+from ..llm_providers import DEFAULT_PROVIDER_OBJ
 from ..logging_config import get_logger
 from . import llm_log
 
@@ -152,9 +153,12 @@ class OllamaClient:
         model: str | None = None,
         timeout: int | None = None,
     ) -> None:
-        self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
-        self.api_key = api_key if api_key is not None else settings.ollama_api_key
-        self.model = model or settings.ollama_model
+        # Callers normally pass these explicitly (resolved per-user in services/llm
+        # .py); the defaults just keep the bare OllamaClient() used by the health
+        # probe working (default provider, no key).
+        self.base_url = (base_url or DEFAULT_PROVIDER_OBJ.base_url).rstrip("/")
+        self.api_key = api_key
+        self.model = model or DEFAULT_PROVIDER_OBJ.default_main_model
         self.timeout = timeout or settings.ollama_timeout
 
     @property

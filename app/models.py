@@ -31,7 +31,11 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
-    # Telegram linking: code is shown on the dashboard; user DMs the bot to bind chat_id.
+    # Telegram is per-user: the user supplies their own bot token (created via
+    # @BotFather) and links the chat reports go to by DMing ``/start <code>`` to
+    # that bot. ``telegram_bot_token`` is sensitive — treat the DB as secret, and
+    # never echo it back over the API (see routers/telegram_config.py).
+    telegram_bot_token: Mapped[str | None] = mapped_column(String(128))
     telegram_chat_id: Mapped[str | None] = mapped_column(String(64), index=True)
     telegram_link_code: Mapped[str | None] = mapped_column(String(32), index=True)
 
@@ -49,6 +53,9 @@ class User(Base):
     )
     applications: Mapped[list[Application]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
+    )
+    llm_config: Mapped[LlmConfig | None] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
     )
 
 
@@ -235,6 +242,29 @@ class MatchResult(Base):
     position: Mapped[Position] = relationship(back_populates="matches")
     resume: Mapped[Resume | None] = relationship(back_populates="matches")
     interest: Mapped[Interest | None] = relationship(back_populates="matches")
+
+
+class LlmConfig(Base):
+    """A user's chosen LLM provider + credentials/models. One row per user (its
+    absence means "use the deployment-wide defaults from settings"). ``provider``
+    is a key into ``llm_providers.PROVIDERS`` (which supplies the base URL); the
+    user brings their own ``api_key`` and picks the main (scoring) and light
+    (relevance-filter) models."""
+
+    __tablename__ = "llm_configs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    provider: Mapped[str] = mapped_column(String(32), default="ollama_cloud")
+    # User-supplied API key for the provider. Stored as-is (like the Telegram
+    # token); treat the DB as sensitive. NULL falls back to the global settings key.
+    api_key: Mapped[str | None] = mapped_column(String(512))
+    main_model: Mapped[str | None] = mapped_column(String(128))  # scoring ("good") model
+    light_model: Mapped[str | None] = mapped_column(String(128))  # cheap relevance filter
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="llm_config")
 
 
 class Application(Base):

@@ -50,19 +50,15 @@ class Settings(BaseSettings):
     # Truncate each stored prompt/response to this many chars (0 = store in full).
     log_ollama_max_chars: int = 0
 
-    # Ollama Cloud
-    ollama_base_url: str = "https://ollama.com"
-    ollama_api_key: str = ""
-    # Two models: a cheap one triages relevance (does this posting match the
-    # interest?), and the main one does the expensive resume<->role scoring only
-    # for postings that pass. Keeping a strong cheap default here means matching
-    # doesn't silently inherit whatever the user set as the scoring model.
-    ollama_model: str = "gpt-oss:120b-cloud"  # scoring model (the "good" one)
-    ollama_filter_model: str = "deepseek-v4-flash"  # cheap relevance filter
+    # Ollama / LLM
+    # Provider base URL, API key, and the main/light model names are now per-user
+    # (see app/llm_providers.py + the LlmConfig table); only the request timeout
+    # stays a deployment-wide setting.
     ollama_timeout: int = 120
 
-    # Telegram
-    telegram_bot_token: str = ""
+    # Telegram is now per-user (each user brings their own bot token + linked chat;
+    # see app/models.py:User and routers/telegram_config.py) — no deployment-wide
+    # token. The scheduler still pushes the daily report, through each user's bot.
 
     # Scheduler
     daily_run_hour: int = 8

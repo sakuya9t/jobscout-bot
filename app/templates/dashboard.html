@@ -158,6 +158,7 @@
       <button class="nav-button" data-view="resume" onclick="showView('resume')">Check/update resume</button>
       <button class="nav-button" data-view="companies" onclick="showView('companies')">Company watchlist management</button>
       <button class="nav-button" data-view="interests" onclick="showView('interests')">Interest management</button>
+      <button class="nav-button" data-view="llm" onclick="showView('llm')">LLM provider</button>
       <button class="nav-button" data-view="telegram" onclick="showView('telegram')">Telegram settings</button>
     </nav>
     <button class="ghost logout" onclick="logout()">Log out</button>
@@ -227,6 +228,9 @@
         <div id="runGate" class="muted" style="margin-top:8px;"></div>
         <div id="evalBanner" style="display:none; margin-top:12px; padding:10px 12px;
              border:1px solid var(--line); background:var(--surface-soft); color:#2a3a34;
+             border-radius:8px; font-size:13px;"></div>
+        <div id="llmErrorBanner" style="display:none; margin-top:12px; padding:10px 12px;
+             border:1px solid var(--danger); background:#fdecea; color:var(--danger);
              border-radius:8px; font-size:13px;"></div>
         <div id="jobMeta" class="stat-line" style="margin-top:14px;"></div>
         <div id="jobWarnings"></div>
@@ -323,18 +327,61 @@
       <div class="surface"><div id="interests"></div></div>
     </section>
 
+    <section id="view-llm" class="panel">
+      <div class="surface">
+        <h2>LLM provider</h2>
+        <p class="muted">Pick your model provider and bring your own API key and models.
+          These are used to filter and score every job against your resume.</p>
+        <div class="row">
+          <div>
+            <label for="llmProvider">Provider</label>
+            <select id="llmProvider" onchange="onLlmProviderChange()"></select>
+          </div>
+          <div>
+            <label for="llmBaseUrl">Base URL</label>
+            <input id="llmBaseUrl" disabled />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="llmMainModel">Main model (scoring)</label>
+            <input id="llmMainModel" placeholder="e.g. gpt-oss:120b-cloud" />
+          </div>
+          <div>
+            <label for="llmLightModel">Light model (relevance filter)</label>
+            <input id="llmLightModel" placeholder="e.g. deepseek-v4-flash" />
+          </div>
+        </div>
+        <div>
+          <label for="llmApiKey">API key</label>
+          <input id="llmApiKey" type="password" autocomplete="off" placeholder="Your provider API key" />
+          <div id="llmKeyHint" class="muted"></div>
+        </div>
+        <div class="toolbar" style="margin-top:12px;">
+          <button onclick="saveLlmConfig()">Save</button>
+          <button class="ghost" onclick="testLlmConfig()">Test</button>
+          <span id="llmStatus" class="muted"></span>
+        </div>
+      </div>
+    </section>
+
     <section id="view-telegram" class="panel">
       <div class="surface">
         <h2>Telegram settings</h2>
-        <div id="tg" class="muted">
-          {% if user.telegram_chat_id %}
-            Telegram linked. <button class="ghost" onclick="regenCode()">Re-link with a new code</button>
-          {% elif link_code %}
-            Telegram link code: <code>/start {{ link_code }}</code>
-            <button class="ghost" onclick="regenCode()">New code</button>
-          {% else %}
-            Telegram not linked. <button class="ghost" onclick="regenCode()">Generate link code</button>
-          {% endif %}
+        <p class="muted">Get your daily ranked report in Telegram. Create a bot with
+          <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>,
+          paste its token below and Save, then DM your bot to link the chat reports go to.</p>
+        <div>
+          <label for="tgToken">Bot token</label>
+          <input id="tgToken" type="password" autocomplete="off" placeholder="123456789:ABCdef…" />
+          <div id="tgTokenHint" class="muted"></div>
+        </div>
+        <div id="tgLink" class="muted" style="margin-top:12px;"></div>
+        <div class="toolbar" style="margin-top:12px;">
+          <button onclick="saveTelegram()">Save</button>
+          <button class="ghost" onclick="linkTelegram()">Link chat</button>
+          <button class="ghost" onclick="testTelegram()">Test</button>
+          <span id="tgStatus" class="muted"></span>
         </div>
       </div>
     </section>
@@ -350,6 +397,7 @@ const viewCopy = {
   resume: ["Check/update resume", "Current resume used for matching"],
   companies: ["Company watchlist management", "Career sites included in each scan"],
   interests: ["Interest management", "Role preferences and scoring thresholds"],
+  llm: ["LLM provider", "Model provider, API key, and models used for scoring"],
   telegram: ["Telegram settings", "Daily report delivery"]
 };
 // Job-list view: a segmented switch between top 5 matching / all matching / all
@@ -403,13 +451,120 @@ function fmtListed(value){
 
 async function logout(){ await api("/api/auth/logout",{method:"POST"}); window.location="/login"; }
 
+// ── Telegram settings (per-user bot token + linked chat) ──
+async function loadTelegramConfig(){
+  const r = await api("/api/telegram-config");
+  if(!r.ok){ return; }
+  const c = await r.json();
+  document.getElementById("tgToken").value = "";
+  document.getElementById("tgTokenHint").textContent = c.has_token
+    ? "A bot token is saved. Leave blank to keep it, or paste a new one to replace it."
+    : "No bot token saved yet — paste your bot token and Save.";
+  const link = document.getElementById("tgLink");
+  if(c.linked){
+    link.innerHTML = `✅ Linked to chat <code>${esc(c.chat_id)}</code>. `
+      + `<button class="ghost" onclick="regenCode()">Re-link with a new code</button>`;
+  } else if(c.link_code){
+    link.innerHTML = `Not linked yet. DM your bot <code>/start ${esc(c.link_code)}</code>, then click `
+      + `<b>Link chat</b> below. <button class="ghost" onclick="regenCode()">New code</button>`;
+  } else {
+    link.innerHTML = `Not linked. <button class="ghost" onclick="regenCode()">Generate link code</button>`;
+  }
+}
+
+function telegramBody(){
+  const body = {};
+  const t = document.getElementById("tgToken").value.trim();
+  if(t){ body.bot_token = t; }   // blank = keep the saved token
+  return body;
+}
+
+async function saveTelegram(){
+  const s = document.getElementById("tgStatus");
+  s.textContent = "Saving…";
+  const r = await api("/api/telegram-config", {method:"PUT", body: JSON.stringify(telegramBody())});
+  if(!r.ok){ const d=await r.json().catch(()=>({})); s.textContent = d.detail || "Save failed"; return; }
+  s.textContent = "Saved.";
+  await loadTelegramConfig();
+}
+
+async function linkTelegram(){
+  const s = document.getElementById("tgStatus");
+  s.textContent = "Looking for your /start message…";
+  const r = await api("/api/telegram-config/link", {method:"POST"});
+  const d = await r.json().catch(()=>({}));
+  s.textContent = (d.ok ? "✓ " : "✗ ") + (d.detail || (r.ok ? "" : "Link failed"));
+  await loadTelegramConfig();
+}
+
+async function testTelegram(){
+  const s = document.getElementById("tgStatus");
+  s.textContent = "Sending a test message…";
+  const r = await api("/api/telegram-config/test", {method:"POST"});
+  const d = await r.json().catch(()=>({}));
+  s.textContent = (d.ok ? "✓ " : "✗ ") + (d.detail || (r.ok ? "" : "Test failed"));
+}
+
 async function regenCode(){
   const r = await api("/api/auth/telegram-code",{method:"POST"});
   if(!r.ok){ alert("Could not generate a code"); return; }
-  const d = await r.json();
-  document.getElementById("tg").innerHTML =
-    `Telegram link code: <code>/start ${esc(d.telegram_link_code)}</code> `+
-    `<button class="ghost" onclick="regenCode()">New code</button>`;
+  await loadTelegramConfig();
+}
+
+// ── LLM provider settings ──
+let LLM_BASE_URLS = {};  // provider key -> base URL (to mirror the dropdown choice)
+
+async function loadLlmConfig(){
+  const r = await api("/api/llm-config");
+  if(!r.ok){ return; }
+  const cfg = await r.json();
+  LLM_BASE_URLS = {};
+  document.getElementById("llmProvider").innerHTML = cfg.providers.map(p => {
+    LLM_BASE_URLS[p.key] = p.base_url;
+    return `<option value="${esc(p.key)}">${esc(p.label)}</option>`;
+  }).join("");
+  document.getElementById("llmProvider").value = cfg.provider;
+  document.getElementById("llmBaseUrl").value = cfg.base_url;
+  document.getElementById("llmMainModel").value = cfg.main_model;
+  document.getElementById("llmLightModel").value = cfg.light_model;
+  document.getElementById("llmApiKey").value = "";
+  document.getElementById("llmKeyHint").textContent = cfg.has_api_key
+    ? "An API key is saved. Leave blank to keep it, or enter a new one to replace it."
+    : "No API key saved yet — enter one so scans can run.";
+}
+
+function onLlmProviderChange(){
+  document.getElementById("llmBaseUrl").value =
+    LLM_BASE_URLS[document.getElementById("llmProvider").value] || "";
+}
+
+async function saveLlmConfig(){
+  const s = document.getElementById("llmStatus");
+  s.textContent = "Saving…";
+  const r = await api("/api/llm-config", {method:"PUT", body: JSON.stringify(llmFormBody())});
+  if(!r.ok){ const d = await r.json().catch(()=>({})); s.textContent = d.detail || "Save failed"; return; }
+  s.textContent = "Saved.";
+  await loadLlmConfig();
+}
+
+function llmFormBody(){
+  const body = {
+    provider: val("llmProvider"),
+    main_model: val("llmMainModel"),
+    light_model: val("llmLightModel"),
+  };
+  const key = document.getElementById("llmApiKey").value.trim();
+  if(key){ body.api_key = key; }   // blank = use the saved key
+  return body;
+}
+
+async function testLlmConfig(){
+  const s = document.getElementById("llmStatus");
+  s.textContent = "Testing your models…";
+  const r = await api("/api/llm-config/test", {method:"POST", body: JSON.stringify(llmFormBody())});
+  if(!r.ok){ const d = await r.json().catch(()=>({})); s.textContent = d.detail || "Test failed"; return; }
+  const res = await r.json();
+  s.textContent = (res.ok ? "✓ " : "✗ ") + res.detail;
 }
 
 async function uploadResume(){
@@ -765,6 +920,15 @@ function renderJobList(data){
   document.getElementById("jobWarnings").innerHTML = (data.errors || []).length
     ? `<div class="warning-box"><b>Warnings</b><ul class="tight">${data.errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul></div>`
     : "";
+  const llmBanner = document.getElementById("llmErrorBanner");
+  if(data.llm_error){
+    llmBanner.style.display = "";
+    llmBanner.innerHTML = "⚠️ <b>LLM request failed</b> — some jobs couldn’t be scored. "
+      + "Check your provider key and model names, then run again. "
+      + '<a href="#llm" onclick="showView(\'llm\'); return false;">Open LLM provider settings</a>';
+  } else {
+    llmBanner.style.display = "none";
+  }
   document.getElementById("jobList").innerHTML = (data.items || []).map(m => {
     const strengths = m.strengths || [];
     const gaps = m.gaps || [];
@@ -800,6 +964,8 @@ loadResumes();
 loadPresets();
 loadCompanies();
 loadInterests();
+loadLlmConfig();
+loadTelegramConfig();
 loadJobRuns().then(loadJobList);
 startEvalPolling();  // resume the backlog indicator if a drain is already running
 </script>

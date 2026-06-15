@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class _ORM(BaseModel):
@@ -43,6 +43,100 @@ class UserOut(_ORM):
     email: str
     telegram_chat_id: str | None = None
     telegram_link_code: str | None = None
+
+
+# ── LLM provider config ──────────────────────────────────────────────────────
+class LlmProviderOut(BaseModel):
+    """A selectable provider for the settings dropdown."""
+
+    key: str
+    label: str
+    base_url: str
+
+
+class LlmConfigOut(BaseModel):
+    """The user's effective LLM config plus the providers to choose from. The API
+    key is never returned — only whether one is set."""
+
+    provider: str
+    base_url: str
+    main_model: str
+    light_model: str
+    has_api_key: bool
+    providers: list[LlmProviderOut]
+
+
+class LlmModelTest(BaseModel):
+    """Result of probing one model during the settings-page "Test"."""
+
+    role: str  # "main" | "light"
+    model: str
+    ok: bool
+    detail: str
+
+
+class LlmTestResult(BaseModel):
+    """Outcome of the settings-page "Test" button — one entry per distinct model
+    tested (main + light, deduped when they're the same)."""
+
+    ok: bool  # every probed model succeeded
+    detail: str  # one-line summary across the probed models
+    results: list[LlmModelTest] = Field(default_factory=list)
+
+
+class LlmConfigIn(BaseModel):
+    provider: str
+    main_model: str
+    light_model: str
+    # Optional: omit/leave blank to keep the saved key; a non-empty value replaces it.
+    api_key: str | None = None
+
+    @field_validator("provider", "main_model", "light_model")
+    @classmethod
+    def _required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("api_key")
+    @classmethod
+    def _strip_key(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+# ── Telegram config ──────────────────────────────────────────────────────────
+class TelegramConfigOut(BaseModel):
+    """The user's Telegram delivery state. The bot token is never returned — only
+    whether one is set — and ``link_code`` is the one-time code to DM the bot."""
+
+    has_token: bool
+    linked: bool
+    chat_id: str | None = None
+    link_code: str | None = None
+
+
+class TelegramConfigIn(BaseModel):
+    # Optional: omit/leave blank to keep the saved token; a non-empty value replaces it.
+    bot_token: str | None = None
+
+    @field_validator("bot_token")
+    @classmethod
+    def _strip_token(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class TelegramActionResult(BaseModel):
+    """Outcome of the settings-page Link/Test actions."""
+
+    ok: bool
+    detail: str
 
 
 # ── Resume ───────────────────────────────────────────────────────────────────
@@ -192,6 +286,9 @@ class JobListOut(BaseModel):
     total: int = 0
     # Positions still queued for background evaluation (0 = fully evaluated).
     pending: int = 0
+    # True when this run's warnings include an LLM-communication failure (bad
+    # key/model, unreachable provider, exhausted quota) — drives a dashboard banner.
+    llm_error: bool = False
     items: list[MatchOut] = Field(default_factory=list)
 
 

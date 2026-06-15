@@ -20,8 +20,8 @@ from ..db import session_scope
 from ..models import Company, Interest, MatchResult, Position, Resume, Subscription, User
 from ..schemas import MatchVerdict
 from ..timeutil import utcnow
-from . import scraper
-from .ollama_client import OllamaBudgetError, OllamaClient, OllamaError, get_client
+from . import llm, scraper
+from .ollama_client import OllamaBudgetError, OllamaClient, OllamaError
 
 log = logging.getLogger(__name__)
 
@@ -606,8 +606,13 @@ def _score_locked(
     client: OllamaClient | None = None,
     filter_client: OllamaClient | None = None,
 ) -> None:
-    score_client = client or get_client()
-    filter_client = filter_client or OllamaClient(model=settings.ollama_filter_model)
+    # Build the scoring + relevance-filter clients from this user's effective LLM
+    # config (their provider/key/models, else the global defaults), unless a caller
+    # injected clients (tests, or a future override).
+    if client is None or filter_client is None:
+        default_score, default_filter = llm.clients_for_user(db, user)
+    score_client = client or default_score
+    filter_client = filter_client or default_filter
 
     resume, interests, companies = _active_inputs(db, user)
     if not resume:
@@ -632,7 +637,7 @@ def _score_locked(
 
     batch_size = max(1, settings.score_filter_batch_size)
     score_batch_size = max(1, settings.score_batch_size)
-    filter_model = settings.ollama_filter_model
+    filter_model = filter_client.model  # the model name we tag filter-rejects with
     excluded = 0  # pairs dropped by an explicit exclude keyword (no LLM call)
 
     # Evaluate every active interest against the postings it hasn't been scored for.

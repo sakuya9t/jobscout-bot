@@ -678,21 +678,88 @@ def test_job_list_snapshots_keep_previous_ranked_versions():
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-def test_telegram_link_code_is_one_time():
-    """A link code is burned on use so a leaked code can't re-bind the chat."""
+def test_telegram_link_binds_chat_and_burns_code(monkeypatch):
+    """On-demand linking reads the bot's /start <code> once, binds the chat, and
+    burns the one-time code so a leaked code can't re-bind the chat."""
+    from app.auth import create_access_token
+    from app.services import evaluator
     import app.services.telegram_bot as tg
 
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
     with session_scope() as db:
-        u = models.User(email="t@x.com", hashed_password="h", telegram_link_code="abc123")
+        u = models.User(email="t@x.com", hashed_password="h",
+                        telegram_bot_token="bot-123", telegram_link_code="abc123")
         db.add(u)
         db.flush()
         uid = u.id
-    assert "Linked" in tg._link_account("abc123", "555")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # Nothing DMed yet -> not linked, code intact.
+        monkeypatch.setattr(tg, "find_start_chat", lambda token, code: None)
+        r = c.post("/api/telegram-config/link", headers=h).json()
+        assert r["ok"] is False and "abc123" in r["detail"]
+        assert c.get("/api/telegram-config", headers=h).json()["linked"] is False
+
+        # User DMs /start abc123 -> chat bound (only for the matching code), code burned.
+        monkeypatch.setattr(tg, "find_start_chat",
+                            lambda token, code: "555" if code == "abc123" else None)
+        ok = c.post("/api/telegram-config/link", headers=h).json()
+        assert ok["ok"] is True and "555" in ok["detail"]
+        cfg = c.get("/api/telegram-config", headers=h).json()
+        assert cfg["linked"] is True and cfg["chat_id"] == "555"
     with session_scope() as db:
         u = db.get(models.User, uid)
         assert u.telegram_chat_id == "555" and u.telegram_link_code is None
-    # Replaying the now-dead code is rejected.
-    assert "isn't valid" in tg._link_account("abc123", "999")
+
+
+def test_telegram_config_saves_token_and_tests(monkeypatch):
+    """Token is saved (never echoed), the link code is minted on demand, and Test
+    validates the token then only sends once a chat is linked."""
+    from app.auth import create_access_token
+    from app.services import evaluator
+    import app.services.telegram_bot as tg
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="tg@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    sent = {"called": False}
+    monkeypatch.setattr(tg, "get_bot_username", lambda token: (True, "scout_bot"))
+
+    def _send(token, chat_id, text):
+        sent["called"] = True
+        return True
+
+    monkeypatch.setattr(tg, "send_message", _send)
+    with TestClient(app) as c:
+        # Fresh user: no token, but a link code is minted so there's one to DM.
+        first = c.get("/api/telegram-config", headers=h).json()
+        assert first["has_token"] is False and first["linked"] is False and first["link_code"]
+
+        # Test with no token reports it and sends nothing.
+        none = c.post("/api/telegram-config/test", headers=h).json()
+        assert none["ok"] is False and "bot token" in none["detail"].lower()
+        assert sent["called"] is False
+
+        # Save a token (never echoed back).
+        saved = c.put("/api/telegram-config", headers=h, json={"bot_token": "bot-xyz"}).json()
+        assert saved["has_token"] is True and "bot_token" not in saved
+
+        # Valid token but no chat linked yet -> Test reports it, still no send.
+        nochat = c.post("/api/telegram-config/test", headers=h).json()
+        assert nochat["ok"] is False and "linked" in nochat["detail"] and sent["called"] is False
+
+        # Link a chat, then a successful Test actually sends via the user's bot.
+        monkeypatch.setattr(tg, "find_start_chat", lambda token, code: "777")
+        c.post("/api/telegram-config/link", headers=h)
+        ok = c.post("/api/telegram-config/test", headers=h).json()
+        assert ok["ok"] is True and sent["called"] is True and "scout_bot" in ok["detail"]
+
+        # Blank token on re-save keeps the stored one.
+        c.put("/api/telegram-config", headers=h, json={})
+    with session_scope() as db:
+        assert db.get(models.User, uid).telegram_bot_token == "bot-xyz"
+    assert c.get("/api/telegram-config").status_code == 401  # auth required
 
 
 def test_telegram_report_warnings_and_chunking():
@@ -724,8 +791,7 @@ def test_evaluator_drains_backlog_and_records_snapshot(monkeypatch):
 
     with session_scope() as db:
         uid = _seed_user(db)  # 1 described position × 1 interest = backlog of 1
-    monkeypatch.setattr(matcher, "get_client", lambda: GoodClient())
-    monkeypatch.setattr(matcher, "OllamaClient", lambda **k: FilterPass())
+    monkeypatch.setattr(matcher.llm, "clients_for_user", lambda db, user: (GoodClient(), FilterPass()))
 
     evaluator._run(uid)
 
@@ -1075,6 +1141,208 @@ def test_applications_cascade_on_user_delete():
         db.delete(db.get(models.User, uid))
         db.commit()
         assert list(db.scalars(matcher.select(models.Application))) == []
+
+
+# ── LLM provider config (per-user) ───────────────────────────────────────────
+def test_effective_llm_config_defaults_to_provider_with_no_key():
+    from app.llm_providers import DEFAULT_PROVIDER_OBJ as p
+    from app.services import llm
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        eff = llm.effective_config(db, user)
+        assert eff.provider == p.key and eff.base_url == p.base_url
+        assert eff.main_model == p.default_main_model
+        assert eff.light_model == p.default_light_model
+        assert eff.api_key is None  # no per-user key, no global fallback anymore
+
+
+def test_effective_llm_config_uses_user_overrides():
+    from app.services import llm
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.LlmConfig(user_id=uid, provider="ollama_cloud", api_key="sk-user",
+                                main_model="big-model", light_model="small-model"))
+        db.commit()
+        eff = llm.effective_config(db, db.get(models.User, uid))
+        assert eff.base_url == "https://ollama.com"  # from the provider registry
+        assert eff.api_key == "sk-user"
+        assert eff.main_model == "big-model" and eff.light_model == "small-model"
+
+
+def test_clients_built_from_user_config(monkeypatch):
+    from app.services import llm
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, base_url=None, api_key=None, model=None, timeout=None):
+            captured.append((base_url, api_key, model))
+            self.model = model
+
+    monkeypatch.setattr(llm, "OllamaClient", FakeClient)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.LlmConfig(user_id=uid, provider="ollama_cloud", api_key="sk-x",
+                                main_model="big", light_model="small"))
+        db.commit()
+        llm.clients_for_user(db, db.get(models.User, uid))
+    assert ("https://ollama.com", "sk-x", "big") in captured     # scoring client
+    assert ("https://ollama.com", "sk-x", "small") in captured   # relevance-filter client
+
+
+def test_llm_config_endpoints_roundtrip(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        cfg = c.get("/api/llm-config", headers=h).json()
+        assert cfg["provider"] == "ollama_cloud"
+        assert any(p["key"] == "ollama_cloud" and p["base_url"] == "https://ollama.com"
+                   for p in cfg["providers"])
+
+        r = c.put("/api/llm-config", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "small",
+            "api_key": "sk-123"})
+        assert r.status_code == 200
+        got = r.json()
+        assert got["main_model"] == "big" and got["light_model"] == "small"
+        assert got["has_api_key"] is True and "api_key" not in got  # key never echoed back
+
+        again = c.get("/api/llm-config", headers=h).json()
+        assert again["main_model"] == "big" and again["base_url"] == "https://ollama.com"
+        assert again["has_api_key"] is True
+    assert c.get("/api/llm-config").status_code == 401  # auth required
+
+
+def test_llm_config_keeps_key_when_blank_and_rejects_unknown_provider(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        c.put("/api/llm-config", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "m", "light_model": "l", "api_key": "sk-keep"})
+        # Re-saving without api_key keeps the stored one.
+        c.put("/api/llm-config", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "m2", "light_model": "l2"})
+        assert c.get("/api/llm-config", headers=h).json()["has_api_key"] is True
+        # Unknown provider is rejected.
+        assert c.put("/api/llm-config", headers=h, json={
+            "provider": "openai", "main_model": "m", "light_model": "l"}).status_code == 400
+    with session_scope() as db:
+        cfg = db.scalar(matcher.select(models.LlmConfig).where(models.LlmConfig.user_id == uid))
+        assert cfg.api_key == "sk-keep" and cfg.main_model == "m2"
+
+
+def test_matcher_resolves_clients_per_user(monkeypatch):
+    """run_for_user with no injected clients resolves them from the user's config."""
+    called = {}
+
+    def fake_clients(db, user):
+        called["uid"] = user.id
+        return GoodClient(score=91), FilterPass()
+
+    monkeypatch.setattr(matcher.llm, "clients_for_user", fake_clients)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        res = matcher.run_for_user(db, db.get(models.User, uid))  # no clients injected
+        assert called.get("uid") == uid and res.scored == 1
+
+
+def test_llm_config_test_button(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+    import app.routers.llm_config as rc
+    from app.services.ollama_client import OllamaError
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+
+    built: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **k):
+            self.model = k.get("model")
+            built.append(self.model)
+
+        def chat_text(self, *a, **k):
+            if self.model == "bad":
+                raise OllamaError("Ollama returned 401: invalid api key")
+            return "OK"
+
+    monkeypatch.setattr(rc, "OllamaClient", FakeClient)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # Distinct models -> both probed, both pass.
+        built.clear()
+        ok = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "small",
+            "api_key": "sk-1"}).json()
+        assert ok["ok"] is True and built == ["big", "small"]
+        assert {r["role"] for r in ok["results"]} == {"main", "light"}
+
+        # Same model for both -> probed once.
+        built.clear()
+        same = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "big",
+            "api_key": "sk-1"}).json()
+        assert same["ok"] is True and built == ["big"] and len(same["results"]) == 1
+
+        # One model fails -> overall not ok, the failing model named with its error.
+        built.clear()
+        bad = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "bad",
+            "api_key": "sk-1"}).json()
+        assert bad["ok"] is False and built == ["big", "bad"]
+        light = next(r for r in bad["results"] if r["role"] == "light")
+        assert light["ok"] is False and "401" in light["detail"]
+        assert next(r for r in bad["results"] if r["role"] == "main")["ok"] is True
+
+        # No key supplied and none saved -> reported, and no client is even built.
+        built.clear()
+        nokey = c.post("/api/llm-config/test", headers=h, json={
+            "provider": "ollama_cloud", "main_model": "big", "light_model": "small"}).json()
+        assert nokey["ok"] is False and "API key" in nokey["detail"] and built == []
+
+
+def test_llm_failed_classifier():
+    assert reporter.llm_failed(["Scoring failed: Ollama returned 401"]) is True
+    assert reporter.llm_failed(["Filtering failed: read timeout"]) is True
+    assert reporter.llm_failed(["Ollama budget/quota appears to be exhausted"]) is True
+    assert reporter.llm_failed(["Acme: refusing to fetch private host"]) is False
+    assert reporter.llm_failed([]) is False
+
+
+def test_job_list_surfaces_llm_error(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        reporter.record_job_list_snapshot(db, db.get(models.User, uid), SimpleNamespace(
+            new_positions=0, scored=0, filtered=0,
+            errors=["Scoring failed: Ollama returned 401: invalid api key"]))
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.get("/api/job-lists/latest", headers=h).json()["llm_error"] is True
+    # A later clean snapshot clears the banner.
+    with session_scope() as db:
+        reporter.record_job_list_snapshot(db, db.get(models.User, uid), SimpleNamespace(
+            new_positions=0, scored=1, filtered=0, errors=[]))
+    with TestClient(app) as c:
+        assert c.get("/api/job-lists/latest", headers=h).json()["llm_error"] is False
 
 
 def test_score_filter_exempts_non_matching_in_all_category():

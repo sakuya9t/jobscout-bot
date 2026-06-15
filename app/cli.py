@@ -1,7 +1,7 @@
 """Command-line entrypoint: jobscout <command>.
 
 Commands:
-  serve            Run the web app (uvicorn) with scheduler + Telegram poller.
+  serve            Run the web app (uvicorn) with the daily scheduler.
   mcp              Run the MCP server over stdio (for openclaw/hermes/agents).
   run-daily        Run the scrape+score pipeline once for all users (cron-friendly).
   init-db          Create database tables.

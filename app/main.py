@@ -15,10 +15,12 @@ from .routers import (
     auth,
     companies,
     interests,
+    llm_config,
     pages,
     positions,
     reports,
     resumes,
+    telegram_config,
 )
 from .services import evaluator, scheduler
 from .services.ollama_client import get_client
@@ -52,6 +54,8 @@ app.include_router(interests.router)
 app.include_router(positions.router)
 app.include_router(reports.router)
 app.include_router(applications.router)
+app.include_router(llm_config.router)
+app.include_router(telegram_config.router)
 app.include_router(admin.router)
 app.include_router(pages.router)
 

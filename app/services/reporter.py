@@ -278,6 +278,24 @@ def filter_items_posted_within(items: list[dict], posted_within_days: int | None
     return kept
 
 
+# Substrings that mark a run warning as an LLM-communication failure (vs a scrape
+# or config warning) — the matcher tags these with "Filtering failed"/"Scoring
+# failed", and budget/quota exhaustion names Ollama. Used to raise the dashboard's
+# "LLM requests failed" banner.
+_LLM_FAILURE_HINTS = ("filtering failed", "scoring failed", "ollama", "quota", "budget")
+
+
+def is_llm_failure(message: str) -> bool:
+    low = (message or "").lower()
+    return any(hint in low for hint in _LLM_FAILURE_HINTS)
+
+
+def llm_failed(errors: list[str]) -> bool:
+    """Whether any run warning indicates an LLM request failed (bad key/model,
+    unreachable provider, or exhausted quota)."""
+    return any(is_llm_failure(e) for e in errors)
+
+
 def job_list_errors(snapshot: JobListSnapshot) -> list[str]:
     try:
         data = json.loads(snapshot.errors or "[]")
