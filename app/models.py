@@ -54,6 +54,9 @@ class User(Base):
     applications: Mapped[list[Application]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    application_kits: Mapped[list[ApplicationKit]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     llm_config: Mapped[LlmConfig | None] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
     )
@@ -90,6 +93,11 @@ class Resume(Base):
     # Deleting a resume removes the matches scored against it (and its on-disk
     # file, handled in the router) so reports never reference a missing resume.
     matches: Mapped[list[MatchResult]] = relationship(
+        back_populates="resume", cascade="all, delete-orphan"
+    )
+    # Application kits are tailored to a specific resume, so replacing/deleting the
+    # resume drops them too (they'd be stale) — same lifecycle as ``matches``.
+    application_kits: Mapped[list[ApplicationKit]] = relationship(
         back_populates="resume", cascade="all, delete-orphan"
     )
 
@@ -210,6 +218,9 @@ class Position(Base):
     applications: Mapped[list[Application]] = relationship(
         back_populates="position", cascade="all, delete-orphan"
     )
+    application_kits: Mapped[list[ApplicationKit]] = relationship(
+        back_populates="position", cascade="all, delete-orphan"
+    )
 
 
 class MatchResult(Base):
@@ -318,3 +329,48 @@ class LlmLog(Base):
     eval_tokens: Mapped[int | None] = mapped_column(Integer)
     response_content: Mapped[str | None] = mapped_column(Text)
     error_detail: Mapped[str | None] = mapped_column(Text)
+
+
+class ApplicationKit(Base):
+    """LLM-generated application materials for one (user, position): a summary of
+    what the role is looking for, detected open application questions with advice +
+    a draft answer, a cover letter, and a tailored resume.
+
+    Generated on demand from the position detail page (an explicit "Generate"
+    click), in the background (see ``services/kit_worker.py``), never during the
+    bulk scan — which would multiply cost across every posting. The row is cached
+    and shown as-is on every later page open; it is re-generated only when the user
+    explicitly asks (a fresh POST), so reads never trigger LLM calls. One row per
+    (user, position)."""
+
+    __tablename__ = "application_kits"
+    __table_args__ = (UniqueConstraint("user_id", "position_id", name="uq_kit_user_position"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    position_id: Mapped[int] = mapped_column(ForeignKey("positions.id"), index=True)
+    # Which resume the kit was tailored against (nullable so a kit survives even if
+    # we couldn't resolve a resume; in practice generation requires an active one).
+    resume_id: Mapped[int | None] = mapped_column(ForeignKey("resumes.id"))
+
+    # "generating" while the background worker runs, "ok" once complete, "error" on
+    # a terminal LLM failure (with ``error_detail`` set). The detail page polls this.
+    status: Mapped[str] = mapped_column(String(16), default="generating")
+    looking_for: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
+    # JSON list[{question, advice, suggested_answer}] — detected open application
+    # questions plus how to approach them and a draft answer.
+    open_questions: Mapped[str | None] = mapped_column(Text)
+    cover_letter: Mapped[str | None] = mapped_column(Text)
+    # The tailored resume, as copy-paste-ready Markdown.
+    revised_resume: Mapped[str | None] = mapped_column(Text)
+    # A short (3-4 sentence) note on what was optimized for this position, shown
+    # below the resume block (not part of the copyable Markdown).
+    resume_optimization: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="application_kits")
+    position: Mapped[Position] = relationship(back_populates="application_kits")
+    resume: Mapped[Resume | None] = relationship(back_populates="application_kits")

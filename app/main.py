@@ -22,7 +22,7 @@ from .routers import (
     resumes,
     telegram_config,
 )
-from .services import evaluator, scheduler
+from .services import evaluator, kit_worker, scheduler
 from .services.ollama_client import get_client
 
 configure_logging()
@@ -40,9 +40,12 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     # Resume any evaluation backlog left unfinished by a prior process.
     evaluator.resume_pending_on_startup()
+    # Finish any application kit left mid-generation by a prior process.
+    kit_worker.resume_pending_on_startup()
     yield
     scheduler.shutdown()
     evaluator.shutdown()
+    kit_worker.shutdown()
 
 
 app = FastAPI(title="JobScout", version="0.1.0", lifespan=lifespan)

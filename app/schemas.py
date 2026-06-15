@@ -258,12 +258,70 @@ class MatchOut(BaseModel):
     # Whether the current user has marked this position applied (the "Mark applied"
     # toggle). Overlaid live at render time, not stored in saved snapshots.
     applied: bool = False
+    # Application-kit status for this position, overlaid live like ``applied``:
+    # None (no kit requested) | "generating" | "ok" | "error". Drives the job-list
+    # row's kit-status icon.
+    kit_status: str | None = None
 
 
 class ApplicationOut(_ORM):
     position_id: int
     status: str
     applied_at: datetime
+
+
+# ── Application kit (per-position detail page) ───────────────────────────────
+class OpenQuestionOut(BaseModel):
+    """One open application question the LLM detected for a posting, with how to
+    approach it and a draft answer grounded in the candidate's resume."""
+
+    question: str
+    advice: str = ""
+    suggested_answer: str = ""
+
+
+class ApplicationKitOut(BaseModel):
+    """The generated (or in-progress) application kit for one (user, position).
+    ``status`` is "generating" | "ok" | "error"; the content fields are populated
+    as the background worker completes, so a polling client sees partial results."""
+
+    status: str
+    looking_for: list[str] = Field(default_factory=list)
+    open_questions: list[OpenQuestionOut] = Field(default_factory=list)
+    cover_letter: str | None = None
+    # The tailored resume as copy-paste-ready Markdown, plus a short note on what
+    # was optimized for this position (shown below the resume, not part of the copy).
+    revised_resume: str | None = None
+    resume_optimization: str | None = None
+    model: str | None = None
+    error_detail: str | None = None
+    updated_at: datetime | None = None
+
+
+class PositionDetailOut(BaseModel):
+    """Everything the position detail page shows: the posting, the best stored
+    match (score/win/strengths/gaps), live applied status, and the cached kit (or
+    null when none has been generated yet)."""
+
+    position_id: int
+    company: str
+    title: str
+    location: str | None = None
+    department: str | None = None
+    employment_type: str | None = None
+    url: str | None = None
+    description: str | None = None
+    listed_at: str | None = None
+    match_score: int | None = None
+    win_probability: int | None = None
+    reasoning: str | None = None
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    # True when the best stored match for this position did not pass the relevance
+    # filter (score fields aren't meaningful) — the page shows a "not a match" pill.
+    non_matching: bool = False
+    applied: bool = False
+    kit: ApplicationKitOut | None = None
 
 
 class JobListRunOut(BaseModel):

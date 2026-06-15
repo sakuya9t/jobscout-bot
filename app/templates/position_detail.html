@@ -1,0 +1,428 @@
+{% extends "base.html" %}
+{% block title %}Position detail · JobScout{% endblock %}
+{% block body %}
+<style>
+  :root {
+    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
+    --muted:#68746e; --line:#d8e0dc; --accent:#0f766e; --accent-ink:#f5fffd;
+    --amber:#b76b00; --danger:#b42318; --good:#157347;
+  }
+  body { background:var(--page); color:var(--ink); }
+  a { color:var(--accent); }
+  header { display:none; }
+  button { background:var(--accent); color:var(--accent-ink); border-radius:8px;
+    border:0; padding:9px 16px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  main.detail { max-width:920px; margin:0 auto; padding:26px clamp(16px, 3vw, 32px); }
+  .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .brand-mark { font-size:20px; font-weight:800; }
+  .back { font-size:14px; }
+  .surface {
+    background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    padding:20px; margin-bottom:16px;
+  }
+  h1 { margin:0 0 6px; font-size:23px; line-height:1.25; }
+  h2 { margin:0 0 12px; font-size:17px; }
+  h3 { margin:0 0 6px; font-size:15px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .meta { color:var(--muted); font-size:14px; }
+  .score { color:var(--good); font-weight:800; font-size:18px; white-space:nowrap; }
+  .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+  .actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:16px; }
+  .apply-btn {
+    background:transparent; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:8px 14px; font-size:14px; font-weight:600; cursor:pointer;
+  }
+  .apply-btn:hover:not(.applied):not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .apply-btn.applied { background:var(--good); color:#fff; border-color:var(--good); }
+  .apply-btn:disabled { opacity:.6; cursor:default; }
+  .pill {
+    display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px;
+    font-size:12px; background:#eef7f5; color:var(--accent);
+  }
+  .pill.warn { background:#fff4df; color:var(--amber); }
+  .pill.bad { background:#f6e4e4; color:var(--danger); }
+  ul.tight { margin:6px 0; padding-left:20px; }
+  ul.tight li { margin:3px 0; }
+  .kit-controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
+  .qa { border-top:1px solid var(--line); padding:14px 0; }
+  .qa:first-child { border-top:0; }
+  .qa .q { font-weight:700; }
+  .qa .advice { color:var(--muted); font-size:13px; margin:6px 0; }
+  .doc {
+    background:#fbfdfc; border:1px solid var(--line); border-radius:8px;
+    padding:10px 14px 14px; margin-top:8px;
+  }
+  /* The Copy button lives in its own right-aligned bar above the text, so it can
+     never overlay the document's first line. */
+  .doc-bar { display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px; }
+  .doc pre {
+    margin:0; white-space:pre-wrap; word-wrap:break-word; font:14px/1.55 inherit; color:var(--ink);
+  }
+  .doc .copy {
+    font-size:12px; padding:5px 10px; border-radius:6px;
+    background:transparent; color:var(--ink); border:1px solid var(--line);
+  }
+  .doc .copy:hover { border-color:var(--accent); color:var(--accent); }
+  .spinner {
+    display:inline-block; width:15px; height:15px; border:2px solid var(--line);
+    border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;
+    vertical-align:-2px; margin-right:7px;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:#fbfdfc; }
+  .errbox { border:1px solid var(--danger); background:#fdecea; color:var(--danger); border-radius:8px; padding:12px 14px; }
+  .section-gap { margin-top:18px; }
+  /* Rendered (formatted) resume — Markdown turned into real headings/lists, and
+     the element the "Download PDF" print view isolates. */
+  .resume-rendered {
+    --resume-accent:#0f766e; --resume-ink:#17211d; --resume-muted:#58635e;
+    --resume-line:#d6e0dc; --resume-soft:#eef7f5;
+    background:#fff; color:var(--resume-ink); font:13.5px/1.48 inherit;
+    padding:28px 34px; border-radius:6px; box-shadow:0 1px 0 rgba(16,34,29,.04);
+    max-width:780px; margin:0 auto;
+  }
+  .resume-rendered h1 {
+    font-size:30px; line-height:1.08; margin:0; color:#10221d;
+    text-align:center; font-weight:850; letter-spacing:.02em;
+  }
+  .resume-rendered h1 + p {
+    text-align:center; color:var(--resume-muted); font-size:12.5px;
+    margin:6px auto 10px; max-width:680px;
+  }
+  .resume-rendered hr {
+    border:0; height:3px; width:86px; margin:12px auto 18px;
+    background:var(--resume-accent); border-radius:999px;
+  }
+  .resume-rendered h2 {
+    font-size:13px; margin:19px 0 7px; color:var(--resume-accent);
+    border-bottom:1px solid var(--resume-line); padding-bottom:4px;
+    text-transform:uppercase; letter-spacing:.12em; font-weight:850;
+  }
+  /* Each entry's company is a ### heading; the role title is the bold line under
+     it (body size), so the company never renders smaller than the position. */
+  .resume-rendered h3 {
+    font-size:15.5px; font-weight:800; margin:13px 0 1px; color:#13251f;
+  }
+  .resume-rendered h3 + p { margin-top:0; color:var(--resume-muted); }
+  .resume-rendered h3 + p strong { color:#27352f; font-weight:750; }
+  .resume-rendered p { margin:4px 0; }
+  .resume-rendered ul, .resume-rendered ol { margin:6px 0 8px; padding-left:0; list-style:none; }
+  .resume-rendered li {
+    position:relative; margin:4px 0; padding-left:15px;
+    break-inside:avoid;
+  }
+  .resume-rendered li::before {
+    content:""; position:absolute; left:0; top:.68em; width:5px; height:5px;
+    border-radius:50%; background:var(--resume-accent);
+  }
+  .resume-rendered a { color:var(--resume-accent); }
+  .resume-rendered code { background:var(--resume-soft); padding:1px 5px; border-radius:5px; }
+  .resume-rendered strong { font-weight:760; }
+  .resume-rendered em { color:var(--resume-muted); }
+  @page { margin:13mm; }
+  /* "Download PDF": clone the resume into #printRoot and print only that. Using
+     display (not visibility) lets a multi-page resume flow across pages cleanly. */
+  #printRoot { display:none; }
+  @media print {
+    body { background:#fff !important; }
+    body.printing main.detail { display:none !important; }
+    body.printing #printRoot { display:block !important; }
+    #printRoot .resume-rendered {
+      max-width:none; margin:0; padding:0; border-radius:0; box-shadow:none;
+      print-color-adjust:exact; -webkit-print-color-adjust:exact;
+    }
+    #printRoot .resume-rendered h2, #printRoot .resume-rendered h3 { break-after:avoid; }
+  }
+</style>
+
+<main class="detail">
+  <div class="topbar">
+    <div class="brand-mark">JobScout</div>
+    <a class="back" href="/#jobs">← Back to job list</a>
+  </div>
+
+  <div id="content">
+    <div class="surface"><span class="spinner"></span>Loading position…</div>
+  </div>
+</main>
+<!-- Print-only mount: filled with the rendered resume just before window.print(). -->
+<div id="printRoot"></div>
+
+<script>
+const POSITION_ID = {{ position_id | tojson }};
+const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts});
+const esc = s => (s==null?"":String(s)).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function fmtListed(value){
+  if(!value){ return ""; }
+  const d = new Date(value);
+  if(Number.isNaN(d.getTime())){ return ""; }
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if(days <= 0){ return "Listed today"; }
+  if(days === 1){ return "Listed yesterday"; }
+  if(days < 30){ return `Listed ${days} days ago`; }
+  return `Listed ${d.toLocaleDateString([], {dateStyle:"medium"})}`;
+}
+
+let detail = null;        // last loaded detail payload
+let kitPolling = false;
+
+async function loadDetail(){
+  let r;
+  try { r = await api(`/api/positions/${POSITION_ID}/detail`); }
+  catch(e){ r = null; }
+  if(!r || !r.ok){
+    document.getElementById("content").innerHTML = r && r.status === 404
+      ? `<div class="surface empty">This position isn't in your job list. <a href="/#jobs">Back to your jobs</a>.</div>`
+      : `<div class="surface errbox">Could not load this position.</div>`;
+    return;
+  }
+  detail = await r.json();
+  renderDetail();
+}
+
+function renderDetail(){
+  const m = detail;
+  const listed = fmtListed(m.listed_at);
+  const metaBits = [m.company, m.location, m.department, listed].filter(Boolean).map(esc).join(" · ");
+  const head = m.non_matching
+    ? `<span class="pill bad">not a match</span>`
+    : `<div class="score">${m.match_score}/100<div class="muted" style="text-align:right;">win ${m.win_probability}%</div></div>`;
+
+  const strengths = m.strengths || [];
+  const gaps = m.gaps || [];
+  const fit = (m.reasoning || strengths.length || gaps.length) ? `
+    <div class="surface">
+      <h2>How you line up</h2>
+      ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
+      ${strengths.length ? `<div class="section-gap"><h3>Your strengths</h3><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
+      ${gaps.length ? `<div class="section-gap"><h3>Your weak spots</h3><ul class="tight">${gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
+    </div>` : "";
+
+  document.getElementById("content").innerHTML = `
+    <div class="surface">
+      <div class="head-row">
+        <div>
+          <h1>${esc(m.title)}</h1>
+          <div class="meta">${metaBits}</div>
+        </div>
+        ${head}
+      </div>
+      <div class="actions">
+        <button type="button" id="applyBtn" class="apply-btn${m.applied ? " applied" : ""}"
+                aria-pressed="${m.applied ? "true" : "false"}" onclick="toggleApplied(this)">
+          ${m.applied ? "✓ Applied" : "Mark applied"}</button>
+        ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">Go to posting →</a>` : ""}
+      </div>
+    </div>
+    ${fit}
+    <div class="surface" id="kitSurface">
+      <h2>AI application kit</h2>
+      <p class="muted">A tailored cover letter, a revised resume, what this role is looking for,
+        and draft answers to its likely application questions — generated from your resume and this posting.</p>
+      <div class="kit-controls">
+        <button type="button" id="genBtn" onclick="generateKit()">Generate application kit</button>
+        <span id="kitStatus" class="muted"></span>
+      </div>
+      <div id="kitBody"></div>
+    </div>`;
+
+  renderKit(detail.kit);
+}
+
+function renderKit(kit){
+  const body = document.getElementById("kitBody");
+  const btn = document.getElementById("genBtn");
+  const statusEl = document.getElementById("kitStatus");
+  if(!body || !btn){ return; }
+
+  if(!kit){
+    btn.disabled = false;
+    btn.textContent = "Generate application kit";
+    statusEl.textContent = "";
+    body.innerHTML = "";
+    return;
+  }
+
+  if(kit.status === "generating"){
+    btn.disabled = true;
+    btn.textContent = "Generating…";
+    statusEl.innerHTML = `<span class="spinner"></span>Writing your kit — this takes ~30-60s. You can leave and come back.`;
+    if(!kit.cover_letter && !(kit.looking_for||[]).length){ body.innerHTML = ""; }
+    startKitPolling();
+    return;
+  }
+
+  btn.disabled = false;
+  btn.textContent = "Regenerate";
+  statusEl.textContent = kit.model ? `Generated with ${kit.model}.` : "";
+
+  if(kit.status === "error"){
+    body.innerHTML = `<div class="errbox">Generation failed: ${esc(kit.error_detail || "unknown error")}<br>
+      Check your LLM provider settings, then click <b>Regenerate</b>.</div>`;
+    return;
+  }
+
+  // status === "ok"
+  const looking = kit.looking_for || [];
+  const questions = kit.open_questions || [];
+  body.innerHTML = `
+    ${looking.length ? `<div class="section-gap"><h3>What this role is looking for</h3>
+      <ul class="tight">${looking.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
+    ${questions.length ? `<div class="section-gap"><h3>Application questions</h3>
+      ${questions.map(q => `<div class="qa">
+        <div class="q">${esc(q.question)}</div>
+        ${q.advice ? `<div class="advice">${esc(q.advice)}</div>` : ""}
+        ${q.suggested_answer ? docBlock(q.suggested_answer) : ""}
+      </div>`).join("")}</div>` : ""}
+    ${kit.cover_letter ? `<div class="section-gap"><h3>Cover letter</h3>${docBlock(kit.cover_letter)}</div>` : ""}
+    ${resumeSection(kit)}
+    ${(!looking.length && !questions.length && !kit.cover_letter && !kit.revised_resume)
+      ? `<div class="empty">The model returned an empty kit. Try Regenerate.</div>` : ""}`;
+}
+
+// A read-only document block with a copy button. The text is stored on a data
+// attribute (base64) so copy works regardless of HTML escaping.
+function docBlock(text){
+  const b64 = btoa(unescape(encodeURIComponent(text)));
+  return `<div class="doc">
+    <div class="doc-bar"><button type="button" class="copy" data-text="${b64}" onclick="copyDoc(this)">Copy</button></div>
+    <pre>${esc(text)}</pre></div>`;
+}
+
+async function copyDoc(btn){
+  const original = btn.dataset.label || btn.textContent;
+  btn.dataset.label = original;
+  const text = decodeURIComponent(escape(atob(btn.dataset.text)));
+  try { await navigator.clipboard.writeText(text); btn.textContent = "Copied!"; }
+  catch(e){ btn.textContent = "Copy failed"; }
+  setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500);
+}
+
+// The tailored resume is stored as Markdown; render it to real headings/lists for
+// reading + PDF, while keeping a "Copy Markdown" button for the raw source.
+function resumeSection(kit){
+  if(!kit.revised_resume){ return ""; }
+  const b64 = btoa(unescape(encodeURIComponent(kit.revised_resume)));
+  return `<div class="section-gap"><h3>Tailored resume</h3>
+    <div class="doc">
+      <div class="doc-bar">
+        <button type="button" class="copy" onclick="downloadResumePdf()">Download PDF</button>
+        <button type="button" class="copy" data-text="${b64}" data-label="Copy Markdown" onclick="copyDoc(this)">Copy Markdown</button>
+      </div>
+      <div id="printArea" class="resume-rendered">${mdToHtml(kit.revised_resume)}</div>
+    </div>
+    ${kit.resume_optimization ? `<p class="advice">${esc(kit.resume_optimization)}</p>` : ""}
+  </div>`;
+}
+
+// Print only the resume: copy the rendered resume into #printRoot, which the print
+// stylesheet shows in place of the page. The browser's own "Save as PDF" produces
+// the file — no external libraries.
+function downloadResumePdf(){
+  const src = document.getElementById("printArea");
+  const root = document.getElementById("printRoot");
+  if(!src || !root){ return; }
+  root.innerHTML = `<div class="resume-rendered">${src.innerHTML}</div>`;
+  document.body.classList.add("printing");
+  setTimeout(() => window.print(), 30);
+}
+window.addEventListener("afterprint", () => document.body.classList.remove("printing"));
+
+// Minimal, XSS-safe Markdown -> HTML for the resume subset the model emits
+// (#/##/### headings, -/*/+ and 1. lists, **bold**/*italic*, `code`, ---, links).
+// All text is HTML-escaped first, so the LLM output can never inject markup.
+function mdInline(s){
+  let out = esc(s);
+  out = out.replace(/\`([^\`]+)\`/g, (m, c) => `<code>${c}</code>`);
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  out = out.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, t, href) =>
+    /^(https?:\/\/|mailto:)/i.test(href.trim())
+      ? `<a href="${href.trim()}" target="_blank" rel="noopener">${t}</a>` : m);
+  return out;
+}
+
+function mdToHtml(md){
+  const lines = (md || "").replace(/\r\n?/g, "\n").split("\n");
+  let html = "", para = [], i = 0;
+  const flush = () => { if(para.length){ html += `<p>${para.map(mdInline).join("<br>")}</p>`; para = []; } };
+  const isItem = l => /^\s*([-*+]|\d+[.)])\s+/.test(l);
+  while(i < lines.length){
+    const line = lines[i];
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if(h){ flush(); const lvl = Math.min(h[1].length, 3); html += `<h${lvl}>${mdInline(h[2])}</h${lvl}>`; i++; continue; }
+    if(isItem(line)){
+      flush();
+      const tag = /^\s*\d+[.)]\s+/.test(line) ? "ol" : "ul";
+      html += `<${tag}>`;
+      while(i < lines.length && isItem(lines[i])){
+        html += `<li>${mdInline(lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, ""))}</li>`;
+        i++;
+      }
+      html += `</${tag}>`;
+      continue;
+    }
+    if(/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)){ flush(); html += "<hr>"; i++; continue; }
+    if(/^\s*$/.test(line)){ flush(); i++; continue; }
+    para.push(line);
+    i++;
+  }
+  flush();
+  return html;
+}
+
+async function generateKit(){
+  const btn = document.getElementById("genBtn");
+  btn.disabled = true;
+  const r = await api(`/api/positions/${POSITION_ID}/kit`, {method:"POST"});
+  if(!r.ok){
+    const d = await r.json().catch(()=>({}));
+    document.getElementById("kitStatus").textContent = d.detail || "Could not start generation.";
+    btn.disabled = false;
+    return;
+  }
+  renderKit(await r.json());   // -> "generating", which starts polling
+}
+
+function startKitPolling(){
+  if(kitPolling){ return; }
+  kitPolling = true;
+  setTimeout(pollKit, 4000);
+}
+
+async function pollKit(){
+  let kit = null;
+  try { const r = await api(`/api/positions/${POSITION_ID}/kit`); if(r.ok){ kit = await r.json(); } } catch(e){}
+  if(kit && kit.status !== "generating"){
+    kitPolling = false;
+    detail.kit = kit;
+    renderKit(kit);
+    return;
+  }
+  if(kit){ renderKit(kit); }   // refresh partial progress, keeps kitPolling truthy
+  setTimeout(pollKit, 4000);
+}
+
+async function toggleApplied(btn){
+  const applied = btn.classList.contains("applied");
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/applications/${POSITION_ID}`, {method: applied ? "DELETE" : "POST"});
+    if(!r.ok){ alert("Could not update application status"); return; }
+    const now = !applied;
+    btn.classList.toggle("applied", now);
+    btn.setAttribute("aria-pressed", now ? "true" : "false");
+    btn.textContent = now ? "✓ Applied" : "Mark applied";
+    if(detail){ detail.applied = now; }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+loadDetail();
+</script>
+{% endblock %}

@@ -32,3 +32,17 @@ def dashboard(request: Request, user: User | None = Depends(get_optional_user)):
     # Telegram state (token/link status) is loaded client-side from
     # /api/telegram-config, so the template only needs the user for the header.
     return templates.TemplateResponse(request, "dashboard.html", {"user": user})
+
+
+@router.get("/positions/{position_id}", response_class=HTMLResponse)
+def position_detail_page(
+    position_id: int, request: Request, user: User | None = Depends(get_optional_user)
+):
+    """Per-position detail page. Auth like the dashboard (anonymous -> /login); the
+    page's fetch() calls hit /api/positions/{id}/detail and handle a 404 (a position
+    not in this user's job list) client-side."""
+    if user is None:
+        return RedirectResponse("/login")
+    return templates.TemplateResponse(
+        request, "position_detail.html", {"user": user, "position_id": position_id}
+    )

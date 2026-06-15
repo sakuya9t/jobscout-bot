@@ -555,8 +555,6 @@ def test_run_drains_whole_backlog_to_zero(monkeypatch):
 def test_excluded_pairs_leave_the_backlog(monkeypatch):
     """A keyword-excluded pair gets an 'excluded' marker row (so the backlog
     converges to 0 and the drain terminates) instead of being silently dropped."""
-    from app.services import scraper
-
     with session_scope() as db:
         uid = _seed_user(db)
         # Exclude anything mentioning "backend" — the seeded position's title.
@@ -1594,3 +1592,257 @@ def test_ollama_logging_can_be_disabled(monkeypatch):
     llm_log.flush()
     with session_scope() as db:
         assert list(db.scalars(matcher.select(models.LlmLog))) == []
+
+
+# ── Application kit (per-position detail page) ───────────────────────────────
+class KitClient:
+    """Generation stub. chat_json branches on the schema: the analysis call returns
+    looking_for/open_questions, the resume call returns Markdown + an optimization
+    note. chat_text returns the cover letter."""
+    model = "fake-kit"
+
+    def __init__(self):
+        self.json_calls = 0
+        self.text_calls = 0
+
+    def chat_json(self, system, user, schema, temperature=0.2):
+        self.json_calls += 1
+        if "resume_markdown" in schema.get("properties", {}):
+            return {"resume_markdown": "# Jane Doe\n\n## Experience\n- Built Python APIs",
+                    "optimization_summary": "Reordered to lead with Python and distributed systems."}
+        return {
+            "looking_for": ["Strong Python", "Distributed systems"],
+            "open_questions": [
+                {"question": "Why do you want to work here?",
+                 "advice": "Tie your background to the mission.",
+                 "suggested_answer": "I admire the team's work on…"},
+            ],
+        }
+
+    def chat_text(self, system, user, temperature=0.4):
+        self.text_calls += 1
+        return "Dear hiring team, …"
+
+
+def _seeded_position(db, uid):
+    company = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    return db.scalar(matcher.select(models.Position).where(models.Position.company_id == company.id))
+
+
+def test_kit_generate_populates_all_fields():
+    from app.services import kits
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    client = KitClient()
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        pos = _seeded_position(db, uid)
+        kit = kits.generate(db, user, pos, client=client)
+        assert kit.status == "ok"
+    # Two structured calls (analysis + resume) + one free-text doc (cover letter).
+    assert client.json_calls == 2 and client.text_calls == 1
+    with session_scope() as db:
+        kit = db.scalar(matcher.select(models.ApplicationKit))
+        assert json.loads(kit.looking_for) == ["Strong Python", "Distributed systems"]
+        oq = json.loads(kit.open_questions)
+        assert oq[0]["question"] and oq[0]["advice"] and oq[0]["suggested_answer"]
+        assert kit.cover_letter.startswith("Dear hiring team")
+        # The tailored resume is copy-paste-ready Markdown + an optimization note.
+        assert kit.revised_resume.startswith("# Jane Doe")
+        assert "Reordered to lead with Python" in kit.resume_optimization
+        assert kit.model == "fake-kit" and kit.resume_id is not None
+
+
+def test_resume_prompt_requests_polished_markdown_structure():
+    from app.services import kits
+
+    assert "Professional Summary" in kits.RESUME_SYSTEM
+    assert "Core Skills" in kits.RESUME_SYSTEM
+    assert "Selected Impact" in kits.RESUME_SYSTEM
+    assert "Never use Markdown tables" in kits.RESUME_SYSTEM
+
+
+def test_kit_generate_error_keeps_partials():
+    """A failure on a later call leaves the kit in 'error' but keeps what already
+    completed (the analysis), so the page still shows partial results."""
+    from app.services import kits
+    from app.services.ollama_client import OllamaError
+
+    class TextFails(KitClient):
+        def chat_text(self, *a, **k):
+            raise OllamaError("Ollama returned 500: boom")
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        kit = kits.generate(db, db.get(models.User, uid), _seeded_position(db, uid), client=TextFails())
+        assert kit.status == "error" and "boom" in kit.error_detail
+    with session_scope() as db:
+        kit = db.scalar(matcher.select(models.ApplicationKit))
+        assert json.loads(kit.looking_for)  # analysis survived the later failure
+        assert kit.cover_letter is None and kit.revised_resume is None
+
+
+def test_kit_generate_without_resume_errors():
+    from app.services import kits
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.delete(db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)))
+    with session_scope() as db:
+        kit = kits.generate(db, db.get(models.User, uid), _seeded_position(db, uid), client=KitClient())
+        assert kit.status == "error" and "resume" in kit.error_detail.lower()
+
+
+def test_kit_worker_run_generates_kit(monkeypatch):
+    """The background worker body resolves the user's client and produces an 'ok'
+    kit (mirrors the evaluator drain test). Run synchronously for determinism."""
+    from app.services import kit_worker, kits
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        pid = _seeded_position(db, uid).id
+    monkeypatch.setattr(kits.llm, "clients_for_user", lambda db, user: (KitClient(), KitClient()))
+
+    kit_worker._run(uid, pid)
+
+    with session_scope() as db:
+        kit = db.scalar(matcher.select(models.ApplicationKit))
+        assert kit and kit.status == "ok" and kit.cover_letter and kit.revised_resume
+
+
+def test_position_detail_endpoint_returns_best_match(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:  # produce a passing match so the position is visible
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(score=88), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        d = c.get(f"/api/positions/{pid}/detail", headers=h).json()
+        assert d["position_id"] == pid and d["title"] == "Backend Engineer"
+        assert d["match_score"] == 88 and d["non_matching"] is False
+        assert d["strengths"] == ["Python"] and d["applied"] is False
+        assert d["kit"] is None  # nothing generated yet
+
+
+def test_position_detail_and_kit_require_visibility(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, kit_worker
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    kicked = []
+    monkeypatch.setattr(kit_worker, "ensure_generating", lambda u, p: kicked.append((u, p)))
+    with session_scope() as db:
+        uid = _seed_user(db)
+        unseen_pid = _seeded_position(db, uid).id  # exists, but no MatchResult for the user
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.get(f"/api/positions/{unseen_pid}/detail", headers=h).status_code == 404
+        assert c.get(f"/api/positions/{unseen_pid}/kit", headers=h).status_code == 404
+        assert c.post(f"/api/positions/{unseen_pid}/kit", headers=h).status_code == 404
+        assert c.get("/api/positions/999999/detail", headers=h).status_code == 404
+    assert kicked == []  # an invisible position never reaches the worker
+
+
+def test_generate_kit_kicks_worker_and_polls(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, kit_worker
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    kicked = []
+    monkeypatch.setattr(kit_worker, "ensure_generating", lambda u, p: kicked.append((u, p)))
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.get(f"/api/positions/{pid}/kit", headers=h).status_code == 404  # none yet
+        r = c.post(f"/api/positions/{pid}/kit", headers=h)
+        assert r.status_code == 202 and r.json()["status"] == "generating"
+        assert kicked == [(uid, pid)]
+        polled = c.get(f"/api/positions/{pid}/kit", headers=h).json()
+        assert polled["status"] == "generating"
+        # Re-posting (regenerate) re-arms the worker.
+        c.post(f"/api/positions/{pid}/kit", headers=h)
+        assert kicked == [(uid, pid), (uid, pid)]
+    # The detail payload now carries the in-progress kit.
+    with TestClient(app) as c:
+        d = c.get(f"/api/positions/{pid}/detail", headers=h).json()
+        assert d["kit"]["status"] == "generating"
+
+
+def test_generate_kit_requires_resume(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, kit_worker
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    monkeypatch.setattr(kit_worker, "ensure_generating", lambda u, p: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+        # Deactivate (don't delete) the resume: the scored match — and thus the
+        # position's visibility — survives, but there's no *active* resume to tailor.
+        db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)).is_active = False
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.post(f"/api/positions/{pid}/kit", headers=h).status_code == 400
+
+
+def test_kit_cascades_on_resume_and_user_delete():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        pos = _seeded_position(db, uid)
+        resume = db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid))
+        db.add(models.ApplicationKit(user_id=uid, position_id=pos.id, resume_id=resume.id, status="ok"))
+        db.flush()
+    # Replacing/deleting the tailored resume drops the (now-stale) kit.
+    with session_scope() as db:
+        db.delete(db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)))
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.ApplicationKit))) == []
+        # Re-add a kit, then deleting the user cascades it too.
+        pos = _seeded_position(db, uid)
+        db.add(models.ApplicationKit(user_id=uid, position_id=pos.id, status="ok"))
+    with session_scope() as db:
+        db.delete(db.get(models.User, uid))
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.ApplicationKit))) == []
+
+
+def test_job_list_surfaces_kit_status(monkeypatch):
+    """The job list overlays each position's application-kit status (live, like
+    'applied') so the row can show a generating/ready icon."""
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # No kit yet -> kit_status is null.
+        before = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert all(it["kit_status"] is None for it in before["items"])
+    with session_scope() as db:
+        db.add(models.ApplicationKit(user_id=uid, position_id=pid, status="generating"))
+    with TestClient(app) as c:
+        gen = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and it["kit_status"] == "generating" for it in gen["items"])
+    with session_scope() as db:
+        db.scalar(matcher.select(models.ApplicationKit)).status = "ok"
+    with TestClient(app) as c:
+        done = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and it["kit_status"] == "ok" for it in done["items"])

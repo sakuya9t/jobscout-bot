@@ -160,7 +160,9 @@ def get_job_list(
         ]
     start = max(0, offset)
     page = all_items[start : start + _safe_limit(limit)]
-    reporter.tag_applied(db, user, page)  # overlay live applied status onto the frozen list
+    # Overlay live applied + kit status onto the frozen list.
+    reporter.tag_applied(db, user, page)
+    reporter.tag_kit_status(db, user, page)
     errors = reporter.job_list_errors(snapshot)
     return JobListOut(
         id=snapshot.id,
