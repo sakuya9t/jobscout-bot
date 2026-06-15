@@ -959,6 +959,124 @@ def test_filter_items_posted_within_keeps_undated():
     assert reporter.filter_items_posted_within(items, None) == items
 
 
+# ── Application status ("Mark applied") ──────────────────────────────────────
+def _first_matched_position_id(db, uid):
+    return db.scalar(
+        matcher.select(models.MatchResult.position_id)
+        .where(models.MatchResult.user_id == uid)
+        .limit(1)
+    )
+
+
+def _add_match(db, uid, position_id, score=80):
+    """Give user ``uid`` a (passing) MatchResult on an existing position, so that
+    position shows in their job list and is markable-applied."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    db.add(models.MatchResult(
+        user_id=uid, position_id=position_id, resume_id=rid, interest_id=interest.id,
+        passed_filter=True, match_score=score, win_probability=score, reasoning="r", model="good"))
+    db.flush()
+
+
+def test_mark_and_unmark_applied(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        listed = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert all(it["applied"] is False for it in listed["items"])  # nothing applied yet
+
+        r = c.post(f"/api/applications/{pid}", headers=h)
+        assert r.status_code == 201 and r.json()["position_id"] == pid and r.json()["status"] == "applied"
+        assert c.post(f"/api/applications/{pid}", headers=h).status_code == 201  # idempotent
+
+        after = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and it["applied"] for it in after["items"])
+        assert [a["position_id"] for a in c.get("/api/applications", headers=h).json()] == [pid]
+
+        assert c.delete(f"/api/applications/{pid}", headers=h).status_code == 204
+        assert c.delete(f"/api/applications/{pid}", headers=h).status_code == 204  # idempotent
+        cleared = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert all(not it["applied"] for it in cleared["items"])
+        assert c.get("/api/applications", headers=h).json() == []
+
+
+def test_mark_applied_rejects_position_not_in_job_list(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)  # no real background drain
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # A position the user has no MatchResult for is invisible to them -> 404.
+        assert c.post("/api/applications/999999", headers=h).status_code == 404
+        assert c.get("/api/applications", headers=h).json() == []
+
+
+def test_applied_status_is_per_user(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid_a = _seed_user(db, email="a@x.com")
+        _seed_match_mix(db, uid_a)
+        pid = _first_matched_position_id(db, uid_a)
+        uid_b = _seed_user(db, email="b@x.com")
+        _add_match(db, uid_b, pid)  # B is matched on the SAME position
+    ha = {"Authorization": f"Bearer {create_access_token(uid_a)}"}
+    hb = {"Authorization": f"Bearer {create_access_token(uid_b)}"}
+    with TestClient(app) as c:
+        assert c.post(f"/api/applications/{pid}", headers=ha).status_code == 201
+        # B sees the same position but it's NOT applied for them, and B has no apps.
+        mb = c.get("/api/job-lists/latest?category=matching&limit=50", headers=hb).json()
+        assert any(it["position_id"] == pid and it["applied"] is False for it in mb["items"])
+        assert c.get("/api/applications", headers=hb).json() == []
+
+
+def test_applied_overlaid_on_frozen_snapshot():
+    from app.routers.reports import get_job_list
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        matcher.run_for_user(db, user, client=GoodClient(score=88), filter_client=FilterPass())
+        snap = reporter.record_job_list_snapshot(
+            db, user, SimpleNamespace(new_positions=0, scored=1, filtered=0, errors=[])
+        )
+        pid = reporter.job_list_items(snap)[0]["position_id"]
+
+        before = get_job_list(snap.id, user=user, db=db)
+        assert before.items and all(not it.applied for it in before.items)
+
+        db.add(models.Application(user_id=uid, position_id=pid))
+        db.commit()
+        after = get_job_list(snap.id, user=user, db=db)
+        assert any(it.position_id == pid and it.applied for it in after.items)
+
+
+def test_applications_cascade_on_user_delete():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _seed_match_mix(db, uid)
+        db.add(models.Application(user_id=uid, position_id=_first_matched_position_id(db, uid)))
+        db.commit()
+        assert len(list(db.scalars(matcher.select(models.Application)))) == 1
+        db.delete(db.get(models.User, uid))
+        db.commit()
+        assert list(db.scalars(matcher.select(models.Application))) == []
+
+
 def test_score_filter_exempts_non_matching_in_all_category():
     with session_scope() as db:
         uid = _seed_user(db)

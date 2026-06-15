@@ -47,6 +47,9 @@ class User(Base):
     job_list_snapshots: Mapped[list[JobListSnapshot]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    applications: Mapped[list[Application]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class JobListSnapshot(Base):
@@ -197,6 +200,9 @@ class Position(Base):
     matches: Mapped[list[MatchResult]] = relationship(
         back_populates="position", cascade="all, delete-orphan"
     )
+    applications: Mapped[list[Application]] = relationship(
+        back_populates="position", cascade="all, delete-orphan"
+    )
 
 
 class MatchResult(Base):
@@ -229,6 +235,30 @@ class MatchResult(Base):
     position: Mapped[Position] = relationship(back_populates="matches")
     resume: Mapped[Resume | None] = relationship(back_populates="matches")
     interest: Mapped[Interest | None] = relationship(back_populates="matches")
+
+
+class Application(Base):
+    """A user's application status for one position. Today it's set manually from
+    the dashboard ("Mark applied"); the phase 2/3 auto-apply will create and
+    advance these same rows — hence the ``status``/``source`` fields rather than a
+    bare boolean. One row per (user, position); its absence means "not applied"."""
+
+    __tablename__ = "applications"
+    __table_args__ = (
+        UniqueConstraint("user_id", "position_id", name="uq_application_user_position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    position_id: Mapped[int] = mapped_column(ForeignKey("positions.id"), index=True)
+    # Room to grow for auto-apply: e.g. applied | pending | auto_applied | failed.
+    status: Mapped[str] = mapped_column(String(32), default="applied")
+    source: Mapped[str] = mapped_column(String(16), default="manual")  # manual | auto
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="applications")
+    position: Mapped[Position] = relationship(back_populates="applications")
 
 
 class LlmLog(Base):

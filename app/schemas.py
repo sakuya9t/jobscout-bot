@@ -161,6 +161,15 @@ class MatchOut(BaseModel):
     # Effective "listed" date (ISO, naive UTC): the ATS post date when known, else
     # when our crawler first saw it. Drives the dashboard's post-date filter/label.
     listed_at: str | None = None
+    # Whether the current user has marked this position applied (the "Mark applied"
+    # toggle). Overlaid live at render time, not stored in saved snapshots.
+    applied: bool = False
+
+
+class ApplicationOut(_ORM):
+    position_id: int
+    status: str
+    applied_at: datetime
 
 
 class JobListRunOut(BaseModel):

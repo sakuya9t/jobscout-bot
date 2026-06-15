@@ -8,7 +8,15 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..models import Company, Interest, JobListSnapshot, MatchResult, Position, User
+from ..models import (
+    Application,
+    Company,
+    Interest,
+    JobListSnapshot,
+    MatchResult,
+    Position,
+    User,
+)
 from ..timeutil import utcnow
 from .matcher import ERROR_MODEL
 
@@ -50,7 +58,27 @@ def _match_row(match: MatchResult, pos: Position, company: Company, *,
         "non_matching": non_matching,
         "scored_at": match.created_at.isoformat() if match.created_at else None,
         "listed_at": listed.isoformat() if listed else None,
+        "applied": False,  # overlaid per-user by tag_applied (live, not stored)
     }
+
+
+def tag_applied(db: Session, user: User, items: list[dict]) -> list[dict]:
+    """Set each item's ``applied`` flag from the user's Application rows. Done at
+    render time (not stored) so the toggle reflects the latest status even on a
+    frozen saved list. Mutates and returns ``items``."""
+    ids = [m["position_id"] for m in items if m.get("position_id") is not None]
+    if not ids:
+        return items
+    applied = set(
+        db.scalars(
+            select(Application.position_id).where(
+                Application.user_id == user.id, Application.position_id.in_(ids)
+            )
+        )
+    )
+    for m in items:
+        m["applied"] = m.get("position_id") in applied
+    return items
 
 
 def build_report(
@@ -188,6 +216,7 @@ def build_job_list(
         non_matching = not match.passed_filter
         below = (not non_matching) and match.match_score < thresholds.get(match.interest_id, 70)
         items.append(_match_row(match, pos, company, below_threshold=below, non_matching=non_matching))
+    tag_applied(db, user, items)
     return items, total
 
 

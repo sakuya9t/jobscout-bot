@@ -100,6 +100,15 @@
   .job-title { font-weight:750; font-size:16px; }
   .job-meta { color:var(--muted); font-size:13px; }
   .score { color:var(--good); font-weight:800; white-space:nowrap; }
+  /* Per-job footer: the application toggle + the posting link on one baseline. */
+  .job-actions { display:flex; align-items:center; gap:14px; margin-top:2px; }
+  .apply-btn {
+    background:transparent; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:6px 12px; font-size:13px;
+  }
+  .apply-btn:hover:not(.applied):not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .apply-btn.applied { background:var(--good); color:#fff; border-color:var(--good); }
+  .apply-btn:disabled { opacity:.6; cursor:default; }
   .pill {
     display:inline-flex; align-items:center; min-height:22px; padding:2px 8px;
     border-radius:999px; font-size:12px; background:#eef7f5; color:var(--accent);
@@ -633,6 +642,23 @@ function setJobMode(mode){
   loadJobList();
 }
 
+// Toggle a position's applied status in place (no list reload, so scroll/paging
+// are preserved). The button reflects the new state on success.
+async function toggleApplied(positionId, btn){
+  const applied = btn.classList.contains("applied");
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/applications/${positionId}`, {method: applied ? "DELETE" : "POST"});
+    if(!r.ok){ alert("Could not update application status"); return; }
+    const now = !applied;
+    btn.classList.toggle("applied", now);
+    btn.setAttribute("aria-pressed", now ? "true" : "false");
+    btn.textContent = now ? "✓ Applied" : "Mark applied";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function setPageSize(){
   pageSize = parseInt(document.getElementById("pageSize").value, 10) || 10;
   pageOffset = 0;
@@ -758,7 +784,12 @@ function renderJobList(data){
       ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
       ${strengths.length ? `<div class="muted">Strengths</div><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>` : ""}
       ${gaps.length ? `<div class="muted">Watch-outs</div><ul class="tight">${gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>` : ""}
-      ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">View posting</a>` : ""}
+      <div class="job-actions">
+        <button type="button" class="apply-btn${m.applied ? " applied" : ""}"
+                aria-pressed="${m.applied ? "true" : "false"}"
+                onclick="toggleApplied(${m.position_id}, this)">${m.applied ? "✓ Applied" : "Mark applied"}</button>
+        ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">View posting</a>` : ""}
+      </div>
     </article>`;
   }).join("") || '<div class="empty">No positions in this list yet.</div>';
 }
