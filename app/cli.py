@@ -10,10 +10,14 @@ Commands:
   backfill-descriptions
                    Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
                    whose search API returns none, so older postings become scoreable.
+  migrate-db       Copy schema + data to another database (e.g. SQLite -> Supabase
+                   Postgres) to publish the app on a hosted DB.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sys
 
 
@@ -139,6 +143,83 @@ def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _redact_url(url: str) -> str:
+    """Mask the password in a DB URL for safe printing."""
+    return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", url)
+
+
+def cmd_migrate_db(args: argparse.Namespace) -> int:
+    """Copy schema + all rows from the current database (``settings.database_url``,
+    e.g. the local SQLite file) into a target database (e.g. Supabase Postgres).
+
+    Creates the schema on the target from the ORM models, copies every table in
+    FK-safe dependency order, then fixes Postgres autoincrement sequences so future
+    inserts don't collide with the copied ids. Encrypted columns (company_accounts)
+    copy as-is — decryption keeps working only if the target deployment uses the
+    SAME JOBSCOUT_SECRET_KEY. ``--drop`` recreates the target schema first (so a
+    re-run is clean); without it the target must be empty."""
+    from sqlalchemy import create_engine, func, select, text
+
+    from . import models
+    from .config import settings
+    from .db import engine as source_engine
+
+    target_url = args.target or os.environ.get("JOBSCOUT_TARGET_DATABASE_URL")
+    if not target_url:
+        print("No target. Pass --target <url> or set JOBSCOUT_TARGET_DATABASE_URL.",
+              file=sys.stderr)
+        return 2
+    if target_url == settings.database_url:
+        print("Target is the same as the source — nothing to do.", file=sys.stderr)
+        return 2
+
+    print(f"Source: {_redact_url(settings.database_url)}")
+    print(f"Target: {_redact_url(target_url)}")
+    target_engine = create_engine(target_url, future=True)
+    md = models.Base.metadata
+
+    try:
+        if args.drop:
+            print("Recreating target schema (--drop)…")
+            md.drop_all(target_engine)
+        md.create_all(target_engine)
+
+        total = 0
+        with source_engine.connect() as src, target_engine.begin() as dst:
+            for table in md.sorted_tables:
+                rows = [dict(r._mapping) for r in src.execute(select(table))]
+                for i in range(0, len(rows), args.batch):
+                    dst.execute(table.insert(), rows[i : i + args.batch])
+                print(f"  {table.name:24} {len(rows):>6} rows")
+                total += len(rows)
+
+            # Postgres: copied rows carry explicit ids, so the SERIAL sequences are
+            # still at 1 and the next insert would collide. Advance each to MAX(id).
+            if dst.dialect.name == "postgresql":
+                for table in md.sorted_tables:
+                    if "id" not in table.c or not table.c.id.primary_key:
+                        continue
+                    max_id = dst.execute(select(func.max(table.c.id))).scalar()
+                    if max_id is None:
+                        continue
+                    seq = dst.execute(
+                        text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table.name}
+                    ).scalar()
+                    if seq:
+                        dst.execute(text("SELECT setval(:s, :v, true)"), {"s": seq, "v": max_id})
+                print("  (reset Postgres id sequences)")
+    except Exception as exc:  # noqa: BLE001 — surface the failure, leave target as-is
+        print(f"Migration failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        target_engine.dispose()
+
+    print(f"Done — copied {total} rows across {len(md.sorted_tables)} tables.")
+    print("Next: set JOBSCOUT_DATABASE_URL to the target (same JOBSCOUT_SECRET_KEY) "
+          "and restart the app.")
+    return 0
+
+
 def cmd_token(args: argparse.Namespace) -> int:
     from sqlalchemy import select
 
@@ -186,6 +267,13 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0,
                    help="Max postings to fetch per company (0 = all description-less rows)")
     p.set_defaults(func=cmd_backfill_descriptions)
+
+    p = sub.add_parser("migrate-db",
+                       help="Copy schema + data to another DB (e.g. SQLite -> Supabase Postgres)")
+    p.add_argument("--target", help="Target SQLAlchemy URL (or set JOBSCOUT_TARGET_DATABASE_URL)")
+    p.add_argument("--drop", action="store_true", help="Recreate the target schema first")
+    p.add_argument("--batch", type=int, default=1000, help="Rows per insert batch")
+    p.set_defaults(func=cmd_migrate_db)
 
     p = sub.add_parser("token", help="Mint a bearer token for a user")
     p.add_argument("email")

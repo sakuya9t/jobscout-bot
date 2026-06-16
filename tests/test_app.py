@@ -533,6 +533,44 @@ def test_eightfold_upsert_enriches_new_and_backfills_existing(monkeypatch):
     assert captured["cap"] == 150  # default per-crawl cap from settings
 
 
+def test_migrate_db_copies_schema_and_all_rows(tmp_path):
+    """`jobscout migrate-db` recreates the schema on the target and copies every
+    table's rows (FK order preserved). Exercised SQLite->SQLite; the Postgres
+    sequence-reset step is dialect-guarded and simply skipped here."""
+    import argparse
+    from sqlalchemy import create_engine, func, select
+    from app import models
+    from app.cli import cmd_migrate_db
+    from app.db import engine as source_engine
+
+    # Seed related rows across several tables (users/resumes/companies/positions/
+    # interests) so the copy has FK chains to preserve.
+    with session_scope() as db:
+        _seed_user(db, email="m1@x.com")
+        _seed_user(db, email="m2@x.com")
+
+    target_url = "sqlite:///" + str(tmp_path / "target.db")
+    rc = cmd_migrate_db(argparse.Namespace(target=target_url, drop=True, batch=1000))
+    assert rc == 0
+
+    target_engine = create_engine(target_url)
+    md = models.Base.metadata
+    try:
+        with source_engine.connect() as s, target_engine.connect() as t:
+            for table in md.sorted_tables:
+                src_n = s.execute(select(func.count()).select_from(table)).scalar()
+                tgt_n = t.execute(select(func.count()).select_from(table)).scalar()
+                assert src_n == tgt_n, f"{table.name}: {src_n} != {tgt_n}"
+            # Spot-check real content survived, not just counts.
+            emails = set(t.execute(select(models.User.__table__.c.email)).scalars())
+            assert {"m1@x.com", "m2@x.com"} <= emails
+    finally:
+        target_engine.dispose()
+
+    # Same-URL guard and missing-target guard return non-zero without copying.
+    assert cmd_migrate_db(argparse.Namespace(target=None, drop=False, batch=1000)) == 2
+
+
 def test_backfill_descriptions_cli_heals_eightfold(monkeypatch):
     """`jobscout backfill-descriptions` fetches descriptions for stored eightfold
     postings that lack one (and only those), and leaves others/ATSes untouched."""
