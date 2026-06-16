@@ -175,6 +175,7 @@ def build_job_list(
     min_score: int = 0,
     min_win: int = 0,
     posted_within_days: int | None = None,
+    company_id: int | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
@@ -194,13 +195,18 @@ def build_job_list(
     (None/<=0 = off), by the job's effective listed date — the ATS post date, or
     our first-seen date when the source carries none. The filter is applied to the
     query before counting/paging, so ``total`` and the top-N (e.g. top-5) selection
-    both reflect only the date-filtered pool."""
+    both reflect only the date-filtered pool.
+
+    ``company_id`` (None = all) narrows to one company's postings, applied — like
+    the date filter — before counting/paging so the total reflects the scope."""
     base = (
         select(MatchResult, Position, Company)
         .join(Position, MatchResult.position_id == Position.id)
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id)
     )
+    if company_id is not None:
+        base = base.where(Position.company_id == company_id)
     if posted_within_days and posted_within_days > 0:
         cutoff = utcnow() - timedelta(days=posted_within_days)
         base = base.where(
@@ -355,6 +361,15 @@ def filter_items_posted_within(items: list[dict], posted_within_days: int | None
         if listed is None or listed >= cutoff:
             kept.append(item)
     return kept
+
+
+def filter_items_by_company(items: list[dict], company_name: str | None) -> list[dict]:
+    """Keep stored job-list items for one company (exact ``company`` name match).
+    No-op when ``company_name`` is falsy. Used on the frozen-snapshot path, whose
+    items carry the company name (not its id) — the caller resolves id -> name."""
+    if not company_name:
+        return items
+    return [m for m in items if m.get("company") == company_name]
 
 
 # Substrings that mark a run warning as an LLM-communication failure (vs a scrape

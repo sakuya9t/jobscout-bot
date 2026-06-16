@@ -358,12 +358,22 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
         return [], [f"{company.name}: unexpected scrape error: {exc}"]
 
     new_positions: list[Position] = []
+    # Positions still missing a description that this ATS only exposes on the job
+    # detail page (eightfold): (position, detail_url), newest-first. Covers both
+    # freshly-inserted rows and previously-stored description-less ones (backfill).
+    needs_desc: list[tuple[Position, str]] = []
+    detail_desc = company.ats_type == "eightfold"  # only ATS that needs a detail fetch
     existing = {
         p.external_id: p
         for p in db.scalars(select(Position).where(Position.company_id == company.id))
     }
     for sp in scraped:
-        if sp.external_id in existing:
+        known = existing.get(sp.external_id)
+        if known is not None:
+            # Heal a stored row that has no description once the detail fetch can
+            # supply one (e.g. the whole eightfold board predates this fix).
+            if detail_desc and sp.url and not (known.description or "").strip():
+                needs_desc.append((known, sp.url))
             continue
         pos = Position(
             company_id=company.id,
@@ -381,6 +391,18 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
         # Guard against a board repeating an id within one scrape — a second
         # row would violate uq_position_company_extid and abort the whole run.
         existing[sp.external_id] = pos
+        if detail_desc and sp.url and not (sp.description or "").strip():
+            needs_desc.append((pos, sp.url))
+
+    if detail_desc and needs_desc and settings.scrape_eightfold_max_descriptions > 0:
+        descs = scraper.fetch_eightfold_descriptions(
+            [url for _, url in needs_desc], settings.scrape_eightfold_max_descriptions
+        )
+        for pos, url in needs_desc:
+            text = descs.get(url)
+            if text:
+                pos.description = text
+
     company.last_scraped_at = utcnow()
     db.flush()  # assign ids
     return new_positions, errors

@@ -364,6 +364,54 @@ def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPositi
 # ``ats_token``; if omitted we derive it by stripping a leading careers subdomain.
 _EIGHTFOLD_PAGE = 10
 _CAREERS_SUBDOMAINS = {"jobs", "careers", "career", "job", "apply", "talent", "recruiting"}
+# Pull JSON-LD <script> blocks out of an eightfold job detail page.
+_LD_JSON_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.S
+)
+
+
+def _eightfold_description(url: str) -> str | None:
+    """Fetch one eightfold job detail page and extract its description from the
+    schema.org JobPosting JSON-LD block (the PCSX search API returns none). Best
+    effort: any fetch/parse failure yields None so one bad page never breaks the
+    batch. The description is HTML, so it's stripped to plain text like the others."""
+    try:
+        html = _fetch_text(url)
+    except ScrapeError:
+        return None
+    for block in _LD_JSON_RE.findall(html):
+        try:
+            data = _json.loads(block)
+        except _json.JSONDecodeError:
+            continue
+        for obj in data if isinstance(data, list) else [data]:
+            if isinstance(obj, dict) and obj.get("description"):
+                stripped = _strip_html(obj["description"])
+                if stripped:
+                    return stripped
+    return None
+
+
+def fetch_eightfold_descriptions(
+    urls: list[str], cap: int, max_workers: int | None = None
+) -> dict[str, str]:
+    """Concurrently fetch JSON-LD descriptions for up to ``cap`` eightfold job pages
+    (in the order given — callers pass newest-first). Returns ``{url: description}``
+    for the pages that resolved one. Concurrency is bounded (``max_workers``,
+    default ``scrape_eightfold_desc_workers``) so a crawl fetches in small batches
+    rather than firing hundreds of requests at once."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = max_workers or settings.scrape_eightfold_desc_workers
+    targets = [u for u in dict.fromkeys(urls) if u][: max(0, cap)]
+    if not targets or workers < 1:
+        return {}
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for url, desc in zip(targets, pool.map(_eightfold_description, targets)):
+            if desc:
+                out[url] = desc
+    return out
 
 
 def _eightfold_domain(careers_url: str, explicit: str | None) -> str:

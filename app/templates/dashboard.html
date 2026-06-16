@@ -209,6 +209,12 @@
               <option value="0">All time</option>
             </select>
           </div>
+          <div class="control">
+            <label for="jobCompany">Company</label>
+            <select id="jobCompany" onchange="setCompanyFilter()">
+              <option value="">All companies</option>
+            </select>
+          </div>
           <div class="segmented" id="jobModes" role="tablist" aria-label="Job list view">
             <button type="button" class="seg active" role="tab" data-mode="top5"
                     aria-selected="true" onclick="setJobMode('top5')">Top 5</button>
@@ -602,6 +608,7 @@ let pageOffset = 0;
 let minScore = 0;           // match-score floor: 0 (default) | 50 | 75 | 90
 let minWin = 0;             // win-rate floor: 0 (default) | 50 | 75 | 90
 let postedWithin = 7;       // post-date window in days: 1 | 3 | 7 (default) | 30 | 0 (all)
+let companyFilter = "";     // watch-list company id (string); "" = all companies
 let selectedSnapshotId = null;
 const JOB_MODES = ["top5", "matching", "all"];
 let hasActiveResume = false;
@@ -878,6 +885,7 @@ async function loadCompanies(){
        <span class="muted">${esc(x.careers_url||"")}</span></span>
        <button class="ghost" onclick="delCompany(${x.id})">Remove</button></div>`).join("") ||
     '<div class="empty">No companies on the watchlist.</div>';
+  loadJobCompanyOptions();  // keep the job-list company filter in sync with the list
 }
 
 async function delCompany(id){ await api(`/api/companies/${id}`,{method:"DELETE"}); await loadCompanies(); }
@@ -1063,6 +1071,26 @@ function setDateFilter(){
   loadJobList();
 }
 
+// Populate the job-list "Company" filter from the user's watch-list, preserving
+// the current selection across reloads (and resetting to "all" if it's gone).
+async function loadJobCompanyOptions(){
+  const r = await api("/api/companies");
+  if(!r.ok){ return; }
+  const list = await r.json();
+  const sel = document.getElementById("jobCompany");
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">All companies</option>' +
+    list.map(x => `<option value="${x.id}">${esc(x.name)}</option>`).join("");
+  if([...sel.options].some(o => o.value === keep)){ sel.value = keep; }
+  else { companyFilter = ""; }
+}
+
+function setCompanyFilter(){
+  companyFilter = document.getElementById("jobCompany").value;
+  pageOffset = 0;
+  loadJobList();
+}
+
 function prevPage(){
   pageOffset = Math.max(0, pageOffset - pageSize);
   loadJobList();
@@ -1086,6 +1114,7 @@ async function loadJobList(){
   const base = selectedSnapshotId ? `/api/job-lists/${selectedSnapshotId}` : "/api/job-lists/latest";
   let q = `limit=${limit}&offset=${offset}&category=${category}&min_score=${ms}&min_win=${mw}`;
   if(postedWithin > 0){ q += `&posted_within_days=${postedWithin}`; }
+  if(companyFilter){ q += `&company_id=${encodeURIComponent(companyFilter)}`; }
   const r = await api(`${base}?${q}`);
   if(!r.ok){
     document.getElementById("jobList").innerHTML = '<div class="empty">Could not load this job list.</div>';
@@ -1428,6 +1457,7 @@ showView(initialView);
 loadResumes();
 loadPresets();
 loadCompanies();
+loadJobCompanyOptions();
 loadInterests();
 loadProfile();
 loadLlmConfig();

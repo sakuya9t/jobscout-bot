@@ -7,6 +7,9 @@ Commands:
   init-db          Create database tables.
   health           Check DB + Ollama connectivity.
   token <email>    Mint a bearer token for a user (for MCP / API clients).
+  backfill-descriptions
+                   Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
+                   whose search API returns none, so older postings become scoreable.
 """
 from __future__ import annotations
 
@@ -81,6 +84,61 @@ def cmd_health(_: argparse.Namespace) -> int:
     return 0 if db_ok and ollama != "unreachable" else 1
 
 
+def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
+    """Backfill descriptions for already-stored eightfold postings (NVIDIA et al.).
+
+    The PCSX search API carries no description, so positions scraped before the
+    detail-page enrichment landed are description-less and the matcher skips them.
+    This fetches each one's JSON-LD description (batched, bounded concurrency) and
+    updates it in place. Idempotent — re-running only touches still-empty rows.
+    Targeted: only postings that have a URL and an empty description are fetched, so
+    it never re-hits the search API or the other ATSes."""
+    from sqlalchemy import select
+
+    from .db import init_db, session_scope
+    from .models import Company, Position
+    from .services import scraper
+
+    init_db()
+    total = 0
+    with session_scope() as db:
+        companies = list(db.scalars(
+            select(Company).where(Company.ats_type == "eightfold", Company.is_active == True)  # noqa: E712
+        ))
+        if args.company:
+            key = args.company.strip().lower()
+            companies = [c for c in companies
+                         if (c.preset_key or "").lower() == key or c.name.lower() == key]
+        if not companies:
+            print("No matching active eightfold companies.", file=sys.stderr)
+            return 1
+        for company in companies:
+            empties = [
+                p for p in db.scalars(select(Position).where(Position.company_id == company.id))
+                if p.url and not (p.description or "").strip()
+            ]
+            cap = args.limit if args.limit and args.limit > 0 else len(empties)
+            urls = [p.url for p in empties][:cap]
+            if not urls:
+                print(f"{company.name}: nothing to backfill.")
+                continue
+            print(f"{company.name}: fetching {len(urls)} of {len(empties)} "
+                  f"description-less posting(s)…")
+            descs = scraper.fetch_eightfold_descriptions(urls, cap=len(urls))
+            updated = 0
+            for p in empties:
+                text = descs.get(p.url)
+                if text:
+                    p.description = text
+                    updated += 1
+            db.commit()  # release the write lock between companies
+            total += updated
+            print(f"{company.name}: backfilled {updated} description(s).")
+    print(f"Done — backfilled {total} posting(s). Run a scan (or `jobscout run-daily`) "
+          "to score the newly-described jobs.")
+    return 0
+
+
 def cmd_token(args: argparse.Namespace) -> int:
     from sqlalchemy import select
 
@@ -121,6 +179,13 @@ def main() -> None:
     p.set_defaults(func=cmd_run_daily)
     sub.add_parser("init-db", help="Create database tables").set_defaults(func=cmd_init_db)
     sub.add_parser("health", help="Check DB + Ollama").set_defaults(func=cmd_health)
+
+    p = sub.add_parser("backfill-descriptions",
+                       help="Fetch missing descriptions for eightfold boards (e.g. NVIDIA)")
+    p.add_argument("--company", help="Limit to one company by preset key or name (e.g. nvidia)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="Max postings to fetch per company (0 = all description-less rows)")
+    p.set_defaults(func=cmd_backfill_descriptions)
 
     p = sub.add_parser("token", help="Mint a bearer token for a user")
     p.add_argument("email")

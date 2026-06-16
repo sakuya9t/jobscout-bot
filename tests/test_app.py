@@ -444,6 +444,167 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     assert p.description and "distributed systems" in p.description and "BS degree" in p.description
 
 
+def test_eightfold_description_extracted_from_jsonld(monkeypatch):
+    """Eightfold's search API carries no description; we pull it from the job page's
+    schema.org JobPosting JSON-LD (HTML stripped to text). Failures never raise."""
+    from app.services import scraper
+
+    page = ('<html><head><script type="application/ld+json">'
+            '{"@type":"JobPosting","description":"<p>Build <b>great</b> systems</p>"}'
+            '</script></head><body>x</body></html>')
+    monkeypatch.setattr(scraper, "_fetch_text", lambda url: page)
+    assert scraper._eightfold_description("https://j/careers/job/1") == "Build great systems"
+
+    # JSON-LD as a list: take the entry that has a description.
+    listed = ('<script type="application/ld+json">'
+              '[{"@type":"WebSite"},{"@type":"JobPosting","description":"Role <i>info</i>"}]</script>')
+    monkeypatch.setattr(scraper, "_fetch_text", lambda url: listed)
+    assert scraper._eightfold_description("u") == "Role info"
+
+    monkeypatch.setattr(scraper, "_fetch_text", lambda url: "<html>no jsonld</html>")
+    assert scraper._eightfold_description("u") is None
+
+    def boom(url):
+        raise scraper.ScrapeError("dead host")
+    monkeypatch.setattr(scraper, "_fetch_text", boom)
+    assert scraper._eightfold_description("u") is None  # never raises
+
+
+def test_fetch_eightfold_descriptions_caps_and_dedups(monkeypatch):
+    from app.services import scraper
+
+    seen: list[str] = []
+
+    def fake_one(url):
+        seen.append(url)
+        return None if url.endswith("none") else f"desc {url}"
+
+    monkeypatch.setattr(scraper, "_eightfold_description", fake_one)
+    urls = ["u1", "u2", "u2", "u3none", "u4"]  # u2 repeated, u3none resolves to nothing
+    out = scraper.fetch_eightfold_descriptions(urls, cap=3, max_workers=2)
+    # cap applies over the de-duped order [u1, u2, u3none, u4] -> first 3 fetched.
+    assert set(seen) == {"u1", "u2", "u3none"}
+    assert out == {"u1": "desc u1", "u2": "desc u2"}  # u3none contributes nothing
+    assert scraper.fetch_eightfold_descriptions(urls, cap=0) == {}  # disabled
+
+
+def test_eightfold_upsert_enriches_new_and_backfills_existing(monkeypatch):
+    """_upsert_positions fetches detail-page descriptions for eightfold: new rows are
+    enriched, and a previously-stored description-less row is healed (backfill)."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    with session_scope() as db:
+        company = models.Company(name="NV", ats_type="eightfold", ats_token="nv.com",
+                                 careers_url="https://jobs.nv.com/careers")
+        db.add(company); db.flush()
+        db.add(models.Position(company_id=company.id, external_id="old1", title="Old Role",
+                               url="https://jobs.nv.com/careers/job/old1", description=None))
+        db.flush()
+        cid = company.id
+
+    scraped = [
+        scraper.ScrapedPosition(external_id="old1", title="Old Role",
+                                url="https://jobs.nv.com/careers/job/old1"),  # existing, empty
+        scraper.ScrapedPosition(external_id="new1", title="New Role",
+                                url="https://jobs.nv.com/careers/job/new1"),  # brand new
+    ]
+    monkeypatch.setattr(scraper, "scrape_company", lambda company: scraped)
+    captured = {}
+
+    def fake_fetch(urls, cap, max_workers=None):
+        captured["urls"] = list(urls)
+        captured["cap"] = cap
+        return {u: f"Full description for {u}" for u in urls}
+
+    monkeypatch.setattr(scraper, "fetch_eightfold_descriptions", fake_fetch)
+
+    with session_scope() as db:
+        new_positions, errs = _upsert_positions(db, db.get(models.Company, cid))
+        assert not errs
+        assert [p.external_id for p in new_positions] == ["new1"]
+        assert "Full description" in (new_positions[0].description or "")  # new row enriched
+        healed = db.scalar(matcher.select(models.Position).where(
+            models.Position.company_id == cid, models.Position.external_id == "old1"))
+        assert "Full description" in (healed.description or "")  # existing row backfilled
+
+    assert set(captured["urls"]) == {  # both empties submitted, newest-first order preserved
+        "https://jobs.nv.com/careers/job/old1", "https://jobs.nv.com/careers/job/new1"}
+    assert captured["cap"] == 150  # default per-crawl cap from settings
+
+
+def test_backfill_descriptions_cli_heals_eightfold(monkeypatch):
+    """`jobscout backfill-descriptions` fetches descriptions for stored eightfold
+    postings that lack one (and only those), and leaves others/ATSes untouched."""
+    import argparse
+    from app.cli import cmd_backfill_descriptions
+    from app.services import scraper
+
+    with session_scope() as db:
+        nv = models.Company(preset_key="nvidia", name="NVIDIA", ats_type="eightfold",
+                            ats_token="nvidia.com", careers_url="https://jobs.nv.com/careers")
+        gh = models.Company(name="GH", ats_type="greenhouse")  # must be ignored
+        db.add_all([nv, gh]); db.flush()
+        db.add(models.Position(company_id=nv.id, external_id="e1", title="A",
+                               url="https://jobs.nv.com/careers/job/e1", description=None))
+        db.add(models.Position(company_id=nv.id, external_id="e2", title="B",
+                               url="https://jobs.nv.com/careers/job/e2", description=""))
+        db.add(models.Position(company_id=nv.id, external_id="e3", title="C",
+                               url="https://jobs.nv.com/careers/job/e3", description="already here"))
+        db.add(models.Position(company_id=gh.id, external_id="g1", title="G",
+                               url="https://gh/g1", description=None))  # non-eightfold: skip
+        db.flush()
+        nv_id, gh_id = nv.id, gh.id
+
+    captured = {}
+
+    def fake_fetch(urls, cap, max_workers=None):
+        captured["urls"] = list(urls)
+        return {u: f"desc::{u.rsplit('/', 1)[-1]}" for u in urls}
+
+    monkeypatch.setattr(scraper, "fetch_eightfold_descriptions", fake_fetch)
+
+    rc = cmd_backfill_descriptions(argparse.Namespace(company=None, limit=0))
+    assert rc == 0
+    # Only the two empty eightfold rows were fetched (not the filled one, not GH).
+    assert set(captured["urls"]) == {
+        "https://jobs.nv.com/careers/job/e1", "https://jobs.nv.com/careers/job/e2"}
+    with session_scope() as db:
+        by_ext = {p.external_id: p for p in db.scalars(
+            matcher.select(models.Position).where(models.Position.company_id == nv_id))}
+        assert by_ext["e1"].description == "desc::e1" and by_ext["e2"].description == "desc::e2"
+        assert by_ext["e3"].description == "already here"  # untouched
+        gh_pos = db.scalar(matcher.select(models.Position).where(
+            models.Position.company_id == gh_id))
+        assert gh_pos.description is None  # non-eightfold never fetched
+
+    # --company filter matches by preset key; an unknown one is a clean no-op exit.
+    assert cmd_backfill_descriptions(argparse.Namespace(company="nvidia", limit=0)) == 0
+    assert cmd_backfill_descriptions(argparse.Namespace(company="nope", limit=0)) == 1
+
+
+def test_non_eightfold_skips_description_fetch(monkeypatch):
+    """A Greenhouse (or other) company never triggers the detail-page fetch — those
+    ATSes return descriptions inline, so a description-less row stays as-is."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    with session_scope() as db:
+        company = models.Company(name="GH", ats_type="greenhouse", ats_token="gh")
+        db.add(company); db.flush()
+        cid = company.id
+    monkeypatch.setattr(scraper, "scrape_company", lambda company: [
+        scraper.ScrapedPosition(external_id="g1", title="Role", url="https://x/g1", description=None)])
+
+    def fail(*a, **k):
+        raise AssertionError("detail fetch must not run for non-eightfold ATS")
+
+    monkeypatch.setattr(scraper, "fetch_eightfold_descriptions", fail)
+    with session_scope() as db:
+        new_positions, errs = _upsert_positions(db, db.get(models.Company, cid))
+        assert not errs and new_positions[0].description is None
+
+
 def test_duplicate_external_ids_in_one_scrape_deduped(monkeypatch):
     """A board repeating an external_id within one scrape must not violate the
     (company_id, external_id) unique constraint and abort the run."""
@@ -1014,6 +1175,91 @@ def test_top5_backfills_from_date_filtered_pool():
         # 5 in-window matches, all returned, neither old high scorer among them.
         assert total == 5 and len(items) == 5
         assert {"OldHigh1", "OldHigh2"}.isdisjoint(m["title"] for m in items)
+
+
+def _seed_two_company_matches(db, uid):
+    """Add a second company (Globex, 2 matches) alongside _seed_user's Acme (1
+    match) so the company filter has more than one company to slice. Returns
+    (acme_id, globex_id)."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    acme = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    globex = models.Company(user_id=uid, name="Globex")
+    db.add(globex); db.flush()
+
+    def add(company, ext, title, score):
+        pos = models.Position(company_id=company.id, external_id=ext, title=title, description="d")
+        db.add(pos); db.flush()
+        db.add(models.MatchResult(user_id=uid, position_id=pos.id, resume_id=rid,
+                                  interest_id=interest.id, passed_filter=True, match_score=score,
+                                  win_probability=score, reasoning="r", model="good"))
+
+    add(acme, "a1", "Acme Backend", 90)
+    add(globex, "g1", "Globex Backend", 85)
+    add(globex, "g2", "Globex Frontend", 80)
+    db.flush()
+    return acme.id, globex.id
+
+
+def test_build_job_list_filters_by_company():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        acme_id, globex_id = _seed_two_company_matches(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        _, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 3  # all matches across both companies
+
+        gx, gx_total = reporter.build_job_list(
+            db, user, category="matching", company_id=globex_id, limit=50)
+        assert gx_total == 2 and {m["company"] for m in gx} == {"Globex"}
+
+        ac, ac_total = reporter.build_job_list(
+            db, user, category="matching", company_id=acme_id, limit=50)
+        assert ac_total == 1 and ac[0]["company"] == "Acme"
+
+        # An id with no matches for this user yields an empty (not leaked) page.
+        _, none_total = reporter.build_job_list(
+            db, user, category="matching", company_id=999999, limit=50)
+        assert none_total == 0
+
+
+def test_job_list_endpoint_filters_by_company(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _, globex_id = _seed_two_company_matches(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        wide = c.get("/api/job-lists/latest?category=matching&limit=50", headers=h).json()
+        assert wide["total"] == 3
+        narrow = c.get(
+            f"/api/job-lists/latest?category=matching&limit=50&company_id={globex_id}", headers=h
+        ).json()
+        assert narrow["total"] == 2 and all(it["company"] == "Globex" for it in narrow["items"])
+
+
+def test_job_list_snapshot_filters_by_company():
+    """The frozen-snapshot path filters by company name resolved from the id."""
+    from app.routers.reports import get_job_list
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _, globex_id = _seed_two_company_matches(db, uid)
+        user = db.get(models.User, uid)
+        snap = reporter.record_job_list_snapshot(
+            db, user, SimpleNamespace(new_positions=0, scored=3, filtered=0, errors=[])
+        )
+        full = get_job_list(snap.id, limit=50, user=user, db=db)
+        assert full.total == 3
+        only_gx = get_job_list(snap.id, limit=50, company_id=globex_id, user=user, db=db)
+        assert only_gx.total == 2 and all(it.company == "Globex" for it in only_gx.items)
+        # Unknown company id -> empty page, never another company's rows.
+        missing = get_job_list(snap.id, limit=50, company_id=999999, user=user, db=db)
+        assert missing.total == 0 and missing.items == []
 
 
 def test_job_list_endpoint_accepts_post_date_filter(monkeypatch):

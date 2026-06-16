@@ -83,6 +83,14 @@ class Settings(BaseSettings):
     # postings predate scrape_max_age_days, so this only caps very high-volume
     # boards (60 pages = 600 newest roles) to bound request count per crawl.
     scrape_eightfold_max_pages: int = 60
+    # Eightfold's search API returns no job description — it lives only on each job's
+    # detail page (a JSON-LD block). Without it, every posting is description-less and
+    # the matcher skips it, so we fetch detail pages to enrich/backfill descriptions.
+    # That's one request per job, so cap how many we fetch per crawl (newest-first);
+    # the rest are picked up on subsequent crawls. Fetched in bounded-concurrency
+    # batches (scrape_eightfold_desc_workers) to stay polite. 0 disables enrichment.
+    scrape_eightfold_max_descriptions: int = 150
+    scrape_eightfold_desc_workers: int = 10
     # Only pull postings posted/updated within this many days, to bound how much we
     # store and score. Applies only to sources that expose a date (greenhouse/
     # lever/ashby); Google careers and the HTML fallback carry no per-posting date,

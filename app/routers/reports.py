@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
 from ..db import get_db
-from ..models import JobListSnapshot, User
+from ..models import Company, JobListSnapshot, User
 from ..schemas import EvaluationStatus, JobListOut, JobListRunOut, MatchOut, RunSummary
 from ..services import evaluator, matcher, reporter
 
@@ -94,6 +94,7 @@ def get_latest_job_list(
     min_score: int = 0,
     min_win: int = 0,
     posted_within_days: int | None = None,
+    company_id: int | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -102,13 +103,14 @@ def get_latest_job_list(
     scores them, with ``pending`` counting what's left. ``category`` selects
     matching-only or all (incl. non-matching) jobs; ``min_score``/``min_win`` keep
     only matches at or above those thresholds; ``posted_within_days`` keeps only
-    recently-listed jobs (None = all); ``limit``/``offset`` paginate. Run stats and
-    warnings come from the most recent saved snapshot (the last completed drain);
-    frozen versions are served by ``/job-lists/{id}``."""
+    recently-listed jobs (None = all); ``company_id`` narrows to one watch-list
+    company (None = all); ``limit``/``offset`` paginate. Run stats and warnings come
+    from the most recent saved snapshot (the last completed drain); frozen versions
+    are served by ``/job-lists/{id}``."""
     items, total = reporter.build_job_list(
         db, user, category=_category(category),
         min_score=max(0, min_score), min_win=max(0, min_win),
-        posted_within_days=posted_within_days,
+        posted_within_days=posted_within_days, company_id=company_id,
         limit=_safe_limit(limit), offset=max(0, offset),
     )
     snapshot = db.scalar(
@@ -141,18 +143,24 @@ def get_job_list(
     min_score: int = 0,
     min_win: int = 0,
     posted_within_days: int | None = None,
+    company_id: int | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """A frozen saved version. Snapshots only store matching jobs, so the
     'all'/non-matching category has nothing extra to show here — pagination just
-    pages over the stored matches, after the score/win and post-date filters are
-    applied."""
+    pages over the stored matches, after the score/win, post-date and company
+    filters are applied."""
     snapshot = db.get(JobListSnapshot, snapshot_id)
     if not snapshot or snapshot.user_id != user.id:
         raise HTTPException(status_code=404, detail="Job list not found")
     all_items = reporter.job_list_items(snapshot)
     all_items = reporter.filter_items_posted_within(all_items, posted_within_days)
+    if company_id is not None:
+        # Stored items carry the company name, not its id — resolve id -> name. An
+        # unknown id matches nothing (empty page), never another company's rows.
+        company = db.get(Company, company_id)
+        all_items = reporter.filter_items_by_company(all_items, company.name) if company else []
     if min_score > 0 or min_win > 0:
         all_items = [
             m for m in all_items
