@@ -46,6 +46,11 @@ class User(Base):
     subscriptions: Mapped[list[Subscription]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    # Per-user credentials for the application portals of preset companies that
+    # require an account to apply (see CompanyAccount). Encrypted at rest.
+    company_accounts: Mapped[list[CompanyAccount]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     interests: Mapped[list[Interest]] = relationship(back_populates="user", cascade="all, delete-orphan")
     matches: Mapped[list[MatchResult]] = relationship(back_populates="user", cascade="all, delete-orphan")
     job_list_snapshots: Mapped[list[JobListSnapshot]] = relationship(
@@ -146,6 +151,11 @@ class Company(Base):
     positions: Mapped[list[Position]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
+    # Users' saved application-portal accounts for this company (preset companies
+    # only; cascades so a removed company never leaves orphaned credentials).
+    accounts: Mapped[list[CompanyAccount]] = relationship(
+        back_populates="company", cascade="all, delete-orphan"
+    )
 
     @property
     def is_preset(self) -> bool:
@@ -170,6 +180,38 @@ class Subscription(Base):
 
     user: Mapped[User] = relationship(back_populates="subscriptions")
     company: Mapped[Company] = relationship()
+
+
+class CompanyAccount(Base):
+    """A user's login for the application portal of a (preset) company that
+    requires registering an account to apply — e.g. Google Careers or NVIDIA's
+    Workday. One row per (user, company); only created for companies whose preset
+    has ``requires_account`` set. The username and password are encrypted at rest
+    (see ``app/crypto.py``) — unlike the Telegram token / LLM key, which are stored
+    plaintext — because these are credentials to a third-party site. The portal URL
+    and notes are non-secret and stored as-is. Feeds the phase-2 auto-apply."""
+
+    __tablename__ = "company_accounts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "company_id", name="uq_company_account_user_company"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    # Encrypted (Fernet) — never store/echo the plaintext. The username is the
+    # identifier the user logs in with (often an email); presence of a username is
+    # what "account attached" means in the UI.
+    username_enc: Mapped[str | None] = mapped_column(Text)
+    password_enc: Mapped[str | None] = mapped_column(Text)
+    # Non-secret: where the user registers/signs in (defaults from the preset).
+    portal_url: Mapped[str | None] = mapped_column(String(1024))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="company_accounts")
+    company: Mapped[Company] = relationship(back_populates="accounts")
 
 
 class Interest(Base):

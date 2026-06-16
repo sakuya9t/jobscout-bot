@@ -199,6 +199,50 @@ class CompanyOut(_ORM):
     # True for a global preset company the user is subscribed to (vs their own
     # custom company). Deleting it unsubscribes rather than removing the catalog row.
     is_preset: bool = False
+    # Whether this (preset) company requires a registered application account, and
+    # whether the current user has attached one. Both overlaid by the router (not
+    # ORM columns) to drive the watch-list tag. Always False for custom companies.
+    requires_account: bool = False
+    account_attached: bool = False
+
+
+class CompanyDetailOut(CompanyOut):
+    """The company watch-list detail page payload: the company plus the account
+    state for the current user. The saved password is never returned (only whether
+    one is set); the username is an identifier and is returned so the form prefills."""
+
+    # Where the user registers/signs in to apply (preset default or user override).
+    account_portal_url: str | None = None
+    account_username: str | None = None
+    account_has_password: bool = False
+    account_notes: str | None = None
+
+
+class CompanyAccountIn(BaseModel):
+    """Save the current user's application-portal account for a company. The
+    username is set as-typed (blank clears it, which also clears "attached"); the
+    password follows the keep-blank convention (a non-empty value replaces it, blank
+    keeps the stored one) since it's never prefilled into the form."""
+
+    username: str | None = None
+    password: str | None = None
+    portal_url: str | None = None
+    notes: str | None = None
+
+    @field_validator("username", "portal_url", "notes")
+    @classmethod
+    def _blank_to_none(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v.strip() or None
+
+    @field_validator("password")
+    @classmethod
+    def _strip_password(cls, v: str | None) -> str | None:
+        # Preserve interior spaces but trim edges; blank -> None (= keep existing).
+        if v is None:
+            return None
+        return v.strip() or None
 
 
 # ── Interest ─────────────────────────────────────────────────────────────────

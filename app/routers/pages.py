@@ -46,3 +46,17 @@ def position_detail_page(
     return templates.TemplateResponse(
         request, "position_detail.html", {"user": user, "position_id": position_id}
     )
+
+
+@router.get("/companies/{company_id}", response_class=HTMLResponse)
+def company_detail_page(
+    company_id: int, request: Request, user: User | None = Depends(get_optional_user)
+):
+    """Per-company watch-list detail page. Auth like the dashboard; its fetch()
+    calls hit /api/companies/{id}/detail and handle a 404 (a company not on this
+    user's list) client-side."""
+    if user is None:
+        return RedirectResponse("/login")
+    return templates.TemplateResponse(
+        request, "company_detail.html", {"user": user, "company_id": company_id}
+    )

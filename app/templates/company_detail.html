@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% block title %}Company detail · JobScout{% endblock %}
+{% block body %}
+<style>
+  :root {
+    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
+    --muted:#68746e; --line:#d8e0dc; --accent:#0f766e; --accent-ink:#f5fffd;
+    --amber:#b76b00; --danger:#b42318; --good:#157347;
+  }
+  body { background:var(--page); color:var(--ink); }
+  a { color:var(--accent); }
+  header { display:none; }
+  button { background:var(--accent); color:var(--accent-ink); border-radius:8px;
+    border:0; padding:9px 16px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button.danger { background:transparent; color:var(--danger); border:1px solid #e7c3bf; }
+  input, textarea {
+    background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
+    width:100%; padding:9px 11px; font:inherit; box-sizing:border-box;
+  }
+  label { color:var(--muted); display:block; font-size:13px; margin-bottom:5px; }
+  main.detail { max-width:760px; margin:0 auto; padding:26px clamp(16px, 3vw, 32px); }
+  .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .brand-mark { font-size:20px; font-weight:800; }
+  .back { font-size:14px; }
+  .surface {
+    background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    padding:20px; margin-bottom:16px;
+  }
+  h1 { margin:0 0 6px; font-size:23px; line-height:1.25; }
+  h2 { margin:0 0 4px; font-size:17px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .meta { color:var(--muted); font-size:14px; margin-top:4px; }
+  .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+  .pill {
+    display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px;
+    font-size:12px; background:#eef7f5; color:var(--accent);
+  }
+  .pill.warn { background:#fff4df; color:var(--amber); }
+  .pill.good { background:#e6f4ec; color:var(--good); }
+  .field { margin-bottom:14px; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:6px; }
+  .spinner {
+    display:inline-block; width:15px; height:15px; border:2px solid var(--line);
+    border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;
+    vertical-align:-2px; margin-right:7px;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:#fbfdfc; }
+  .errbox { border:1px solid var(--danger); background:#fdecea; color:var(--danger); border-radius:8px; padding:12px 14px; }
+  .note { background:var(--surface-soft); border-radius:8px; padding:12px 14px; color:#2a3a34; font-size:14px; }
+  @media (max-width: 560px) { .row { grid-template-columns:1fr; } }
+</style>
+
+<main class="detail">
+  <div class="topbar">
+    <div class="brand-mark">JobScout</div>
+    <a class="back" href="/#companies">← Back to watchlist</a>
+  </div>
+
+  <div id="content">
+    <div class="surface"><span class="spinner"></span>Loading company…</div>
+  </div>
+</main>
+
+<script>
+const COMPANY_ID = {{ company_id | tojson }};
+const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts});
+const esc = s => (s==null?"":String(s)).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const val = id => (document.getElementById(id)?.value || "").trim();
+const fmtDate = v => { if(!v){ return "never"; } const d=new Date(v); return Number.isNaN(d.getTime())?v:d.toLocaleString([], {dateStyle:"medium", timeStyle:"short"}); };
+
+let detail = null;
+
+async function loadDetail(){
+  let r;
+  try { r = await api(`/api/companies/${COMPANY_ID}/detail`); }
+  catch(e){ r = null; }
+  if(!r || !r.ok){
+    document.getElementById("content").innerHTML = r && r.status === 404
+      ? `<div class="surface empty">This company isn't on your watchlist. <a href="/#companies">Back to your watchlist</a>.</div>`
+      : `<div class="surface errbox">Could not load this company.</div>`;
+    return;
+  }
+  detail = await r.json();
+  renderDetail();
+}
+
+function renderDetail(){
+  const m = detail;
+  const kind = m.is_preset ? "Preset company" : "Custom company";
+  const tag = m.requires_account
+    ? (m.account_attached
+        ? `<span class="pill good">account attached</span>`
+        : `<span class="pill warn">account needed</span>`)
+    : "";
+  document.getElementById("content").innerHTML = `
+    <div class="surface">
+      <div class="head-row">
+        <div>
+          <h1>${esc(m.name)}</h1>
+          <div class="meta">
+            <span class="pill">${esc(m.ats_type)}</span>
+            <span class="muted"> · ${esc(kind)} · last scraped ${esc(fmtDate(m.last_scraped_at))}</span>
+          </div>
+          ${m.careers_url ? `<div class="meta"><a href="${esc(m.careers_url)}" target="_blank" rel="noopener">${esc(m.careers_url)}</a></div>` : ""}
+        </div>
+        ${tag}
+      </div>
+    </div>
+    <div class="surface" id="accountSurface">${accountSection(m)}</div>`;
+}
+
+function accountSection(m){
+  if(!m.requires_account){
+    return m.is_preset
+      ? `<h2>Application account</h2>
+         <div class="note">Applying to ${esc(m.name)} doesn't require a registered account —
+           you can apply directly from each posting, so there's nothing to store here.</div>`
+      : `<h2>Application account</h2>
+         <div class="note">This is a custom company you added. Saved application accounts and
+           auto-apply are only supported for built-in preset companies, so there's nothing to store here.</div>`;
+  }
+  const pwPlaceholder = m.account_has_password
+    ? "A password is saved — leave blank to keep it"
+    : "Password for the application portal";
+  return `
+    <h2>Application account</h2>
+    <p class="muted">${esc(m.name)} requires a registered account to submit an application.
+      Save the credentials you apply with — they're <b>encrypted</b> before storage and reused for auto-apply.</p>
+    <div class="field">
+      <label for="acPortal">Application portal URL</label>
+      <input id="acPortal" placeholder="https://…" value="${esc(m.account_portal_url || "")}" />
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="acUser">Username / email</label>
+        <input id="acUser" autocomplete="off" placeholder="you@example.com" value="${esc(m.account_username || "")}" />
+      </div>
+      <div class="field">
+        <label for="acPass">Password</label>
+        <input id="acPass" type="password" autocomplete="new-password" placeholder="${esc(pwPlaceholder)}" />
+      </div>
+    </div>
+    <div class="field">
+      <label for="acNotes">Notes (optional)</label>
+      <textarea id="acNotes" rows="2" placeholder="Anything to remember about this login">${esc(m.account_notes || "")}</textarea>
+    </div>
+    <div class="actions">
+      <button type="button" id="acSave" onclick="saveAccount()">Save account</button>
+      ${m.account_attached ? `<button type="button" class="danger" onclick="removeAccount()">Remove account</button>` : ""}
+      <span id="acStatus" class="muted"></span>
+    </div>`;
+}
+
+function accountBody(){
+  const body = {
+    username: val("acUser") || null,
+    portal_url: val("acPortal") || null,
+    notes: val("acNotes") || null,
+  };
+  const pw = document.getElementById("acPass").value;   // keep interior spaces
+  if(pw.trim()){ body.password = pw; }                  // blank = keep saved password
+  return body;
+}
+
+async function saveAccount(){
+  const s = document.getElementById("acStatus");
+  const btn = document.getElementById("acSave");
+  btn.disabled = true; s.textContent = "Saving…";
+  const r = await api(`/api/companies/${COMPANY_ID}/account`, {method:"PUT", body: JSON.stringify(accountBody())});
+  btn.disabled = false;
+  if(!r.ok){ const d = await r.json().catch(()=>({})); s.textContent = d.detail || "Save failed"; return; }
+  detail = await r.json();
+  renderDetail();
+  document.getElementById("acStatus").textContent = "Saved.";
+}
+
+async function removeAccount(){
+  if(!confirm("Remove the saved account for this company?")){ return; }
+  const s = document.getElementById("acStatus");
+  s.textContent = "Removing…";
+  const r = await api(`/api/companies/${COMPANY_ID}/account`, {method:"DELETE"});
+  if(!r.ok){ s.textContent = "Could not remove the account."; return; }
+  await loadDetail();
+}
+
+loadDetail();
+</script>
+{% endblock %}

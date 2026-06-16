@@ -118,6 +118,15 @@
     border-radius:999px; font-size:12px; background:#eef7f5; color:var(--accent);
   }
   .pill.warn { background:#fff4df; color:var(--amber); }
+  /* Always-visible info badge (e.g. next to a section heading); hover/focus for
+     the native tooltip. */
+  .info-dot {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:18px; height:18px; margin-left:6px; vertical-align:1px;
+    border-radius:50%; background:var(--accent); color:var(--accent-ink);
+    font-size:12px; font-style:italic; font-weight:700; cursor:help; user-select:none;
+  }
+  .info-dot:focus { outline:2px solid var(--accent); outline-offset:2px; }
   .empty {
     border:1px dashed var(--line); border-radius:8px; padding:20px; color:var(--muted);
     background:#fbfdfc;
@@ -449,7 +458,9 @@
 
     <section id="view-companies" class="panel">
       <div class="surface">
-        <h2>Company watchlist management</h2>
+        <h2>Company watchlist management
+          <span class="info-dot" tabindex="0" role="img" aria-label="company not in preset list doesn't support auto apply"
+                title="company not in preset list doesn't support auto apply">i</span></h2>
         <div class="row">
           <div>
             <label for="cPreset">Quick add</label>
@@ -846,13 +857,24 @@ async function addCompany(){
   await loadCompanies();
 }
 
+// Account tag for a watch-list row: only preset companies that require a portal
+// account get one — "account attached" once the user has saved credentials, else
+// "account needed". Companies that apply without an account show nothing.
+function accountTag(x){
+  if(!x.requires_account){ return ""; }
+  return x.account_attached
+    ? '<span class="pill" style="background:#e6f4ec; color:var(--good);">account attached</span>'
+    : '<span class="pill warn">account needed</span>';
+}
+
 async function loadCompanies(){
   const r = await api("/api/companies"); const list = await r.json();
   watchedNames = new Set(list.map(x => (x.name || "").toLowerCase()));
   renderPresetOptions();
   document.getElementById("companies").innerHTML = list.map(x =>
     `<div class="list-item flex" style="justify-content:space-between;">
-       <span><b>${esc(x.name)}</b> <span class="pill">${esc(x.ats_type)}</span>
+       <span><a href="/companies/${x.id}"><b>${esc(x.name)}</b></a> <span class="pill">${esc(x.ats_type)}</span>
+       ${accountTag(x)}
        <span class="muted">${esc(x.careers_url||"")}</span></span>
        <button class="ghost" onclick="delCompany(${x.id})">Remove</button></div>`).join("") ||
     '<div class="empty">No companies on the watchlist.</div>';

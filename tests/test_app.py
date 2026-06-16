@@ -1198,6 +1198,124 @@ def test_effective_llm_config_uses_user_overrides():
         assert eff.main_model == "big-model" and eff.light_model == "small-model"
 
 
+# ── Company application accounts (encrypted, per-user) ───────────────────────
+def test_crypto_roundtrip_and_tamper_resistance():
+    from app import crypto
+
+    token = crypto.encrypt("hunter2")
+    assert token and "hunter2" not in token          # ciphertext, not plaintext
+    assert crypto.decrypt(token) == "hunter2"         # round-trips
+    assert crypto.encrypt(None) is None and crypto.encrypt("") is None
+    assert crypto.decrypt(None) is None
+    assert crypto.decrypt("not-a-real-token") is None  # bad token -> None, never raises
+
+
+def _subscribe_preset(client, headers, name):
+    """Subscribe the user to a built-in preset by name; returns the company row."""
+    presets = client.get("/api/companies/presets", headers=headers).json()
+    p = next(x for x in presets if x["name"] == name)
+    body = {k: p[k] for k in ("name", "careers_url", "ats_type", "ats_token")}
+    body["preset_key"] = p["key"]
+    return client.post("/api/companies", json=body, headers=headers).json()
+
+
+def test_account_preset_attach_encrypts_and_tags():
+    """A preset that needs an account: saving credentials encrypts them at rest,
+    never echoes the password, and flips the watch-list tag to attached. Blank
+    password on re-save keeps the stored one; Remove clears the account."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'acc@x.com').json()['access_token']}"}
+        cid = _subscribe_preset(c, h, "Google")["id"]  # Google Careers requires an account
+
+        row = next(x for x in c.get("/api/companies", headers=h).json() if x["id"] == cid)
+        assert row["requires_account"] is True and row["account_attached"] is False
+
+        det = c.get(f"/api/companies/{cid}/detail", headers=h).json()
+        assert det["requires_account"] is True
+        assert det["account_portal_url"] and "google" in det["account_portal_url"]
+        assert det["account_username"] is None and det["account_has_password"] is False
+
+        saved = c.put(f"/api/companies/{cid}/account", headers=h,
+                      json={"username": "me@gmail.com", "password": "hunter2",
+                            "portal_url": "https://accounts.google.com/"}).json()
+        assert saved["account_attached"] is True
+        assert saved["account_username"] == "me@gmail.com"
+        assert saved["account_has_password"] is True
+        assert "password" not in saved  # secret never returned
+
+        with session_scope() as db:
+            acct = db.scalar(matcher.select(models.CompanyAccount)
+                             .where(models.CompanyAccount.company_id == cid))
+            assert acct.username_enc and "me@gmail.com" not in acct.username_enc
+            assert acct.password_enc and "hunter2" not in acct.password_enc
+
+        row = next(x for x in c.get("/api/companies", headers=h).json() if x["id"] == cid)
+        assert row["account_attached"] is True
+
+        # Blank password keeps the saved one; the username change persists.
+        c.put(f"/api/companies/{cid}/account", headers=h,
+              json={"username": "me2@gmail.com", "password": ""})
+        det2 = c.get(f"/api/companies/{cid}/detail", headers=h).json()
+        assert det2["account_username"] == "me2@gmail.com" and det2["account_has_password"] is True
+
+        assert c.delete(f"/api/companies/{cid}/account", headers=h).status_code == 204
+        det3 = c.get(f"/api/companies/{cid}/detail", headers=h).json()
+        assert det3["account_attached"] is False and det3["account_has_password"] is False
+
+
+def test_account_rejected_for_non_account_and_custom_companies():
+    """Companies you can apply to without an account (Greenhouse presets, and any
+    custom company) expose no account section and refuse account saves."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'noa@x.com').json()['access_token']}"}
+
+        cid = _subscribe_preset(c, h, "Anthropic")["id"]  # Greenhouse: no account needed
+        assert c.get(f"/api/companies/{cid}/detail", headers=h).json()["requires_account"] is False
+        assert c.put(f"/api/companies/{cid}/account", headers=h,
+                     json={"username": "x", "password": "y"}).status_code == 400
+
+        custom = c.post("/api/companies", json={"name": "Acme Custom"}, headers=h).json()
+        cdet = c.get(f"/api/companies/{custom['id']}/detail", headers=h).json()
+        assert cdet["requires_account"] is False and cdet["is_preset"] is False
+        assert c.put(f"/api/companies/{custom['id']}/account", headers=h,
+                     json={"username": "x"}).status_code == 400
+
+
+def test_company_detail_scoped_to_user_watchlist():
+    """Detail is visible only for companies on the user's list: a preset they don't
+    follow and another user's custom company both 404; auth is required."""
+    with TestClient(app) as c:
+        ha = {"Authorization": f"Bearer {_register(c, 'da@x.com').json()['access_token']}"}
+        hb = {"Authorization": f"Bearer {_register(c, 'db@x.com').json()['access_token']}"}
+
+        # A seeded preset the user hasn't subscribed to is not visible.
+        with session_scope() as db:
+            gid = db.scalar(matcher.select(models.Company.id)
+                            .where(models.Company.preset_key == "google"))
+        assert c.get(f"/api/companies/{gid}/detail", headers=ha).status_code == 404
+
+        # B can't see A's custom company; A can.
+        custom = c.post("/api/companies", json={"name": "Acme"}, headers=ha).json()
+        assert c.get(f"/api/companies/{custom['id']}/detail", headers=hb).status_code == 404
+        assert c.get(f"/api/companies/{custom['id']}/detail", headers=ha).status_code == 200
+    with TestClient(app) as c:
+        assert c.get("/api/companies/1/detail").status_code == 401  # auth required
+
+
+def test_company_accounts_cascade_on_user_delete():
+    """Deleting a user removes their saved credentials (no orphaned ciphertext)."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'cas@x.com').json()['access_token']}"}
+        cid = _subscribe_preset(c, h, "NVIDIA")["id"]  # NVIDIA (Workday) requires an account
+        c.put(f"/api/companies/{cid}/account", headers=h,
+              json={"username": "n@v.com", "password": "p"})
+    with session_scope() as db:
+        assert db.scalar(matcher.select(models.CompanyAccount)) is not None
+        db.delete(db.scalar(matcher.select(models.User).where(models.User.email == "cas@x.com")))
+        db.commit()
+        assert list(db.scalars(matcher.select(models.CompanyAccount))) == []
+
+
 def test_clients_built_from_user_config(monkeypatch):
     from app.services import llm
 
