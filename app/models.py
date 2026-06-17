@@ -384,6 +384,27 @@ class LlmLog(Base):
     error_detail: Mapped[str | None] = mapped_column(Text)
 
 
+class InviteCode(Base):
+    """A registration invitation. The plaintext code is shown once at mint time and
+    never stored: we keep only ``code_hash`` = HMAC-SHA256(root_secret, code), so a DB
+    leak yields irreversible hashes (no usable codes, and no way to forge new ones) and
+    the root key never touches a row. See ``app/invites.py`` for the derivation and the
+    atomic redeem that enforces ``max_uses``/``expires_at``. Not user-owned — a code is
+    shared and consumed by whoever registers with it, so it carries no ``user_id``."""
+
+    __tablename__ = "invite_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    max_uses: Mapped[int] = mapped_column(Integer, default=1)
+    uses: Mapped[int] = mapped_column(Integer, default=0)
+    # Null = never expires. Stored as naive UTC like every other timestamp (timeutil).
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ApplicationKit(Base):
     """LLM-generated application materials for one (user, position): a summary of
     what the role is looking for, detected open application questions with advice +

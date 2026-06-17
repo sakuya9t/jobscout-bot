@@ -88,6 +88,20 @@ Open the dashboard, register, upload a resume, add companies + interests, and
 click **Run scan now**. The in-process scheduler also runs the scan daily at
 `JOBSCOUT_DAILY_RUN_HOUR`.
 
+### Registration control (invite codes + rate limiting)
+Registration is **invite-gated** by default (`JOBSCOUT_REQUIRE_INVITE=1`). Mint codes
+from the CLI — only an HMAC of each code is stored (derived from `JOBSCOUT_SECRET_KEY`),
+so the DB never holds a usable code or the key:
+```bash
+jobscout invite mint --max-uses 5 --expires-days 30 --count 3   # prints codes once
+jobscout invite list                                            # uses/expiry/state
+jobscout invite revoke <id|code>
+```
+Set `JOBSCOUT_REQUIRE_INVITE=0` for open registration (local dev). The app also applies
+in-process per-IP **rate limits** (a global blanket plus stricter caps on login/register)
+to blunt brute-force and DoS — see [docs/DEPLOY_VERCEL.md](docs/DEPLOY_VERCEL.md) for the
+knobs and how this interacts with Vercel's edge DDoS/WAF protection.
+
 ### Telegram (optional, per-user)
 Each user brings their own bot. Create one with @BotFather, paste its token on the
 dashboard's **Telegram settings** page and Save, then DM the bot `/start <code>`

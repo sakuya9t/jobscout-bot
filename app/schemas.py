@@ -33,6 +33,13 @@ class Credentials(BaseModel):
     password: str = Field(min_length=6)
 
 
+class RegisterCredentials(Credentials):
+    # Required at registration only when JOBSCOUT_REQUIRE_INVITE is on (the route, not
+    # the schema, enforces presence, so the field is optional here and ignored when
+    # invites are disabled). Login uses plain Credentials and never carries a code.
+    invite_code: str | None = None
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"

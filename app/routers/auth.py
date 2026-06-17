@@ -1,11 +1,12 @@
 """Register / login / logout / me."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .. import invites, ratelimit
 from ..auth import (
     create_access_token,
     get_current_user,
@@ -16,11 +17,26 @@ from ..auth import (
 from ..config import settings
 from ..db import get_db
 from ..models import User
-from ..schemas import Credentials, Token, UserOut
+from ..schemas import Credentials, RegisterCredentials, Token, UserOut
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 COOKIE = "access_token"
+
+
+def _rl_login(request: Request) -> None:
+    """Throttle login attempts per IP to blunt credential-stuffing. Reads the limit
+    from settings at request time so it tracks config (and test overrides)."""
+    ratelimit.enforce(
+        request, scope="login", limit=settings.rate_limit_auth_per_minute, window_s=60
+    )
+
+
+def _rl_register(request: Request) -> None:
+    """Throttle signups per IP — also caps invite-code guessing on this route."""
+    ratelimit.enforce(
+        request, scope="register", limit=settings.rate_limit_register_per_hour, window_s=3600
+    )
 
 
 def _set_cookie(response: Response, token: str) -> None:
@@ -32,8 +48,17 @@ def _set_cookie(response: Response, token: str) -> None:
     )
 
 
-@router.post("/register", response_model=Token)
-def register(creds: Credentials, response: Response, db: Session = Depends(get_db)) -> Token:
+@router.post("/register", response_model=Token, dependencies=[Depends(_rl_register)])
+def register(
+    creds: RegisterCredentials, response: Response, db: Session = Depends(get_db)
+) -> Token:
+    # Reserve an invite use *inside* this transaction: if the user insert below fails
+    # (e.g. duplicate email), the rollback also undoes the increment, so a failed
+    # signup never burns a code. A generic 403 avoids an oracle for unknown vs
+    # expired vs exhausted codes — invite-code guessing is also rate-limited above.
+    if settings.require_invite and not invites.redeem(db, creds.invite_code):
+        db.rollback()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid or expired invitation code")
     user = User(
         # Normalize so "A@b.com" and "a@b.com" can't become two accounts
         # (EmailStr only lowercases the domain half).
@@ -46,7 +71,8 @@ def register(creds: Credentials, response: Response, db: Session = Depends(get_d
         db.commit()
     except IntegrityError:
         # Lost the race (or a plain duplicate) — the unique email constraint is
-        # the source of truth, so a check-then-insert TOCTOU can't 500 here.
+        # the source of truth, so a check-then-insert TOCTOU can't 500 here. The
+        # rollback also releases the invite use reserved above.
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
     db.refresh(user)
@@ -55,7 +81,7 @@ def register(creds: Credentials, response: Response, db: Session = Depends(get_d
     return Token(access_token=token)
 
 
-@router.post("/login", response_model=Token)
+@router.post("/login", response_model=Token, dependencies=[Depends(_rl_login)])
 def login(creds: Credentials, response: Response, db: Session = Depends(get_db)) -> Token:
     user = db.scalar(select(User).where(User.email == creds.email.lower()))
     if not user or not verify_password(creds.password, user.hashed_password):

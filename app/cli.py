@@ -7,6 +7,8 @@ Commands:
   init-db          Create database tables.
   health           Check DB + Ollama connectivity.
   token <email>    Mint a bearer token for a user (for MCP / API clients).
+  invite           Mint / list / revoke registration invite codes
+                   (e.g. `jobscout invite mint --max-uses 5 --expires-days 30`).
   backfill-descriptions
                    Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
                    whose search API returns none, so older postings become scoreable.
@@ -220,6 +222,63 @@ def cmd_migrate_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_invite(args: argparse.Namespace) -> int:
+    """Mint / list / revoke registration invite codes (see app/invites.py)."""
+    from sqlalchemy import select
+
+    from . import invites
+    from .db import init_db, session_scope
+    from .models import InviteCode
+
+    init_db()
+    with session_scope() as db:
+        if args.invite_command == "mint":
+            codes = invites.mint(
+                db,
+                max_uses=args.max_uses,
+                expires_in_days=args.expires_days,
+                note=args.note,
+                count=args.count,
+            )
+            # Printed once — only the HMAC is stored, so a code can't be recovered later.
+            print(f"Minted {len(codes)} code(s) "
+                  f"(max_uses={max(1, args.max_uses)}, "
+                  f"expires={'in ' + str(args.expires_days) + 'd' if args.expires_days else 'never'}):")
+            for code in codes:
+                print(f"  {code}")
+            return 0
+
+        if args.invite_command == "list":
+            rows = list(db.scalars(select(InviteCode).order_by(InviteCode.id)))
+            if not rows:
+                print("No invite codes.")
+                return 0
+            print(f"{'id':>4}  {'uses':>9}  {'expires':<19}  {'state':<8}  note")
+            for r in rows:
+                expires = r.expires_at.strftime("%Y-%m-%d %H:%M") if r.expires_at else "never"
+                if r.revoked:
+                    state = "revoked"
+                elif invites.is_expired(r):
+                    state = "expired"
+                elif r.uses >= r.max_uses:
+                    state = "used-up"
+                else:
+                    state = "active"
+                print(f"{r.id:>4}  {r.uses:>4}/{r.max_uses:<4}  {expires:<19}  {state:<8}  {r.note or ''}")
+            return 0
+
+        if args.invite_command == "revoke":
+            target = args.code.strip()
+            ok = (
+                invites.revoke(db, code_id=int(target)) if target.isdigit()
+                else invites.revoke(db, code=target)
+            )
+            print(f"Revoked {target}." if ok else f"No matching code: {target}")
+            return 0 if ok else 1
+
+    return 2
+
+
 def cmd_token(args: argparse.Namespace) -> int:
     from sqlalchemy import select
 
@@ -278,6 +337,19 @@ def main() -> None:
     p = sub.add_parser("token", help="Mint a bearer token for a user")
     p.add_argument("email")
     p.set_defaults(func=cmd_token)
+
+    p = sub.add_parser("invite", help="Mint / list / revoke registration invite codes")
+    isub = p.add_subparsers(dest="invite_command", required=True)
+    m = isub.add_parser("mint", help="Mint new invite code(s); prints them once")
+    m.add_argument("--max-uses", type=int, default=1, help="How many times each code can be used")
+    m.add_argument("--expires-days", type=int, default=None,
+                   help="Days until each code expires (omit = never expires)")
+    m.add_argument("--count", type=int, default=1, help="How many codes to mint")
+    m.add_argument("--note", default=None, help="Optional label stored with the code(s)")
+    isub.add_parser("list", help="List all invite codes and their state")
+    rv = isub.add_parser("revoke", help="Revoke a code by id or by the code itself")
+    rv.add_argument("code", help="Invite code id (number) or the plaintext code")
+    p.set_defaults(func=cmd_invite)
 
     args = parser.parse_args()
     raise SystemExit(args.func(args))

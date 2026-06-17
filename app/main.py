@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from . import ratelimit
 from .config import settings
 from .db import init_db, session_scope
 from .logging_config import configure_logging, get_logger
@@ -50,6 +52,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="JobScout", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Per-IP blanket limit on every request as a coarse DoS brake. The auth routes
+    carry their own stricter per-route limits on top of this. ``/health`` is exempt so
+    uptime checks aren't throttled. No-op when JOBSCOUT_RATE_LIMIT_ENABLED is off."""
+    if request.url.path != "/health":
+        allowed, retry_after = ratelimit.check_global(request)
+        if not allowed:
+            return JSONResponse(
+                {"detail": "Too many requests. Please slow down and try again later."},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+    return await call_next(request)
+
 
 app.include_router(auth.router)
 app.include_router(resumes.router)
