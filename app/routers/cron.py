@@ -1,14 +1,17 @@
-"""Serverless cron endpoint — the daily scrape+score pipeline behind an HTTP call.
+"""Optional HTTP trigger for the daily scrape+score pipeline.
 
-On a long-lived server the in-process scheduler (``app/services/scheduler.py``)
-runs ``daily_job`` on a timer. On Vercel that scheduler is disabled
-(``JOBSCOUT_SCHEDULER_ENABLED=0``); instead a Vercel Cron entry hits this endpoint
-on a schedule. Vercel automatically sends ``Authorization: Bearer $CRON_SECRET``
-on cron invocations when the ``CRON_SECRET`` env var is set, so we authenticate on
-that exact value (read straight from the environment, bypassing the ``JOBSCOUT_``
-settings prefix). The work is the same synchronous run as ``jobscout run-daily``
-(``app/cli.py:cmd_run_daily``) — ``run_for_all_users`` scrapes and scores to
-completion inline, so the scan finishes within the single request.
+This is the same synchronous run as ``jobscout run-daily`` (``app/cli.py``) behind
+an authenticated HTTP call. NOTE: it is **not** the scheduled production path. On
+Vercel's serverless functions a full scan can't complete within the (Hobby) 60s
+limit — a single Ollama request alone can take up to JOBSCOUT_OLLAMA_TIMEOUT — so
+the daily scan runs in a GitHub Actions cron (``.github/workflows/daily-scan.yml``,
+no time limit) instead. This endpoint remains handy for a manual kick or for a
+long-lived-server deploy where the request can run to completion.
+
+Auth: send ``Authorization: Bearer <CRON_SECRET>`` (the value of the ``CRON_SECRET``
+env var, read straight from the environment, bypassing the ``JOBSCOUT_`` prefix).
+This is also the header Vercel Cron would send automatically if you ever schedule
+it there on a plan whose function time limit fits.
 """
 from __future__ import annotations
 
