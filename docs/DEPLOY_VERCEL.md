@@ -92,6 +92,13 @@ After that, **push to `main`** (or run the workflow manually) to deploy.
   dashboard already falls back to the DB-stored extracted text, and matching/scoring
   use that text, so this is cosmetic. Supabase Storage is the real fix later.
 - **Rate limiting is per-instance** on serverless — rely on the Vercel WAF (below).
+- **Database connections go through Supabase's pooler.** The app uses SQLAlchemy
+  `NullPool` on Postgres (no in-process connection pool), so serverless instances and
+  the daily-scan job don't hoard idle connections and exhaust the pooler's per-client
+  cap. Use the **session pooler** URL (port `5432`) as documented; if you later run
+  enough concurrency to still hit "max clients reached in session mode", switch the
+  connection string to the **transaction pooler** (port `6543`), which multiplexes and
+  raises the ceiling — change it in both `SUPABASE_DB_URL` and `JOBSCOUT_DATABASE_URL`.
 
 For a deploy where the scheduler, workers, and rate limiter all work as-is, run the
 long-lived server on a VM / container / Fly.io / Render instead (still pointed at

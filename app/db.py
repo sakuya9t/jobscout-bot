@@ -8,14 +8,27 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from .config import settings
 
 log = logging.getLogger(__name__)
 
 _is_sqlite = settings.database_url.startswith("sqlite")
-_connect_args = {"check_same_thread": False} if _is_sqlite else {}
-engine = create_engine(settings.database_url, connect_args=_connect_args, future=True)
+if _is_sqlite:
+    engine = create_engine(
+        settings.database_url, connect_args={"check_same_thread": False}, future=True
+    )
+else:
+    # Postgres is reached through Supabase's connection pooler (Supavisor). Pooling
+    # *again* in-process means every serverless instance and batch run hoards idle
+    # connections and exhausts the pooler's per-client cap ("max clients reached in
+    # session mode - ... pool_size: 15"). NullPool keeps no idle connections: one is
+    # opened per checkout and closed on release, so we only ever hold what we're
+    # actively using. pool_pre_ping drops a connection the pooler closed under us.
+    engine = create_engine(
+        settings.database_url, poolclass=NullPool, pool_pre_ping=True, future=True
+    )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
