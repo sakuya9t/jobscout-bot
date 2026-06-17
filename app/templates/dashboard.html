@@ -821,6 +821,13 @@ function updateScanGate(hasResume){
     hasResume ? "" : "Upload a resume before running a scan.";
 }
 
+// The daily cron only scrapes; scoring happens here. So once the user already has
+// a saved (scored) list, the button is really "score again", not a first scan.
+function updateRunButtonLabel(hasSavedList){
+  document.getElementById("runBtn").textContent =
+    hasSavedList ? "Refresh matching scores" : "Run scan now";
+}
+
 async function delResume(id){
   await api(`/api/resumes/${id}`,{method:"DELETE"});
   await loadResumes();
@@ -1012,6 +1019,8 @@ async function pollEval(){
 async function loadJobRuns(){
   const r = await api("/api/job-lists/runs");
   const runs = r.ok ? await r.json() : [];
+  // A saved run exists once the user has scored at least once -> "refresh" wording.
+  updateRunButtonLabel(runs.length > 0);
   const sel = document.getElementById("jobVersion");
   const selected = selectedSnapshotId ? String(selectedSnapshotId) : "latest";
   sel.innerHTML = '<option value="latest">Latest saved list</option>' + runs.map(run => {

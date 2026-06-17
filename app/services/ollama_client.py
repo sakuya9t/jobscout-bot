@@ -35,8 +35,8 @@ class OllamaBudgetError(OllamaError):
     Distinct from a generic OllamaError so the matcher can (a) tell the user their
     Ollama account is out of quota in plain language and (b) NOT write permanent
     error-markers — an exhausted budget is recoverable, so those postings must
-    re-score automatically once quota returns, not be skipped until a manual
-    --retry-failed."""
+    re-score automatically once quota returns, not be skipped until the markers are
+    manually cleared."""
 
     pass
 

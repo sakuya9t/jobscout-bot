@@ -1,8 +1,8 @@
-"""In-process daily scheduler. Runs the full pipeline for all users at the
-configured hour, then pushes each user's Telegram report through that user's own
-bot. Telegram is per-user (the bot token + linked chat live on the User row), so
-there is no global bot or long-poll loop — linking is on-demand from the settings
-page. Everything is optional and guarded so the app boots fine without it."""
+"""In-process daily scheduler. Scrapes every user's companies at the configured
+hour and saves any new positions. It deliberately does NOT score — matching is
+expensive per user, so it's deferred to an on-demand scan from the job-list view
+(web ``/api/run``). Everything is optional and guarded so the app boots fine
+without it."""
 from __future__ import annotations
 
 import logging
@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ..config import settings
-from . import crawler, matcher, telegram_bot
+from . import crawler, matcher
 
 log = logging.getLogger(__name__)
 
@@ -19,14 +19,11 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def daily_job() -> None:
-    log.info("daily job starting")
-    summaries = matcher.run_for_all_users()
+    log.info("daily scrape starting")
+    summaries = matcher.scrape_for_all_users()
     total_new = sum(s.new_positions for s in summaries.values())
-    total_scored = sum(s.scored for s in summaries.values())
-    log.info("daily job done: %d users, %d new positions, %d scored",
-             len(summaries), total_new, total_scored)
-    error_by_user = {uid: s.errors for uid, s in summaries.items() if s.errors}
-    telegram_bot.send_daily_reports(error_by_user)
+    log.info("daily scrape done: %d users, %d new positions "
+             "(scoring deferred to on-demand scans)", len(summaries), total_new)
 
 
 def start() -> None:

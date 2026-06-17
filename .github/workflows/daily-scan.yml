@@ -1,11 +1,10 @@
 name: Daily scan
 
-# The daily scrape+score+report pipeline. It runs here, NOT as a Vercel Cron,
-# because Vercel Hobby caps functions at 60s and a single Ollama request alone can
-# take up to JOBSCOUT_OLLAMA_TIMEOUT (120s). A GitHub Actions runner has no such
-# limit, so `jobscout run-daily` finishes the whole scan synchronously and the
-# per-user Telegram reports fire normally — exactly like the in-process scheduler
-# on a long-lived server, just triggered by cron here.
+# The daily scrape. It runs here, NOT as a Vercel Cron, because Vercel Hobby caps
+# functions at 60s; a GitHub Actions runner has no such limit, so `jobscout
+# run-daily` can scrape every company to completion. It only scrapes and saves new
+# positions — matching (the expensive per-user LLM step) is deferred to an on-demand
+# scan from the dashboard, so this stays fast and cheap even with many users.
 on:
   schedule:
     - cron: "0 8 * * *" # 08:00 UTC daily (GitHub cron is always UTC)
@@ -29,10 +28,10 @@ jobs:
       - name: Install
         run: pip install -e .
       - name: Run daily scan
-        # Both are REQUIRED: the DB URL, and JOBSCOUT_SECRET_KEY to decrypt each
-        # user's LLM API key + Telegram bot token (encrypted at rest). The key MUST
-        # be the same value Vercel runs with, or decryption returns garbage and
-        # scoring/Telegram fail.
+        # The DB URL is REQUIRED. JOBSCOUT_SECRET_KEY is kept here (same value Vercel
+        # runs with) so any encrypted-at-rest column this path touches decrypts
+        # correctly; scrape-only doesn't score or send Telegram, but keeping the key
+        # aligned avoids surprises if the scrape path ever reads a secret column.
         env:
           JOBSCOUT_DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
           JOBSCOUT_SECRET_KEY: ${{ secrets.JOBSCOUT_SECRET_KEY }}

@@ -3,7 +3,8 @@
 Commands:
   serve            Run the web app (uvicorn) with the daily scheduler.
   mcp              Run the MCP server over stdio (for openclaw/hermes/agents).
-  run-daily        Run the scrape+score pipeline once for all users (cron-friendly).
+  run-daily        Scrape all users' companies and save new positions (cron-friendly;
+                   no scoring — matching runs on-demand from the job-list view).
   init-db          Create database tables.
   encrypt-secrets  Encrypt the telegram-token / LLM-key columns at rest (one-time,
                    idempotent migration; widens the columns on Postgres first).
@@ -49,17 +50,15 @@ def cmd_mcp(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run_daily(args: argparse.Namespace) -> int:
+def cmd_run_daily(_: argparse.Namespace) -> int:
     from .db import init_db
-    from .services import matcher, telegram_bot
+    from .services import matcher
 
     init_db()
-    summaries = matcher.run_for_all_users(retry_failed=args.retry_failed)
+    summaries = matcher.scrape_for_all_users()
     new = sum(s.new_positions for s in summaries.values())
-    scored = sum(s.scored for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
-    telegram_bot.send_daily_reports({uid: s.errors for uid, s in summaries.items() if s.errors})
-    print(f"Users: {len(summaries)} | new positions: {new} | scored: {scored} | warnings: {len(errors)}")
+    print(f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)}")
     for e in errors:
         print(f"  - {e}")
     return 0
@@ -190,7 +189,7 @@ def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
             db.commit()  # release the write lock between companies
             total += updated
             print(f"{company.name}: backfilled {updated} description(s).")
-    print(f"Done — backfilled {total} posting(s). Run a scan (or `jobscout run-daily`) "
+    print(f"Done — backfilled {total} posting(s). Run a scan from the job-list view "
           "to score the newly-described jobs.")
     return 0
 
@@ -363,10 +362,10 @@ def main() -> None:
     p.set_defaults(func=cmd_serve)
 
     sub.add_parser("mcp", help="Run the MCP server (stdio)").set_defaults(func=cmd_mcp)
-    p = sub.add_parser("run-daily", help="Run the pipeline once for all users")
-    p.add_argument("--retry-failed", action="store_true",
-                   help="Clear prior scoring-error markers so failed pairs are re-scored")
-    p.set_defaults(func=cmd_run_daily)
+    sub.add_parser(
+        "run-daily",
+        help="Scrape all users' companies and save new positions (no scoring)",
+    ).set_defaults(func=cmd_run_daily)
     sub.add_parser("init-db", help="Create database tables").set_defaults(func=cmd_init_db)
     sub.add_parser(
         "encrypt-secrets",

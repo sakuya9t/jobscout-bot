@@ -1852,6 +1852,32 @@ def test_user_scan_does_not_crawl_presets(monkeypatch):
     assert "Acme" in crawled and "Anthropic" not in crawled
 
 
+def test_scrape_for_all_users_scrapes_but_does_not_score(monkeypatch):
+    """The daily-cron entry point saves new positions for every user but never
+    scores or snapshots — matching is deferred to an on-demand scan."""
+    from app.services import crawler, scraper
+
+    monkeypatch.setattr(crawler, "crawl_presets", lambda: None)  # isolate from preset crawl
+    monkeypatch.setattr(
+        matcher.scraper, "scrape_company",
+        lambda company: [scraper.ScrapedPosition(
+            external_id="new1", title="Backend Engineer", location="Remote",
+            description="Build Python APIs")],
+    )
+    with session_scope() as db:
+        uid = _seed_user(db)  # already has one seeded position + active resume/interest
+
+    summaries = matcher.scrape_for_all_users()
+
+    assert summaries[uid].new_positions == 1 and summaries[uid].scored == 0
+    with session_scope() as db:
+        # The freshly scraped posting is persisted (alongside the seeded one)...
+        assert len(list(db.scalars(matcher.select(models.Position)))) == 2
+        # ...but the cron wrote no MatchResults and saved no job-list snapshot.
+        assert list(db.scalars(matcher.select(models.MatchResult))) == []
+        assert list(db.scalars(matcher.select(models.JobListSnapshot))) == []
+
+
 def test_two_subscribers_share_one_preset_position():
     from app.db import seed_presets
 

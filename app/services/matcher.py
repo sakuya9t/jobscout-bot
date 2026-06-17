@@ -84,7 +84,7 @@ _SCORE_BATCH_DESC_CHARS = 1500  # batch scoring keeps one resume + N postings in
 
 # Marker stored on the `model` column of a MatchResult when scoring terminally
 # failed, so the pair is skipped on re-runs rather than re-billed. Cleared by
-# `clear_failed_markers` (CLI: run-daily --retry-failed).
+# `clear_failed_markers` so a later scan re-scores the pair.
 ERROR_MODEL = "error"
 # Marker for a pair dropped by an explicit exclude keyword before any LLM call.
 # Persisting it (instead of just counting) means the pair leaves the evaluation
@@ -282,7 +282,7 @@ def _persist_error_marker(
     db: Session, user: User, resume: Resume, interest: Interest, pos: Position, message: str
 ) -> None:
     """Mark a (position, interest) pair as terminally failed so it isn't re-billed
-    until ``--retry-failed`` clears it."""
+    until ``clear_failed_markers`` clears it."""
     db.add(MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
@@ -428,8 +428,8 @@ def _score_batch(
         data = client.chat_json(SYSTEM_PROMPT, prompt, MATCH_BATCH_SCHEMA)
     except OllamaBudgetError:
         # Recoverable — don't write error-markers, or these postings would be
-        # skipped until --retry-failed even after the user tops up. Propagate so
-        # the run loop stops and reports it once.
+        # skipped until clear_failed_markers runs even after the user tops up.
+        # Propagate so the run loop stops and reports it once.
         raise
     except OllamaError as exc:
         log.warning("batch scoring failed for %d postings: %s", len(positions), exc)
@@ -756,10 +756,13 @@ def run_for_user(
     return res
 
 
-def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
-    """Entry point for the scheduler/CLI. Crawl the shared preset catalog ONCE, then
-    score each user (which also scrapes that user's custom companies) — committed
-    independently. ``retry_failed`` clears prior error-markers first."""
+def scrape_for_all_users() -> dict[int, RunResult]:
+    """Daily-cron entry point. Crawl the shared preset catalog ONCE, then scrape each
+    user's custom companies and persist any new positions — committed independently
+    per user. Deliberately does NOT score: matching is expensive per user, so it's
+    deferred to an on-demand scan from the job-list view (web ``/api/run`` -> the
+    background evaluator in ``services/evaluator``). New positions simply accumulate
+    until the user runs a scan, which scores the whole backlog."""
     from . import crawler
 
     crawler.crawl_presets()  # shared, once — not per user
@@ -770,16 +773,13 @@ def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
     for uid in user_ids:
         try:
             with session_scope() as db:
-                from . import reporter
-
                 user = db.get(User, uid)
-                if retry_failed:
-                    clear_failed_markers(db, user_id=uid)
-                summaries[uid] = run_for_user(db, user)
-                reporter.record_job_list_snapshot(db, user, summaries[uid])
+                res = scrape_only(db, user)
+                res.finalize_errors()
+                summaries[uid] = res
         except Exception as exc:  # isolate per-user failures
-            log.exception("daily run failed for user %s", uid)
+            log.exception("daily scrape failed for user %s", uid)
             r = RunResult()
-            r.errors.append(f"run failed: {exc}")
+            r.errors.append(f"scrape failed: {exc}")
             summaries[uid] = r
     return summaries
