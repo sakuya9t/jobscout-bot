@@ -25,6 +25,15 @@ class CompanyPreset:
     ats_type: str = "auto"
     ats_token: str | None = None
     location_hint: str | None = None
+    # Whether submitting an application to this company requires registering an
+    # account on its application portal (vs. a one-shot form). Drives the company
+    # detail page's "application account" section and the watch-list tag, and is
+    # the gate for phase-2 auto-apply. Greenhouse/Ashby/Lever boards let you apply
+    # without an account; portals like Google Careers and NVIDIA's Workday don't.
+    requires_account: bool = False
+    # Where the user registers/signs in to apply (prefilled into the account form).
+    # Only meaningful when ``requires_account`` is True.
+    account_portal_url: str | None = None
 
 
 # Order here is the display order in the dashboard dropdown.
@@ -62,6 +71,10 @@ PRESETS: list[CompanyPreset] = [
         careers_url="https://jobs.nvidia.com/careers",
         ats_type="eightfold",
         ats_token="nvidia.com",
+        # Applying funnels into NVIDIA's Workday portal, which requires a candidate
+        # account/sign-in before you can submit.
+        requires_account=True,
+        account_portal_url="https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
     ),
     CompanyPreset(
         # Google has no public ATS API, but its careers site server-renders each
@@ -71,6 +84,9 @@ PRESETS: list[CompanyPreset] = [
         name="Google",
         careers_url="https://www.google.com/about/careers/applications/jobs/results/",
         ats_type="google",
+        # Google Careers requires signing in with a Google account to submit.
+        requires_account=True,
+        account_portal_url="https://accounts.google.com/",
     ),
 ]
 

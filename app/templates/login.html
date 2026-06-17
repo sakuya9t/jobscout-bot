@@ -9,6 +9,10 @@
     <input id="email" type="email" autocomplete="username" />
     <label>Password</label>
     <input id="password" type="password" autocomplete="current-password" />
+    {% if mode == "register" %}
+    <label>Invitation code</label>
+    <input id="invite_code" type="text" autocomplete="off" placeholder="Required to register" />
+    {% endif %}
     <p class="err" id="err"></p>
     <button id="submit" style="width:100%; margin-top:8px;">
       {{ "Sign up" if mode == "register" else "Log in" }}
@@ -39,6 +43,9 @@
       email: document.getElementById("email").value,
       password: document.getElementById("password").value,
     };
+    if (mode === "register") {
+      body.invite_code = document.getElementById("invite_code").value;
+    }
     const path = mode === "register" ? "/api/auth/register" : "/api/auth/login";
     const r = await fetch(path, {
       method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),

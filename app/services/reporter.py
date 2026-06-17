@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models import (
     Application,
+    ApplicationKit,
     Company,
     Interest,
     JobListSnapshot,
@@ -59,6 +60,9 @@ def _match_row(match: MatchResult, pos: Position, company: Company, *,
         "scored_at": match.created_at.isoformat() if match.created_at else None,
         "listed_at": listed.isoformat() if listed else None,
         "applied": False,  # overlaid per-user by tag_applied (live, not stored)
+        # Application-kit status overlaid by tag_kit_status (live, not stored):
+        # None (no kit yet) | "generating" | "ok" | "error".
+        "kit_status": None,
     }
 
 
@@ -78,6 +82,26 @@ def tag_applied(db: Session, user: User, items: list[dict]) -> list[dict]:
     )
     for m in items:
         m["applied"] = m.get("position_id") in applied
+    return items
+
+
+def tag_kit_status(db: Session, user: User, items: list[dict]) -> list[dict]:
+    """Set each item's ``kit_status`` from the user's ApplicationKit rows (None when
+    no kit has been requested for that position). Overlaid live at render time — like
+    ``tag_applied`` — so the job list reflects the current status even on a frozen
+    saved list. Mutates and returns ``items``."""
+    ids = [m["position_id"] for m in items if m.get("position_id") is not None]
+    if not ids:
+        return items
+    statuses = dict(
+        db.execute(
+            select(ApplicationKit.position_id, ApplicationKit.status).where(
+                ApplicationKit.user_id == user.id, ApplicationKit.position_id.in_(ids)
+            )
+        ).all()
+    )
+    for m in items:
+        m["kit_status"] = statuses.get(m.get("position_id"))
     return items
 
 
@@ -151,6 +175,7 @@ def build_job_list(
     min_score: int = 0,
     min_win: int = 0,
     posted_within_days: int | None = None,
+    company_id: int | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
@@ -170,13 +195,18 @@ def build_job_list(
     (None/<=0 = off), by the job's effective listed date — the ATS post date, or
     our first-seen date when the source carries none. The filter is applied to the
     query before counting/paging, so ``total`` and the top-N (e.g. top-5) selection
-    both reflect only the date-filtered pool."""
+    both reflect only the date-filtered pool.
+
+    ``company_id`` (None = all) narrows to one company's postings, applied — like
+    the date filter — before counting/paging so the total reflects the scope."""
     base = (
         select(MatchResult, Position, Company)
         .join(Position, MatchResult.position_id == Position.id)
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id)
     )
+    if company_id is not None:
+        base = base.where(Position.company_id == company_id)
     if posted_within_days and posted_within_days > 0:
         cutoff = utcnow() - timedelta(days=posted_within_days)
         base = base.where(
@@ -217,7 +247,62 @@ def build_job_list(
         below = (not non_matching) and match.match_score < thresholds.get(match.interest_id, 70)
         items.append(_match_row(match, pos, company, below_threshold=below, non_matching=non_matching))
     tag_applied(db, user, items)
+    tag_kit_status(db, user, items)
     return items, total
+
+
+def position_visible(db: Session, user: User, position_id: int) -> bool:
+    """Whether ``position_id`` is in the user's job list — i.e. it has been scored
+    for them (a MatchResult exists). The same gate the 'Mark applied' action uses,
+    so the detail page and kit generation only ever touch positions the user can see."""
+    return db.scalar(
+        select(MatchResult.id)
+        .where(MatchResult.user_id == user.id, MatchResult.position_id == position_id)
+        .limit(1)
+    ) is not None
+
+
+def build_position_detail(db: Session, user: User, position_id: int) -> dict | None:
+    """The detail-page payload for one position: its posting fields plus the user's
+    best stored match (a passing match, highest score, else the highest-scoring
+    row). Returns None when the position isn't in the user's job list. ``applied``
+    is overlaid live like the job list."""
+    row = db.execute(
+        select(MatchResult, Position, Company)
+        .join(Position, MatchResult.position_id == Position.id)
+        .join(Company, Position.company_id == Company.id)
+        .where(MatchResult.user_id == user.id, MatchResult.position_id == position_id)
+        .order_by(
+            MatchResult.passed_filter.desc(),
+            MatchResult.match_score.desc(),
+            MatchResult.win_probability.desc(),
+        )
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    match, pos, company = row
+    listed = _listed_at(pos)
+    detail = {
+        "position_id": pos.id,
+        "company": company.name,
+        "title": pos.title,
+        "location": pos.location,
+        "department": pos.department,
+        "employment_type": pos.employment_type,
+        "url": pos.url,
+        "description": pos.description,
+        "listed_at": listed.isoformat() if listed else None,
+        "match_score": match.match_score,
+        "win_probability": match.win_probability,
+        "reasoning": match.reasoning,
+        "strengths": _loads(match.strengths),
+        "gaps": _loads(match.gaps),
+        "non_matching": not match.passed_filter,
+        "applied": False,
+    }
+    tag_applied(db, user, [detail])
+    return detail
 
 
 def _match_out_payload(match: dict) -> dict:
@@ -276,6 +361,15 @@ def filter_items_posted_within(items: list[dict], posted_within_days: int | None
         if listed is None or listed >= cutoff:
             kept.append(item)
     return kept
+
+
+def filter_items_by_company(items: list[dict], company_name: str | None) -> list[dict]:
+    """Keep stored job-list items for one company (exact ``company`` name match).
+    No-op when ``company_name`` is falsy. Used on the frozen-snapshot path, whose
+    items carry the company name (not its id) — the caller resolves id -> name."""
+    if not company_name:
+        return items
+    return [m for m in items if m.get("company") == company_name]
 
 
 # Substrings that mark a run warning as an LLM-communication failure (vs a scrape

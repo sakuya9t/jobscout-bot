@@ -7,12 +7,51 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
-from ..company_presets import PRESETS
+from ..company_presets import PRESETS, PRESETS_BY_KEY
+from ..crypto import decrypt, encrypt
 from ..db import get_db
-from ..models import Company, Subscription, User
-from ..schemas import CompanyIn, CompanyOut, CompanyPresetOut, CompanyUpdate
+from ..models import Company, CompanyAccount, Subscription, User
+from ..schemas import (
+    CompanyAccountIn,
+    CompanyDetailOut,
+    CompanyIn,
+    CompanyOut,
+    CompanyPresetOut,
+    CompanyUpdate,
+)
 
 router = APIRouter(prefix="/api/companies", tags=["companies"])
+
+
+def _requires_account(company: Company) -> bool:
+    """Whether applying to this company needs a registered portal account — a
+    property of its preset; always False for custom (non-preset) companies."""
+    preset = PRESETS_BY_KEY.get(company.preset_key) if company.preset_key else None
+    return bool(preset and preset.requires_account)
+
+
+def _visible_company(db: Session, user: User, company_id: int) -> Company:
+    """Fetch a company on the user's watch-list: a custom company they own, or a
+    preset company they subscribe to. 404 for anything else (incl. presets they
+    don't follow), so the detail page is scoped exactly to the user's list."""
+    company = db.get(Company, company_id)
+    if company is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
+    if company.is_preset:
+        followed = db.scalar(select(Subscription.id).where(
+            Subscription.user_id == user.id, Subscription.company_id == company.id
+        ))
+        if not followed:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
+    elif company.user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
+    return company
+
+
+def _get_account(db: Session, user: User, company_id: int) -> CompanyAccount | None:
+    return db.scalar(select(CompanyAccount).where(
+        CompanyAccount.user_id == user.id, CompanyAccount.company_id == company_id
+    ))
 
 
 @router.get("/presets", response_model=list[CompanyPresetOut])
@@ -47,14 +86,26 @@ def _detect_preset_key(payload: CompanyIn) -> str | None:
 @router.get("", response_model=list[CompanyOut])
 def list_companies(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """The user's watch-list: their own custom companies + the preset companies they
-    subscribe to (merged, name-sorted)."""
+    subscribe to (merged, name-sorted). Each row carries whether it needs an
+    application account and whether the user has attached one (drives the tags)."""
     custom = db.scalars(select(Company).where(Company.user_id == user.id))
     subscribed = db.scalars(
         select(Company)
         .join(Subscription, Subscription.company_id == Company.id)
         .where(Subscription.user_id == user.id)
     )
-    return sorted([*custom, *subscribed], key=lambda c: c.name.lower())
+    companies = sorted([*custom, *subscribed], key=lambda c: c.name.lower())
+    # Company ids the user has an account attached for (a username is saved).
+    attached = set(db.scalars(select(CompanyAccount.company_id).where(
+        CompanyAccount.user_id == user.id, CompanyAccount.username_enc.is_not(None)
+    )))
+    out: list[CompanyOut] = []
+    for c in companies:
+        row = CompanyOut.model_validate(c)
+        row.requires_account = _requires_account(c)
+        row.account_attached = c.id in attached
+        out.append(row)
+    return out
 
 
 @router.post("", response_model=CompanyOut, status_code=status.HTTP_201_CREATED)
@@ -123,3 +174,74 @@ def delete_company(company_id: int, user: User = Depends(get_current_user), db: 
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
     db.delete(company)
     db.commit()
+
+
+def _detail(db: Session, user: User, company: Company) -> CompanyDetailOut:
+    """Build the detail payload: the company + this user's account state. The
+    password is reported as a flag only; the username (an identifier) is decrypted
+    so the form prefills. The portal URL falls back to the preset default."""
+    out = CompanyDetailOut.model_validate(company)
+    out.requires_account = _requires_account(company)
+    preset = PRESETS_BY_KEY.get(company.preset_key) if company.preset_key else None
+    account = _get_account(db, user, company.id)
+    username = decrypt(account.username_enc) if account else None
+    out.account_username = username
+    out.account_attached = bool(username)
+    out.account_has_password = bool(account and account.password_enc)
+    out.account_notes = account.notes if account else None
+    out.account_portal_url = (
+        (account.portal_url if account and account.portal_url else None)
+        or (preset.account_portal_url if preset else None)
+    )
+    return out
+
+
+@router.get("/{company_id}/detail", response_model=CompanyDetailOut)
+def company_detail(
+    company_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """The company watch-list detail page data, scoped to the user's list."""
+    company = _visible_company(db, user, company_id)
+    return _detail(db, user, company)
+
+
+@router.put("/{company_id}/account", response_model=CompanyDetailOut)
+def save_account(
+    company_id: int,
+    payload: CompanyAccountIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Save the user's application-portal account for a company. Only allowed for
+    preset companies that require an account; the username/password are encrypted
+    before storage. The password follows keep-blank semantics (blank keeps the
+    saved one); the username is set as-typed (blank clears it)."""
+    company = _visible_company(db, user, company_id)
+    if not _requires_account(company):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This company doesn't require an application account.",
+        )
+    account = _get_account(db, user, company.id)
+    if account is None:
+        account = CompanyAccount(user_id=user.id, company_id=company.id)
+        db.add(account)
+    account.username_enc = encrypt(payload.username)  # blank -> None (clears it)
+    if payload.password is not None:  # blank -> keep the saved password
+        account.password_enc = encrypt(payload.password)
+    account.portal_url = payload.portal_url
+    account.notes = payload.notes
+    db.commit()
+    return _detail(db, user, company)
+
+
+@router.delete("/{company_id}/account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    company_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Remove the user's saved account for a company. Idempotent (204 either way)."""
+    company = _visible_company(db, user, company_id)
+    account = _get_account(db, user, company.id)
+    if account is not None:
+        db.delete(account)
+        db.commit()

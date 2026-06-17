@@ -275,6 +275,34 @@ def test_resume_is_account_level_and_overwritten():
         assert listing[0]["id"] == r2.json()["id"] and listing[0]["filename"] == "second.txt"
 
 
+def test_resume_preview_file_and_content():
+    """The résumé title's in-page preview is served two ways: the original file
+    (inline) and the extracted text fallback — both owner-scoped."""
+    with TestClient(app) as c:
+        ha = {"Authorization": f"Bearer {_register(c, 'pv@x.com').json()['access_token']}"}
+        rid = c.post("/api/resumes", headers=ha,
+                     files={"file": ("cv.txt", b"Senior Python engineer", "text/plain")}).json()["id"]
+
+        # Original file, served inline (not as an attachment) with its content type.
+        f = c.get(f"/api/resumes/{rid}/file", headers=ha)
+        assert f.status_code == 200 and f.content == b"Senior Python engineer"
+        assert f.headers["content-type"].startswith("text/plain")
+        assert "inline" in f.headers.get("content-disposition", "")
+
+        # Extracted-text fallback (for formats the browser can't render).
+        content = c.get(f"/api/resumes/{rid}/content", headers=ha).json()
+        assert content["filename"] == "cv.txt" and content["content_text"] == "Senior Python engineer"
+
+        # Another user can't preview it.
+        hb = {"Authorization": f"Bearer {_register(c, 'pv2@x.com').json()['access_token']}"}
+        assert c.get(f"/api/resumes/{rid}/file", headers=hb).status_code == 404
+        assert c.get(f"/api/resumes/{rid}/content", headers=hb).status_code == 404
+    # Auth required.
+    with TestClient(app) as c:
+        assert c.get("/api/resumes/1/file").status_code == 401
+        assert c.get("/api/resumes/1/content").status_code == 401
+
+
 def test_tenant_isolation():
     """User B must never see or mutate user A's data."""
     with TestClient(app) as c:
@@ -416,6 +444,205 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     assert p.description and "distributed systems" in p.description and "BS degree" in p.description
 
 
+def test_eightfold_description_extracted_from_jsonld(monkeypatch):
+    """Eightfold's search API carries no description; we pull it from the job page's
+    schema.org JobPosting JSON-LD (HTML stripped to text). Failures never raise."""
+    from app.services import scraper
+
+    page = ('<html><head><script type="application/ld+json">'
+            '{"@type":"JobPosting","description":"<p>Build <b>great</b> systems</p>"}'
+            '</script></head><body>x</body></html>')
+    monkeypatch.setattr(scraper, "_fetch_text", lambda url: page)
+    assert scraper._eightfold_description("https://j/careers/job/1") == "Build great systems"
+
+    # JSON-LD as a list: take the entry that has a description.
+    listed = ('<script type="application/ld+json">'
+              '[{"@type":"WebSite"},{"@type":"JobPosting","description":"Role <i>info</i>"}]</script>')
+    monkeypatch.setattr(scraper, "_fetch_text", lambda url: listed)
+    assert scraper._eightfold_description("u") == "Role info"
+
+    monkeypatch.setattr(scraper, "_fetch_text", lambda url: "<html>no jsonld</html>")
+    assert scraper._eightfold_description("u") is None
+
+    def boom(url):
+        raise scraper.ScrapeError("dead host")
+    monkeypatch.setattr(scraper, "_fetch_text", boom)
+    assert scraper._eightfold_description("u") is None  # never raises
+
+
+def test_fetch_eightfold_descriptions_caps_and_dedups(monkeypatch):
+    from app.services import scraper
+
+    seen: list[str] = []
+
+    def fake_one(url):
+        seen.append(url)
+        return None if url.endswith("none") else f"desc {url}"
+
+    monkeypatch.setattr(scraper, "_eightfold_description", fake_one)
+    urls = ["u1", "u2", "u2", "u3none", "u4"]  # u2 repeated, u3none resolves to nothing
+    out = scraper.fetch_eightfold_descriptions(urls, cap=3, max_workers=2)
+    # cap applies over the de-duped order [u1, u2, u3none, u4] -> first 3 fetched.
+    assert set(seen) == {"u1", "u2", "u3none"}
+    assert out == {"u1": "desc u1", "u2": "desc u2"}  # u3none contributes nothing
+    assert scraper.fetch_eightfold_descriptions(urls, cap=0) == {}  # disabled
+
+
+def test_eightfold_upsert_enriches_new_and_backfills_existing(monkeypatch):
+    """_upsert_positions fetches detail-page descriptions for eightfold: new rows are
+    enriched, and a previously-stored description-less row is healed (backfill)."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    with session_scope() as db:
+        company = models.Company(name="NV", ats_type="eightfold", ats_token="nv.com",
+                                 careers_url="https://jobs.nv.com/careers")
+        db.add(company); db.flush()
+        db.add(models.Position(company_id=company.id, external_id="old1", title="Old Role",
+                               url="https://jobs.nv.com/careers/job/old1", description=None))
+        db.flush()
+        cid = company.id
+
+    scraped = [
+        scraper.ScrapedPosition(external_id="old1", title="Old Role",
+                                url="https://jobs.nv.com/careers/job/old1"),  # existing, empty
+        scraper.ScrapedPosition(external_id="new1", title="New Role",
+                                url="https://jobs.nv.com/careers/job/new1"),  # brand new
+    ]
+    monkeypatch.setattr(scraper, "scrape_company", lambda company: scraped)
+    captured = {}
+
+    def fake_fetch(urls, cap, max_workers=None):
+        captured["urls"] = list(urls)
+        captured["cap"] = cap
+        return {u: f"Full description for {u}" for u in urls}
+
+    monkeypatch.setattr(scraper, "fetch_eightfold_descriptions", fake_fetch)
+
+    with session_scope() as db:
+        new_positions, errs = _upsert_positions(db, db.get(models.Company, cid))
+        assert not errs
+        assert [p.external_id for p in new_positions] == ["new1"]
+        assert "Full description" in (new_positions[0].description or "")  # new row enriched
+        healed = db.scalar(matcher.select(models.Position).where(
+            models.Position.company_id == cid, models.Position.external_id == "old1"))
+        assert "Full description" in (healed.description or "")  # existing row backfilled
+
+    assert set(captured["urls"]) == {  # both empties submitted, newest-first order preserved
+        "https://jobs.nv.com/careers/job/old1", "https://jobs.nv.com/careers/job/new1"}
+    assert captured["cap"] == 150  # default per-crawl cap from settings
+
+
+def test_migrate_db_copies_schema_and_all_rows(tmp_path):
+    """`jobscout migrate-db` recreates the schema on the target and copies every
+    table's rows (FK order preserved). Exercised SQLite->SQLite; the Postgres
+    sequence-reset step is dialect-guarded and simply skipped here."""
+    import argparse
+    from sqlalchemy import create_engine, func, select
+    from app import models
+    from app.cli import cmd_migrate_db
+    from app.db import engine as source_engine
+
+    # Seed related rows across several tables (users/resumes/companies/positions/
+    # interests) so the copy has FK chains to preserve.
+    with session_scope() as db:
+        _seed_user(db, email="m1@x.com")
+        _seed_user(db, email="m2@x.com")
+
+    target_url = "sqlite:///" + str(tmp_path / "target.db")
+    rc = cmd_migrate_db(argparse.Namespace(target=target_url, drop=True, batch=1000))
+    assert rc == 0
+
+    target_engine = create_engine(target_url)
+    md = models.Base.metadata
+    try:
+        with source_engine.connect() as s, target_engine.connect() as t:
+            for table in md.sorted_tables:
+                src_n = s.execute(select(func.count()).select_from(table)).scalar()
+                tgt_n = t.execute(select(func.count()).select_from(table)).scalar()
+                assert src_n == tgt_n, f"{table.name}: {src_n} != {tgt_n}"
+            # Spot-check real content survived, not just counts.
+            emails = set(t.execute(select(models.User.__table__.c.email)).scalars())
+            assert {"m1@x.com", "m2@x.com"} <= emails
+    finally:
+        target_engine.dispose()
+
+    # Same-URL guard and missing-target guard return non-zero without copying.
+    assert cmd_migrate_db(argparse.Namespace(target=None, drop=False, batch=1000)) == 2
+
+
+def test_backfill_descriptions_cli_heals_eightfold(monkeypatch):
+    """`jobscout backfill-descriptions` fetches descriptions for stored eightfold
+    postings that lack one (and only those), and leaves others/ATSes untouched."""
+    import argparse
+    from app.cli import cmd_backfill_descriptions
+    from app.services import scraper
+
+    with session_scope() as db:
+        nv = models.Company(preset_key="nvidia", name="NVIDIA", ats_type="eightfold",
+                            ats_token="nvidia.com", careers_url="https://jobs.nv.com/careers")
+        gh = models.Company(name="GH", ats_type="greenhouse")  # must be ignored
+        db.add_all([nv, gh]); db.flush()
+        db.add(models.Position(company_id=nv.id, external_id="e1", title="A",
+                               url="https://jobs.nv.com/careers/job/e1", description=None))
+        db.add(models.Position(company_id=nv.id, external_id="e2", title="B",
+                               url="https://jobs.nv.com/careers/job/e2", description=""))
+        db.add(models.Position(company_id=nv.id, external_id="e3", title="C",
+                               url="https://jobs.nv.com/careers/job/e3", description="already here"))
+        db.add(models.Position(company_id=gh.id, external_id="g1", title="G",
+                               url="https://gh/g1", description=None))  # non-eightfold: skip
+        db.flush()
+        nv_id, gh_id = nv.id, gh.id
+
+    captured = {}
+
+    def fake_fetch(urls, cap, max_workers=None):
+        captured["urls"] = list(urls)
+        return {u: f"desc::{u.rsplit('/', 1)[-1]}" for u in urls}
+
+    monkeypatch.setattr(scraper, "fetch_eightfold_descriptions", fake_fetch)
+
+    rc = cmd_backfill_descriptions(argparse.Namespace(company=None, limit=0))
+    assert rc == 0
+    # Only the two empty eightfold rows were fetched (not the filled one, not GH).
+    assert set(captured["urls"]) == {
+        "https://jobs.nv.com/careers/job/e1", "https://jobs.nv.com/careers/job/e2"}
+    with session_scope() as db:
+        by_ext = {p.external_id: p for p in db.scalars(
+            matcher.select(models.Position).where(models.Position.company_id == nv_id))}
+        assert by_ext["e1"].description == "desc::e1" and by_ext["e2"].description == "desc::e2"
+        assert by_ext["e3"].description == "already here"  # untouched
+        gh_pos = db.scalar(matcher.select(models.Position).where(
+            models.Position.company_id == gh_id))
+        assert gh_pos.description is None  # non-eightfold never fetched
+
+    # --company filter matches by preset key; an unknown one is a clean no-op exit.
+    assert cmd_backfill_descriptions(argparse.Namespace(company="nvidia", limit=0)) == 0
+    assert cmd_backfill_descriptions(argparse.Namespace(company="nope", limit=0)) == 1
+
+
+def test_non_eightfold_skips_description_fetch(monkeypatch):
+    """A Greenhouse (or other) company never triggers the detail-page fetch — those
+    ATSes return descriptions inline, so a description-less row stays as-is."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    with session_scope() as db:
+        company = models.Company(name="GH", ats_type="greenhouse", ats_token="gh")
+        db.add(company); db.flush()
+        cid = company.id
+    monkeypatch.setattr(scraper, "scrape_company", lambda company: [
+        scraper.ScrapedPosition(external_id="g1", title="Role", url="https://x/g1", description=None)])
+
+    def fail(*a, **k):
+        raise AssertionError("detail fetch must not run for non-eightfold ATS")
+
+    monkeypatch.setattr(scraper, "fetch_eightfold_descriptions", fail)
+    with session_scope() as db:
+        new_positions, errs = _upsert_positions(db, db.get(models.Company, cid))
+        assert not errs and new_positions[0].description is None
+
+
 def test_duplicate_external_ids_in_one_scrape_deduped(monkeypatch):
     """A board repeating an external_id within one scrape must not violate the
     (company_id, external_id) unique constraint and abort the run."""
@@ -555,8 +782,6 @@ def test_run_drains_whole_backlog_to_zero(monkeypatch):
 def test_excluded_pairs_leave_the_backlog(monkeypatch):
     """A keyword-excluded pair gets an 'excluded' marker row (so the backlog
     converges to 0 and the drain terminates) instead of being silently dropped."""
-    from app.services import scraper
-
     with session_scope() as db:
         uid = _seed_user(db)
         # Exclude anything mentioning "backend" — the seeded position's title.
@@ -990,6 +1215,91 @@ def test_top5_backfills_from_date_filtered_pool():
         assert {"OldHigh1", "OldHigh2"}.isdisjoint(m["title"] for m in items)
 
 
+def _seed_two_company_matches(db, uid):
+    """Add a second company (Globex, 2 matches) alongside _seed_user's Acme (1
+    match) so the company filter has more than one company to slice. Returns
+    (acme_id, globex_id)."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    acme = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    globex = models.Company(user_id=uid, name="Globex")
+    db.add(globex); db.flush()
+
+    def add(company, ext, title, score):
+        pos = models.Position(company_id=company.id, external_id=ext, title=title, description="d")
+        db.add(pos); db.flush()
+        db.add(models.MatchResult(user_id=uid, position_id=pos.id, resume_id=rid,
+                                  interest_id=interest.id, passed_filter=True, match_score=score,
+                                  win_probability=score, reasoning="r", model="good"))
+
+    add(acme, "a1", "Acme Backend", 90)
+    add(globex, "g1", "Globex Backend", 85)
+    add(globex, "g2", "Globex Frontend", 80)
+    db.flush()
+    return acme.id, globex.id
+
+
+def test_build_job_list_filters_by_company():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        acme_id, globex_id = _seed_two_company_matches(db, uid)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        _, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 3  # all matches across both companies
+
+        gx, gx_total = reporter.build_job_list(
+            db, user, category="matching", company_id=globex_id, limit=50)
+        assert gx_total == 2 and {m["company"] for m in gx} == {"Globex"}
+
+        ac, ac_total = reporter.build_job_list(
+            db, user, category="matching", company_id=acme_id, limit=50)
+        assert ac_total == 1 and ac[0]["company"] == "Acme"
+
+        # An id with no matches for this user yields an empty (not leaked) page.
+        _, none_total = reporter.build_job_list(
+            db, user, category="matching", company_id=999999, limit=50)
+        assert none_total == 0
+
+
+def test_job_list_endpoint_filters_by_company(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _, globex_id = _seed_two_company_matches(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        wide = c.get("/api/job-lists/latest?category=matching&limit=50", headers=h).json()
+        assert wide["total"] == 3
+        narrow = c.get(
+            f"/api/job-lists/latest?category=matching&limit=50&company_id={globex_id}", headers=h
+        ).json()
+        assert narrow["total"] == 2 and all(it["company"] == "Globex" for it in narrow["items"])
+
+
+def test_job_list_snapshot_filters_by_company():
+    """The frozen-snapshot path filters by company name resolved from the id."""
+    from app.routers.reports import get_job_list
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        _, globex_id = _seed_two_company_matches(db, uid)
+        user = db.get(models.User, uid)
+        snap = reporter.record_job_list_snapshot(
+            db, user, SimpleNamespace(new_positions=0, scored=3, filtered=0, errors=[])
+        )
+        full = get_job_list(snap.id, limit=50, user=user, db=db)
+        assert full.total == 3
+        only_gx = get_job_list(snap.id, limit=50, company_id=globex_id, user=user, db=db)
+        assert only_gx.total == 2 and all(it.company == "Globex" for it in only_gx.items)
+        # Unknown company id -> empty page, never another company's rows.
+        missing = get_job_list(snap.id, limit=50, company_id=999999, user=user, db=db)
+        assert missing.total == 0 and missing.items == []
+
+
 def test_job_list_endpoint_accepts_post_date_filter(monkeypatch):
     from app.auth import create_access_token
     from app.services import evaluator
@@ -1170,6 +1480,124 @@ def test_effective_llm_config_uses_user_overrides():
         assert eff.base_url == "https://ollama.com"  # from the provider registry
         assert eff.api_key == "sk-user"
         assert eff.main_model == "big-model" and eff.light_model == "small-model"
+
+
+# ── Company application accounts (encrypted, per-user) ───────────────────────
+def test_crypto_roundtrip_and_tamper_resistance():
+    from app import crypto
+
+    token = crypto.encrypt("hunter2")
+    assert token and "hunter2" not in token          # ciphertext, not plaintext
+    assert crypto.decrypt(token) == "hunter2"         # round-trips
+    assert crypto.encrypt(None) is None and crypto.encrypt("") is None
+    assert crypto.decrypt(None) is None
+    assert crypto.decrypt("not-a-real-token") is None  # bad token -> None, never raises
+
+
+def _subscribe_preset(client, headers, name):
+    """Subscribe the user to a built-in preset by name; returns the company row."""
+    presets = client.get("/api/companies/presets", headers=headers).json()
+    p = next(x for x in presets if x["name"] == name)
+    body = {k: p[k] for k in ("name", "careers_url", "ats_type", "ats_token")}
+    body["preset_key"] = p["key"]
+    return client.post("/api/companies", json=body, headers=headers).json()
+
+
+def test_account_preset_attach_encrypts_and_tags():
+    """A preset that needs an account: saving credentials encrypts them at rest,
+    never echoes the password, and flips the watch-list tag to attached. Blank
+    password on re-save keeps the stored one; Remove clears the account."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'acc@x.com').json()['access_token']}"}
+        cid = _subscribe_preset(c, h, "Google")["id"]  # Google Careers requires an account
+
+        row = next(x for x in c.get("/api/companies", headers=h).json() if x["id"] == cid)
+        assert row["requires_account"] is True and row["account_attached"] is False
+
+        det = c.get(f"/api/companies/{cid}/detail", headers=h).json()
+        assert det["requires_account"] is True
+        assert det["account_portal_url"] and "google" in det["account_portal_url"]
+        assert det["account_username"] is None and det["account_has_password"] is False
+
+        saved = c.put(f"/api/companies/{cid}/account", headers=h,
+                      json={"username": "me@gmail.com", "password": "hunter2",
+                            "portal_url": "https://accounts.google.com/"}).json()
+        assert saved["account_attached"] is True
+        assert saved["account_username"] == "me@gmail.com"
+        assert saved["account_has_password"] is True
+        assert "password" not in saved  # secret never returned
+
+        with session_scope() as db:
+            acct = db.scalar(matcher.select(models.CompanyAccount)
+                             .where(models.CompanyAccount.company_id == cid))
+            assert acct.username_enc and "me@gmail.com" not in acct.username_enc
+            assert acct.password_enc and "hunter2" not in acct.password_enc
+
+        row = next(x for x in c.get("/api/companies", headers=h).json() if x["id"] == cid)
+        assert row["account_attached"] is True
+
+        # Blank password keeps the saved one; the username change persists.
+        c.put(f"/api/companies/{cid}/account", headers=h,
+              json={"username": "me2@gmail.com", "password": ""})
+        det2 = c.get(f"/api/companies/{cid}/detail", headers=h).json()
+        assert det2["account_username"] == "me2@gmail.com" and det2["account_has_password"] is True
+
+        assert c.delete(f"/api/companies/{cid}/account", headers=h).status_code == 204
+        det3 = c.get(f"/api/companies/{cid}/detail", headers=h).json()
+        assert det3["account_attached"] is False and det3["account_has_password"] is False
+
+
+def test_account_rejected_for_non_account_and_custom_companies():
+    """Companies you can apply to without an account (Greenhouse presets, and any
+    custom company) expose no account section and refuse account saves."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'noa@x.com').json()['access_token']}"}
+
+        cid = _subscribe_preset(c, h, "Anthropic")["id"]  # Greenhouse: no account needed
+        assert c.get(f"/api/companies/{cid}/detail", headers=h).json()["requires_account"] is False
+        assert c.put(f"/api/companies/{cid}/account", headers=h,
+                     json={"username": "x", "password": "y"}).status_code == 400
+
+        custom = c.post("/api/companies", json={"name": "Acme Custom"}, headers=h).json()
+        cdet = c.get(f"/api/companies/{custom['id']}/detail", headers=h).json()
+        assert cdet["requires_account"] is False and cdet["is_preset"] is False
+        assert c.put(f"/api/companies/{custom['id']}/account", headers=h,
+                     json={"username": "x"}).status_code == 400
+
+
+def test_company_detail_scoped_to_user_watchlist():
+    """Detail is visible only for companies on the user's list: a preset they don't
+    follow and another user's custom company both 404; auth is required."""
+    with TestClient(app) as c:
+        ha = {"Authorization": f"Bearer {_register(c, 'da@x.com').json()['access_token']}"}
+        hb = {"Authorization": f"Bearer {_register(c, 'db@x.com').json()['access_token']}"}
+
+        # A seeded preset the user hasn't subscribed to is not visible.
+        with session_scope() as db:
+            gid = db.scalar(matcher.select(models.Company.id)
+                            .where(models.Company.preset_key == "google"))
+        assert c.get(f"/api/companies/{gid}/detail", headers=ha).status_code == 404
+
+        # B can't see A's custom company; A can.
+        custom = c.post("/api/companies", json={"name": "Acme"}, headers=ha).json()
+        assert c.get(f"/api/companies/{custom['id']}/detail", headers=hb).status_code == 404
+        assert c.get(f"/api/companies/{custom['id']}/detail", headers=ha).status_code == 200
+    with TestClient(app) as c:
+        assert c.get("/api/companies/1/detail").status_code == 401  # auth required
+
+
+def test_company_accounts_cascade_on_user_delete():
+    """Deleting a user removes their saved credentials (no orphaned ciphertext)."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'cas@x.com').json()['access_token']}"}
+        cid = _subscribe_preset(c, h, "NVIDIA")["id"]  # NVIDIA (Workday) requires an account
+        c.put(f"/api/companies/{cid}/account", headers=h,
+              json={"username": "n@v.com", "password": "p"})
+    with session_scope() as db:
+        assert db.scalar(matcher.select(models.CompanyAccount)) is not None
+        db.delete(db.scalar(matcher.select(models.User).where(models.User.email == "cas@x.com")))
+        db.commit()
+        assert list(db.scalars(matcher.select(models.CompanyAccount))) == []
 
 
 def test_clients_built_from_user_config(monkeypatch):
@@ -1594,3 +2022,450 @@ def test_ollama_logging_can_be_disabled(monkeypatch):
     llm_log.flush()
     with session_scope() as db:
         assert list(db.scalars(matcher.select(models.LlmLog))) == []
+
+
+# ── Application kit (per-position detail page) ───────────────────────────────
+class KitClient:
+    """Generation stub. chat_json branches on the schema: the analysis call returns
+    looking_for/open_questions, the resume call returns Markdown + an optimization
+    note. chat_text returns the cover letter."""
+    model = "fake-kit"
+
+    def __init__(self):
+        self.json_calls = 0
+        self.text_calls = 0
+
+    def chat_json(self, system, user, schema, temperature=0.2):
+        self.json_calls += 1
+        if "resume_markdown" in schema.get("properties", {}):
+            return {"resume_markdown": "# Jane Doe\n\n## Experience\n- Built Python APIs",
+                    "optimization_summary": "Reordered to lead with Python and distributed systems."}
+        return {
+            "looking_for": ["Strong Python", "Distributed systems"],
+            "open_questions": [
+                {"question": "Why do you want to work here?",
+                 "advice": "Tie your background to the mission.",
+                 "suggested_answer": "I admire the team's work on…"},
+            ],
+        }
+
+    def chat_text(self, system, user, temperature=0.4):
+        self.text_calls += 1
+        return "Dear hiring team, …"
+
+
+def _seeded_position(db, uid):
+    company = db.scalar(matcher.select(models.Company).where(models.Company.user_id == uid))
+    return db.scalar(matcher.select(models.Position).where(models.Position.company_id == company.id))
+
+
+def test_kit_generate_populates_all_fields():
+    from app.services import kits
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    client = KitClient()
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        pos = _seeded_position(db, uid)
+        kit = kits.generate(db, user, pos, client=client)
+        assert kit.status == "ok"
+    # Two structured calls (analysis + resume) + one free-text doc (cover letter).
+    assert client.json_calls == 2 and client.text_calls == 1
+    with session_scope() as db:
+        kit = db.scalar(matcher.select(models.ApplicationKit))
+        assert json.loads(kit.looking_for) == ["Strong Python", "Distributed systems"]
+        oq = json.loads(kit.open_questions)
+        assert oq[0]["question"] and oq[0]["advice"] and oq[0]["suggested_answer"]
+        assert kit.cover_letter.startswith("Dear hiring team")
+        # The tailored resume is copy-paste-ready Markdown + an optimization note.
+        assert kit.revised_resume.startswith("# Jane Doe")
+        assert "Reordered to lead with Python" in kit.resume_optimization
+        assert kit.model == "fake-kit" and kit.resume_id is not None
+
+
+def test_resume_prompt_requests_polished_markdown_structure():
+    from app.services import kits
+
+    assert "Professional Summary" in kits.RESUME_SYSTEM
+    assert "Core Skills" in kits.RESUME_SYSTEM
+    assert "Selected Impact" in kits.RESUME_SYSTEM
+    assert "Never use Markdown tables" in kits.RESUME_SYSTEM
+
+
+def test_kit_generate_error_keeps_partials():
+    """A failure on a later call leaves the kit in 'error' but keeps what already
+    completed (the analysis), so the page still shows partial results."""
+    from app.services import kits
+    from app.services.ollama_client import OllamaError
+
+    class TextFails(KitClient):
+        def chat_text(self, *a, **k):
+            raise OllamaError("Ollama returned 500: boom")
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        kit = kits.generate(db, db.get(models.User, uid), _seeded_position(db, uid), client=TextFails())
+        assert kit.status == "error" and "boom" in kit.error_detail
+    with session_scope() as db:
+        kit = db.scalar(matcher.select(models.ApplicationKit))
+        assert json.loads(kit.looking_for)  # analysis survived the later failure
+        assert kit.cover_letter is None and kit.revised_resume is None
+
+
+def test_kit_generate_without_resume_errors():
+    from app.services import kits
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.delete(db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)))
+    with session_scope() as db:
+        kit = kits.generate(db, db.get(models.User, uid), _seeded_position(db, uid), client=KitClient())
+        assert kit.status == "error" and "resume" in kit.error_detail.lower()
+
+
+def test_kit_worker_run_generates_kit(monkeypatch):
+    """The background worker body resolves the user's client and produces an 'ok'
+    kit (mirrors the evaluator drain test). Run synchronously for determinism."""
+    from app.services import kit_worker, kits
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+        pid = _seeded_position(db, uid).id
+    monkeypatch.setattr(kits.llm, "clients_for_user", lambda db, user: (KitClient(), KitClient()))
+
+    kit_worker._run(uid, pid)
+
+    with session_scope() as db:
+        kit = db.scalar(matcher.select(models.ApplicationKit))
+        assert kit and kit.status == "ok" and kit.cover_letter and kit.revised_resume
+
+
+def test_position_detail_endpoint_returns_best_match(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:  # produce a passing match so the position is visible
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(score=88), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        d = c.get(f"/api/positions/{pid}/detail", headers=h).json()
+        assert d["position_id"] == pid and d["title"] == "Backend Engineer"
+        assert d["match_score"] == 88 and d["non_matching"] is False
+        assert d["strengths"] == ["Python"] and d["applied"] is False
+        assert d["kit"] is None  # nothing generated yet
+
+
+def test_position_detail_and_kit_require_visibility(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, kit_worker
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    kicked = []
+    monkeypatch.setattr(kit_worker, "ensure_generating", lambda u, p: kicked.append((u, p)))
+    with session_scope() as db:
+        uid = _seed_user(db)
+        unseen_pid = _seeded_position(db, uid).id  # exists, but no MatchResult for the user
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.get(f"/api/positions/{unseen_pid}/detail", headers=h).status_code == 404
+        assert c.get(f"/api/positions/{unseen_pid}/kit", headers=h).status_code == 404
+        assert c.post(f"/api/positions/{unseen_pid}/kit", headers=h).status_code == 404
+        assert c.get("/api/positions/999999/detail", headers=h).status_code == 404
+    assert kicked == []  # an invisible position never reaches the worker
+
+
+def test_generate_kit_kicks_worker_and_polls(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, kit_worker
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    kicked = []
+    monkeypatch.setattr(kit_worker, "ensure_generating", lambda u, p: kicked.append((u, p)))
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.get(f"/api/positions/{pid}/kit", headers=h).status_code == 404  # none yet
+        r = c.post(f"/api/positions/{pid}/kit", headers=h)
+        assert r.status_code == 202 and r.json()["status"] == "generating"
+        assert kicked == [(uid, pid)]
+        polled = c.get(f"/api/positions/{pid}/kit", headers=h).json()
+        assert polled["status"] == "generating"
+        # Re-posting (regenerate) re-arms the worker.
+        c.post(f"/api/positions/{pid}/kit", headers=h)
+        assert kicked == [(uid, pid), (uid, pid)]
+    # The detail payload now carries the in-progress kit.
+    with TestClient(app) as c:
+        d = c.get(f"/api/positions/{pid}/detail", headers=h).json()
+        assert d["kit"]["status"] == "generating"
+
+
+def test_generate_kit_requires_resume(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, kit_worker
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    monkeypatch.setattr(kit_worker, "ensure_generating", lambda u, p: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+        # Deactivate (don't delete) the resume: the scored match — and thus the
+        # position's visibility — survives, but there's no *active* resume to tailor.
+        db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)).is_active = False
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        assert c.post(f"/api/positions/{pid}/kit", headers=h).status_code == 400
+
+
+def test_kit_cascades_on_resume_and_user_delete():
+    with session_scope() as db:
+        uid = _seed_user(db)
+        pos = _seeded_position(db, uid)
+        resume = db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid))
+        db.add(models.ApplicationKit(user_id=uid, position_id=pos.id, resume_id=resume.id, status="ok"))
+        db.flush()
+    # Replacing/deleting the tailored resume drops the (now-stale) kit.
+    with session_scope() as db:
+        db.delete(db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)))
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.ApplicationKit))) == []
+        # Re-add a kit, then deleting the user cascades it too.
+        pos = _seeded_position(db, uid)
+        db.add(models.ApplicationKit(user_id=uid, position_id=pos.id, status="ok"))
+    with session_scope() as db:
+        db.delete(db.get(models.User, uid))
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.ApplicationKit))) == []
+
+
+# ── Applicant profile (user-level autofill data) ─────────────────────────────
+def test_profile_defaults_email_when_absent(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="prof@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        p = c.get("/api/profile", headers=h).json()
+        # No profile saved yet -> blank default with the account email pre-filled.
+        assert p["email"] == "prof@x.com" and p["first_name"] is None
+        assert p["education"] == [] and p["experience"] == []
+    assert c.get("/api/profile").status_code == 401  # auth required
+
+
+def test_profile_upsert_and_replace_children(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="pu@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        body = {
+            "first_name": " Jane ", "last_name": "Doe", "phone": "555-1234",
+            "authorized_to_work": True, "requires_sponsorship": False,
+            "remote_preference": "remote", "gender": "Female",
+            "education": [{"school": "MIT", "degree": "BS", "field_of_study": "CS"}],
+            "experience": [
+                {"company": "Acme", "title": "Engineer", "is_current": True},
+                {"company": "Globex", "title": "Intern"},
+            ],
+        }
+        saved = c.put("/api/profile", headers=h, json=body).json()
+        assert saved["first_name"] == "Jane"  # trimmed
+        assert saved["authorized_to_work"] is True and saved["requires_sponsorship"] is False
+        assert saved["gender"] == "Female"
+        assert [e["school"] for e in saved["education"]] == ["MIT"]
+        assert [x["company"] for x in saved["experience"]] == ["Acme", "Globex"]
+        assert saved["experience"][0]["is_current"] is True
+
+        # A second save with fewer rows REPLACES the children (no leftovers).
+        replaced = c.put("/api/profile", headers=h, json={
+            "first_name": "Jane",
+            "education": [],
+            "experience": [{"company": "NewCo", "title": "Staff"}],
+        }).json()
+        assert replaced["education"] == []
+        assert [x["company"] for x in replaced["experience"]] == ["NewCo"]
+        # GET reflects the latest state.
+        got = c.get("/api/profile", headers=h).json()
+        assert [x["company"] for x in got["experience"]] == ["NewCo"]
+
+
+def test_profile_drops_blank_child_rows(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db, email="pb@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        saved = c.put("/api/profile", headers=h, json={
+            "education": [{"school": "", "degree": ""}, {"school": "CMU"}],
+            "experience": [{"is_current": True}],  # only a flag -> not a real entry
+        }).json()
+        assert [e["school"] for e in saved["education"]] == ["CMU"]
+        assert saved["experience"] == []
+
+
+def test_profile_is_per_user(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid_a = _seed_user(db, email="pa@x.com")
+        uid_b = _seed_user(db, email="pbb@x.com")
+    ha = {"Authorization": f"Bearer {create_access_token(uid_a)}"}
+    hb = {"Authorization": f"Bearer {create_access_token(uid_b)}"}
+    with TestClient(app) as c:
+        c.put("/api/profile", headers=ha, json={"first_name": "AAA", "phone": "111"})
+        # B never sees A's data; B's default email is B's own.
+        pb = c.get("/api/profile", headers=hb).json()
+        assert pb["first_name"] is None and pb["email"] == "pbb@x.com"
+
+
+def test_profile_extract_normalizes_model_aliases():
+    """Models often ignore the field names we ask for and emit their own (name,
+    location, linkedin, work_experience, dates, role, highlights). The extractor
+    must still map them onto the profile shape — the real-world failure that made
+    import return an empty name and no experience."""
+    from app.services import profile_extract
+
+    class AliasClient:
+        model = "fake-extract"
+
+        def chat_text(self, system, user, temperature=0.4):
+            # Different keys than we asked for, plus prose around the JSON.
+            return (
+                "Here is the extracted profile:\n"
+                '{"name": "Jane Q Doe", "email": "jane@doe.dev", '
+                '"location": "Boston, MA, USA", "linkedin": "https://linkedin.com/in/jane", '
+                '"work_experience": [{"company": "Acme", "role": "Senior Engineer", '
+                '"dates": "2021 - Present", "highlights": ["Built APIs", "Led a team"]}], '
+                '"education": [{"school": "MIT", "degree": "BS", "field": "CS", "dates": "2016 - 2020"}]}'
+            )
+
+    with session_scope() as db:
+        uid = _seed_user(db, email="ex@x.com")
+    with session_scope() as db:
+        draft = profile_extract.extract_from_resume(db, db.get(models.User, uid), client=AliasClient())
+
+    assert draft["first_name"] == "Jane" and draft["last_name"] == "Q Doe"
+    assert draft["email"] == "jane@doe.dev"
+    assert (draft["city"], draft["state_region"], draft["country"]) == ("Boston", "MA", "USA")
+    assert draft["linkedin_url"] == "https://linkedin.com/in/jane"
+    exp = draft["experience"][0]
+    assert exp["company"] == "Acme" and exp["title"] == "Senior Engineer"
+    assert exp["start_date"] == "2021" and exp["is_current"] is True
+    # Bullets become one "- " line each.
+    assert exp["description"] == "- Built APIs\n- Led a team"
+    edu = draft["education"][0]
+    assert edu["school"] == "MIT" and edu["field_of_study"] == "CS"
+    assert edu["start_date"] == "2016" and edu["end_date"] == "2020"
+
+
+def test_format_description_bullets_and_ordered_lists():
+    from app.services.profile_extract import _format_description as fmt
+
+    # A list of bullets -> one "- " line each (existing markers stripped).
+    assert fmt(["Built APIs", "Led a team"]) == "- Built APIs\n- Led a team"
+    assert fmt(["• Built APIs", "- Led a team"]) == "- Built APIs\n- Led a team"
+    # Inline glyphs and newlines both split into "- " lines.
+    assert fmt("• Built APIs • Led a team") == "- Built APIs\n- Led a team"
+    assert fmt("Built APIs\nLed a team") == "- Built APIs\n- Led a team"
+    # Ordered list: each item on its own line, numbering preserved.
+    assert fmt("1. Built APIs 2. Led a team") == "1. Built APIs\n2. Led a team"
+    # Plain prose stays a single block — no spurious leading dash.
+    prose = "Led a team that shipped the billing platform."
+    assert fmt(prose) == prose
+    # Description priority + empties.
+    assert fmt(None, ["Did X"]) == "- Did X"
+    assert fmt("", None, []) == ""
+
+
+def test_profile_extract_requires_active_resume():
+    from app.services import profile_extract
+
+    with session_scope() as db:
+        uid = _seed_user(db, email="nr@x.com")
+        db.delete(db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid)))
+    with session_scope() as db:
+        with pytest.raises(profile_extract.NoResumeError):
+            profile_extract.extract_from_resume(db, db.get(models.User, uid), client=object())
+
+
+def test_profile_import_endpoint(monkeypatch):
+    from app.auth import create_access_token
+    from app.services import evaluator, profile_extract
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    monkeypatch.setattr(profile_extract, "extract_from_resume",
+                        lambda db, user, **k: {"first_name": "Imported", "education": [], "experience": []})
+    with session_scope() as db:
+        uid = _seed_user(db, email="imp@x.com")
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        out = c.post("/api/profile/import-from-resume", headers=h).json()
+        assert out["first_name"] == "Imported"
+        # Import does NOT persist — the saved profile is still empty.
+        assert c.get("/api/profile", headers=h).json()["first_name"] is None
+
+
+def test_profile_cascades_on_user_delete():
+    with session_scope() as db:
+        uid = _seed_user(db, email="pc@x.com")
+        db.add(models.ApplicantProfile(user_id=uid, first_name="Jane"))
+        db.add(models.ProfileEducation(user_id=uid, school="MIT"))
+        db.add(models.ProfileExperience(user_id=uid, company="Acme"))
+        db.flush()
+    with session_scope() as db:
+        db.delete(db.get(models.User, uid))
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.ApplicantProfile))) == []
+        assert list(db.scalars(matcher.select(models.ProfileEducation))) == []
+        assert list(db.scalars(matcher.select(models.ProfileExperience))) == []
+
+
+def test_job_list_surfaces_kit_status(monkeypatch):
+    """The job list overlays each position's application-kit status (live, like
+    'applied') so the row can show a generating/ready icon."""
+    from app.auth import create_access_token
+    from app.services import evaluator
+
+    monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+        pid = _first_matched_position_id(db, uid)
+    h = {"Authorization": f"Bearer {create_access_token(uid)}"}
+    with TestClient(app) as c:
+        # No kit yet -> kit_status is null.
+        before = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert all(it["kit_status"] is None for it in before["items"])
+    with session_scope() as db:
+        db.add(models.ApplicationKit(user_id=uid, position_id=pid, status="generating"))
+    with TestClient(app) as c:
+        gen = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and it["kit_status"] == "generating" for it in gen["items"])
+    with session_scope() as db:
+        db.scalar(matcher.select(models.ApplicationKit)).status = "ok"
+    with TestClient(app) as c:
+        done = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and it["kit_status"] == "ok" for it in done["items"])

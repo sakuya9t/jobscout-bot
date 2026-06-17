@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class _ORM(BaseModel):
@@ -31,6 +31,13 @@ class MatchVerdict(BaseModel):
 class Credentials(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)
+
+
+class RegisterCredentials(Credentials):
+    # Required at registration only when JOBSCOUT_REQUIRE_INVITE is on (the route, not
+    # the schema, enforces presence, so the field is optional here and ignored when
+    # invites are disabled). Login uses plain Credentials and never carries a code.
+    invite_code: str | None = None
 
 
 class Token(BaseModel):
@@ -147,6 +154,14 @@ class ResumeOut(_ORM):
     created_at: datetime
 
 
+class ResumeContentOut(_ORM):
+    """The résumé's extracted plain text, for the in-page preview fallback when the
+    browser can't render the original file (e.g. .docx)."""
+
+    filename: str
+    content_text: str
+
+
 # ── Company ──────────────────────────────────────────────────────────────────
 class CompanyPresetOut(BaseModel):
     """A built-in popular-company option the dashboard offers as a one-click fill."""
@@ -191,6 +206,50 @@ class CompanyOut(_ORM):
     # True for a global preset company the user is subscribed to (vs their own
     # custom company). Deleting it unsubscribes rather than removing the catalog row.
     is_preset: bool = False
+    # Whether this (preset) company requires a registered application account, and
+    # whether the current user has attached one. Both overlaid by the router (not
+    # ORM columns) to drive the watch-list tag. Always False for custom companies.
+    requires_account: bool = False
+    account_attached: bool = False
+
+
+class CompanyDetailOut(CompanyOut):
+    """The company watch-list detail page payload: the company plus the account
+    state for the current user. The saved password is never returned (only whether
+    one is set); the username is an identifier and is returned so the form prefills."""
+
+    # Where the user registers/signs in to apply (preset default or user override).
+    account_portal_url: str | None = None
+    account_username: str | None = None
+    account_has_password: bool = False
+    account_notes: str | None = None
+
+
+class CompanyAccountIn(BaseModel):
+    """Save the current user's application-portal account for a company. The
+    username is set as-typed (blank clears it, which also clears "attached"); the
+    password follows the keep-blank convention (a non-empty value replaces it, blank
+    keeps the stored one) since it's never prefilled into the form."""
+
+    username: str | None = None
+    password: str | None = None
+    portal_url: str | None = None
+    notes: str | None = None
+
+    @field_validator("username", "portal_url", "notes")
+    @classmethod
+    def _blank_to_none(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v.strip() or None
+
+    @field_validator("password")
+    @classmethod
+    def _strip_password(cls, v: str | None) -> str | None:
+        # Preserve interior spaces but trim edges; blank -> None (= keep existing).
+        if v is None:
+            return None
+        return v.strip() or None
 
 
 # ── Interest ─────────────────────────────────────────────────────────────────
@@ -258,12 +317,70 @@ class MatchOut(BaseModel):
     # Whether the current user has marked this position applied (the "Mark applied"
     # toggle). Overlaid live at render time, not stored in saved snapshots.
     applied: bool = False
+    # Application-kit status for this position, overlaid live like ``applied``:
+    # None (no kit requested) | "generating" | "ok" | "error". Drives the job-list
+    # row's kit-status icon.
+    kit_status: str | None = None
 
 
 class ApplicationOut(_ORM):
     position_id: int
     status: str
     applied_at: datetime
+
+
+# ── Application kit (per-position detail page) ───────────────────────────────
+class OpenQuestionOut(BaseModel):
+    """One open application question the LLM detected for a posting, with how to
+    approach it and a draft answer grounded in the candidate's resume."""
+
+    question: str
+    advice: str = ""
+    suggested_answer: str = ""
+
+
+class ApplicationKitOut(BaseModel):
+    """The generated (or in-progress) application kit for one (user, position).
+    ``status`` is "generating" | "ok" | "error"; the content fields are populated
+    as the background worker completes, so a polling client sees partial results."""
+
+    status: str
+    looking_for: list[str] = Field(default_factory=list)
+    open_questions: list[OpenQuestionOut] = Field(default_factory=list)
+    cover_letter: str | None = None
+    # The tailored resume as copy-paste-ready Markdown, plus a short note on what
+    # was optimized for this position (shown below the resume, not part of the copy).
+    revised_resume: str | None = None
+    resume_optimization: str | None = None
+    model: str | None = None
+    error_detail: str | None = None
+    updated_at: datetime | None = None
+
+
+class PositionDetailOut(BaseModel):
+    """Everything the position detail page shows: the posting, the best stored
+    match (score/win/strengths/gaps), live applied status, and the cached kit (or
+    null when none has been generated yet)."""
+
+    position_id: int
+    company: str
+    title: str
+    location: str | None = None
+    department: str | None = None
+    employment_type: str | None = None
+    url: str | None = None
+    description: str | None = None
+    listed_at: str | None = None
+    match_score: int | None = None
+    win_probability: int | None = None
+    reasoning: str | None = None
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    # True when the best stored match for this position did not pass the relevance
+    # filter (score fields aren't meaningful) — the page shows a "not a match" pill.
+    non_matching: bool = False
+    applied: bool = False
+    kit: ApplicationKitOut | None = None
 
 
 class JobListRunOut(BaseModel):
@@ -306,3 +423,97 @@ class RunSummary(BaseModel):
     errors: list[str] = []
     # Positions handed to the background evaluator and not yet scored.
     pending: int = 0
+
+
+# ── Applicant profile (user-level autofill data) ─────────────────────────────
+class _BlankStrToNone(BaseModel):
+    """Coerce blank/whitespace-only string fields to None (and trim the rest) so the
+    profile stores clean nulls instead of empty strings from an untouched form."""
+
+    @model_validator(mode="after")
+    def _coerce_blanks(self):
+        for name, value in self.__dict__.items():
+            if isinstance(value, str):
+                setattr(self, name, value.strip() or None)
+        return self
+
+
+class ProfileEducationIn(_BlankStrToNone):
+    school: str | None = None
+    degree: str | None = None
+    field_of_study: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    gpa: str | None = None
+    location: str | None = None
+    description: str | None = None
+
+
+class ProfileEducationOut(ProfileEducationIn):
+    id: int | None = None
+
+
+class ProfileExperienceIn(_BlankStrToNone):
+    company: str | None = None
+    title: str | None = None
+    location: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    is_current: bool = False
+    description: str | None = None
+
+
+class ProfileExperienceOut(ProfileExperienceIn):
+    id: int | None = None
+
+
+class _ProfileScalars(BaseModel):
+    """The flat profile fields shared by the In (request) and Out (response) models.
+    Every field is optional — an application profile is filled incrementally."""
+
+    # Identity + contact
+    first_name: str | None = None
+    last_name: str | None = None
+    preferred_name: str | None = None
+    pronouns: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    address_line1: str | None = None
+    address_line2: str | None = None
+    city: str | None = None
+    state_region: str | None = None
+    postal_code: str | None = None
+    country: str | None = None
+    # Links
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    portfolio_url: str | None = None
+    other_url: str | None = None
+    # Work authorization (booleans tri-state: None = not answered)
+    work_authorization: str | None = None
+    authorized_to_work: bool | None = None
+    requires_sponsorship: bool | None = None
+    open_to_relocation: bool | None = None
+    # Job preferences
+    desired_salary: str | None = None
+    salary_currency: str | None = None
+    remote_preference: str | None = None
+    preferred_locations: str | None = None
+    earliest_start_date: str | None = None
+    notice_period: str | None = None
+    # Voluntary self-identification (EEO)
+    gender: str | None = None
+    race_ethnicity: str | None = None
+    hispanic_latino: str | None = None
+    veteran_status: str | None = None
+    disability_status: str | None = None
+
+
+class ApplicantProfileIn(_ProfileScalars, _BlankStrToNone):
+    education: list[ProfileEducationIn] = Field(default_factory=list)
+    experience: list[ProfileExperienceIn] = Field(default_factory=list)
+
+
+class ApplicantProfileOut(_ProfileScalars):
+    education: list[ProfileEducationOut] = Field(default_factory=list)
+    experience: list[ProfileExperienceOut] = Field(default_factory=list)

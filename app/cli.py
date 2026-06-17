@@ -7,10 +7,19 @@ Commands:
   init-db          Create database tables.
   health           Check DB + Ollama connectivity.
   token <email>    Mint a bearer token for a user (for MCP / API clients).
+  invite           Mint / list / revoke registration invite codes
+                   (e.g. `jobscout invite mint --max-uses 5 --expires-days 30`).
+  backfill-descriptions
+                   Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
+                   whose search API returns none, so older postings become scoreable.
+  migrate-db       Copy schema + data to another database (e.g. SQLite -> Supabase
+                   Postgres) to publish the app on a hosted DB.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sys
 
 
@@ -81,6 +90,195 @@ def cmd_health(_: argparse.Namespace) -> int:
     return 0 if db_ok and ollama != "unreachable" else 1
 
 
+def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
+    """Backfill descriptions for already-stored eightfold postings (NVIDIA et al.).
+
+    The PCSX search API carries no description, so positions scraped before the
+    detail-page enrichment landed are description-less and the matcher skips them.
+    This fetches each one's JSON-LD description (batched, bounded concurrency) and
+    updates it in place. Idempotent — re-running only touches still-empty rows.
+    Targeted: only postings that have a URL and an empty description are fetched, so
+    it never re-hits the search API or the other ATSes."""
+    from sqlalchemy import select
+
+    from .db import init_db, session_scope
+    from .models import Company, Position
+    from .services import scraper
+
+    init_db()
+    total = 0
+    with session_scope() as db:
+        companies = list(db.scalars(
+            select(Company).where(Company.ats_type == "eightfold", Company.is_active == True)  # noqa: E712
+        ))
+        if args.company:
+            key = args.company.strip().lower()
+            companies = [c for c in companies
+                         if (c.preset_key or "").lower() == key or c.name.lower() == key]
+        if not companies:
+            print("No matching active eightfold companies.", file=sys.stderr)
+            return 1
+        for company in companies:
+            empties = [
+                p for p in db.scalars(select(Position).where(Position.company_id == company.id))
+                if p.url and not (p.description or "").strip()
+            ]
+            cap = args.limit if args.limit and args.limit > 0 else len(empties)
+            urls = [p.url for p in empties][:cap]
+            if not urls:
+                print(f"{company.name}: nothing to backfill.")
+                continue
+            print(f"{company.name}: fetching {len(urls)} of {len(empties)} "
+                  f"description-less posting(s)…")
+            descs = scraper.fetch_eightfold_descriptions(urls, cap=len(urls))
+            updated = 0
+            for p in empties:
+                text = descs.get(p.url)
+                if text:
+                    p.description = text
+                    updated += 1
+            db.commit()  # release the write lock between companies
+            total += updated
+            print(f"{company.name}: backfilled {updated} description(s).")
+    print(f"Done — backfilled {total} posting(s). Run a scan (or `jobscout run-daily`) "
+          "to score the newly-described jobs.")
+    return 0
+
+
+def _redact_url(url: str) -> str:
+    """Mask the password in a DB URL for safe printing."""
+    return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", url)
+
+
+def cmd_migrate_db(args: argparse.Namespace) -> int:
+    """Copy schema + all rows from the current database (``settings.database_url``,
+    e.g. the local SQLite file) into a target database (e.g. Supabase Postgres).
+
+    Creates the schema on the target from the ORM models, copies every table in
+    FK-safe dependency order, then fixes Postgres autoincrement sequences so future
+    inserts don't collide with the copied ids. Encrypted columns (company_accounts)
+    copy as-is — decryption keeps working only if the target deployment uses the
+    SAME JOBSCOUT_SECRET_KEY. ``--drop`` recreates the target schema first (so a
+    re-run is clean); without it the target must be empty."""
+    from sqlalchemy import create_engine, func, select, text
+
+    from . import models
+    from .config import settings
+    from .db import engine as source_engine
+
+    target_url = args.target or os.environ.get("JOBSCOUT_TARGET_DATABASE_URL")
+    if not target_url:
+        print("No target. Pass --target <url> or set JOBSCOUT_TARGET_DATABASE_URL.",
+              file=sys.stderr)
+        return 2
+    if target_url == settings.database_url:
+        print("Target is the same as the source — nothing to do.", file=sys.stderr)
+        return 2
+
+    print(f"Source: {_redact_url(settings.database_url)}")
+    print(f"Target: {_redact_url(target_url)}")
+    target_engine = create_engine(target_url, future=True)
+    md = models.Base.metadata
+
+    try:
+        if args.drop:
+            print("Recreating target schema (--drop)…")
+            md.drop_all(target_engine)
+        md.create_all(target_engine)
+
+        total = 0
+        with source_engine.connect() as src, target_engine.begin() as dst:
+            for table in md.sorted_tables:
+                rows = [dict(r._mapping) for r in src.execute(select(table))]
+                for i in range(0, len(rows), args.batch):
+                    dst.execute(table.insert(), rows[i : i + args.batch])
+                print(f"  {table.name:24} {len(rows):>6} rows")
+                total += len(rows)
+
+            # Postgres: copied rows carry explicit ids, so the SERIAL sequences are
+            # still at 1 and the next insert would collide. Advance each to MAX(id).
+            if dst.dialect.name == "postgresql":
+                for table in md.sorted_tables:
+                    if "id" not in table.c or not table.c.id.primary_key:
+                        continue
+                    max_id = dst.execute(select(func.max(table.c.id))).scalar()
+                    if max_id is None:
+                        continue
+                    seq = dst.execute(
+                        text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table.name}
+                    ).scalar()
+                    if seq:
+                        dst.execute(text("SELECT setval(:s, :v, true)"), {"s": seq, "v": max_id})
+                print("  (reset Postgres id sequences)")
+    except Exception as exc:  # noqa: BLE001 — surface the failure, leave target as-is
+        print(f"Migration failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        target_engine.dispose()
+
+    print(f"Done — copied {total} rows across {len(md.sorted_tables)} tables.")
+    print("Next: set JOBSCOUT_DATABASE_URL to the target (same JOBSCOUT_SECRET_KEY) "
+          "and restart the app.")
+    return 0
+
+
+def cmd_invite(args: argparse.Namespace) -> int:
+    """Mint / list / revoke registration invite codes (see app/invites.py)."""
+    from sqlalchemy import select
+
+    from . import invites
+    from .db import init_db, session_scope
+    from .models import InviteCode
+
+    init_db()
+    with session_scope() as db:
+        if args.invite_command == "mint":
+            codes = invites.mint(
+                db,
+                max_uses=args.max_uses,
+                expires_in_days=args.expires_days,
+                note=args.note,
+                count=args.count,
+            )
+            # Printed once — only the HMAC is stored, so a code can't be recovered later.
+            print(f"Minted {len(codes)} code(s) "
+                  f"(max_uses={max(1, args.max_uses)}, "
+                  f"expires={'in ' + str(args.expires_days) + 'd' if args.expires_days else 'never'}):")
+            for code in codes:
+                print(f"  {code}")
+            return 0
+
+        if args.invite_command == "list":
+            rows = list(db.scalars(select(InviteCode).order_by(InviteCode.id)))
+            if not rows:
+                print("No invite codes.")
+                return 0
+            print(f"{'id':>4}  {'uses':>9}  {'expires':<19}  {'state':<8}  note")
+            for r in rows:
+                expires = r.expires_at.strftime("%Y-%m-%d %H:%M") if r.expires_at else "never"
+                if r.revoked:
+                    state = "revoked"
+                elif invites.is_expired(r):
+                    state = "expired"
+                elif r.uses >= r.max_uses:
+                    state = "used-up"
+                else:
+                    state = "active"
+                print(f"{r.id:>4}  {r.uses:>4}/{r.max_uses:<4}  {expires:<19}  {state:<8}  {r.note or ''}")
+            return 0
+
+        if args.invite_command == "revoke":
+            target = args.code.strip()
+            ok = (
+                invites.revoke(db, code_id=int(target)) if target.isdigit()
+                else invites.revoke(db, code=target)
+            )
+            print(f"Revoked {target}." if ok else f"No matching code: {target}")
+            return 0 if ok else 1
+
+    return 2
+
+
 def cmd_token(args: argparse.Namespace) -> int:
     from sqlalchemy import select
 
@@ -122,9 +320,36 @@ def main() -> None:
     sub.add_parser("init-db", help="Create database tables").set_defaults(func=cmd_init_db)
     sub.add_parser("health", help="Check DB + Ollama").set_defaults(func=cmd_health)
 
+    p = sub.add_parser("backfill-descriptions",
+                       help="Fetch missing descriptions for eightfold boards (e.g. NVIDIA)")
+    p.add_argument("--company", help="Limit to one company by preset key or name (e.g. nvidia)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="Max postings to fetch per company (0 = all description-less rows)")
+    p.set_defaults(func=cmd_backfill_descriptions)
+
+    p = sub.add_parser("migrate-db",
+                       help="Copy schema + data to another DB (e.g. SQLite -> Supabase Postgres)")
+    p.add_argument("--target", help="Target SQLAlchemy URL (or set JOBSCOUT_TARGET_DATABASE_URL)")
+    p.add_argument("--drop", action="store_true", help="Recreate the target schema first")
+    p.add_argument("--batch", type=int, default=1000, help="Rows per insert batch")
+    p.set_defaults(func=cmd_migrate_db)
+
     p = sub.add_parser("token", help="Mint a bearer token for a user")
     p.add_argument("email")
     p.set_defaults(func=cmd_token)
+
+    p = sub.add_parser("invite", help="Mint / list / revoke registration invite codes")
+    isub = p.add_subparsers(dest="invite_command", required=True)
+    m = isub.add_parser("mint", help="Mint new invite code(s); prints them once")
+    m.add_argument("--max-uses", type=int, default=1, help="How many times each code can be used")
+    m.add_argument("--expires-days", type=int, default=None,
+                   help="Days until each code expires (omit = never expires)")
+    m.add_argument("--count", type=int, default=1, help="How many codes to mint")
+    m.add_argument("--note", default=None, help="Optional label stored with the code(s)")
+    isub.add_parser("list", help="List all invite codes and their state")
+    rv = isub.add_parser("revoke", help="Revoke a code by id or by the code itself")
+    rv.add_argument("code", help="Invite code id (number) or the plaintext code")
+    p.set_defaults(func=cmd_invite)
 
     args = parser.parse_args()
     raise SystemExit(args.func(args))

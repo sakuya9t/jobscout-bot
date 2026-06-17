@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -13,12 +14,22 @@ from ..auth import get_current_user
 from ..config import settings
 from ..db import get_db
 from ..models import Resume, User
-from ..schemas import ResumeOut
+from ..schemas import ResumeContentOut, ResumeOut
 from ..services.resume_parser import extract_text
 
 router = APIRouter(prefix="/api/resumes", tags=["resumes"])
 
 MAX_RESUME_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# Content types for inline preview of the stored original file. Anything else is
+# served as a generic binary (the dashboard falls back to the extracted text).
+_MEDIA_TYPES = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/plain",
+    ".markdown": "text/plain",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 
 
 def _safe_filename(name: str | None) -> str:
@@ -104,6 +115,35 @@ def _owned(db: Session, user: User, resume_id: int) -> Resume:
     if not resume or resume.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Resume not found")
     return resume
+
+
+@router.get("/{resume_id}/file")
+def get_resume_file(
+    resume_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Stream the original uploaded file for in-page preview (inline, not a
+    download). PDFs render natively in the dashboard's preview iframe; the browser
+    handles txt/md too. Scoped to the owner via ``_owned``."""
+    resume = _owned(db, user, resume_id)
+    path = _stored_path(user.id, resume)
+    if not path.exists():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Stored resume file not found")
+    ext = os.path.splitext(resume.filename)[1].lower()
+    return FileResponse(
+        path,
+        media_type=_MEDIA_TYPES.get(ext, "application/octet-stream"),
+        filename=resume.filename,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/{resume_id}/content", response_model=ResumeContentOut)
+def get_resume_content(
+    resume_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """The résumé's extracted plain text — the dashboard preview's fallback for
+    formats the browser can't render inline (e.g. .docx)."""
+    return _owned(db, user, resume_id)
 
 
 @router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)

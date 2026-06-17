@@ -31,6 +31,27 @@ class Settings(BaseSettings):
     # trigger. Set JOBSCOUT_ADMIN_TOKEN to a long random string to enable.
     admin_token: str = ""
 
+    # Registration control (see app/invites.py). When on (default), /api/auth/register
+    # requires a valid invite code; set JOBSCOUT_REQUIRE_INVITE=0 for open registration
+    # (local dev / tests). invite_secret is the HMAC key for codes; empty falls back to
+    # secret_key so there's no extra key to manage — set it only to rotate invites
+    # independently of sessions (rotating invalidates outstanding codes).
+    require_invite: bool = True
+    invite_secret: str = ""
+
+    # Rate limiting (see app/ratelimit.py). In-process per-IP limits: a global blanket
+    # plus stricter caps on login/register. Disable for tests/dev with
+    # JOBSCOUT_RATE_LIMIT_ENABLED=0. Behind a multi-instance/serverless deploy these are
+    # per-instance only — use the platform WAF as the real DoS shield (docs/DEPLOY_VERCEL.md).
+    rate_limit_enabled: bool = True
+    rate_limit_global_per_minute: int = 120
+    rate_limit_auth_per_minute: int = 5      # login attempts / IP / minute
+    rate_limit_register_per_hour: int = 5    # signups / IP / hour (also throttles code guessing)
+    # Trust the left-most X-Forwarded-For hop for the client IP (correct behind a proxy
+    # like Vercel/nginx). Turn OFF for a directly-exposed server, where the header is
+    # client-controlled and could be spoofed to dodge the limit.
+    trust_forwarded_for: bool = True
+
     @property
     def secret_is_default(self) -> bool:
         return self.secret_key == DEFAULT_SECRET
@@ -83,6 +104,14 @@ class Settings(BaseSettings):
     # postings predate scrape_max_age_days, so this only caps very high-volume
     # boards (60 pages = 600 newest roles) to bound request count per crawl.
     scrape_eightfold_max_pages: int = 60
+    # Eightfold's search API returns no job description — it lives only on each job's
+    # detail page (a JSON-LD block). Without it, every posting is description-less and
+    # the matcher skips it, so we fetch detail pages to enrich/backfill descriptions.
+    # That's one request per job, so cap how many we fetch per crawl (newest-first);
+    # the rest are picked up on subsequent crawls. Fetched in bounded-concurrency
+    # batches (scrape_eightfold_desc_workers) to stay polite. 0 disables enrichment.
+    scrape_eightfold_max_descriptions: int = 150
+    scrape_eightfold_desc_workers: int = 10
     # Only pull postings posted/updated within this many days, to bound how much we
     # store and score. Applies only to sources that expose a date (greenhouse/
     # lever/ashby); Google careers and the HTML fallback carry no per-posting date,

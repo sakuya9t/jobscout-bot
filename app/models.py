@@ -46,6 +46,11 @@ class User(Base):
     subscriptions: Mapped[list[Subscription]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    # Per-user credentials for the application portals of preset companies that
+    # require an account to apply (see CompanyAccount). Encrypted at rest.
+    company_accounts: Mapped[list[CompanyAccount]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     interests: Mapped[list[Interest]] = relationship(back_populates="user", cascade="all, delete-orphan")
     matches: Mapped[list[MatchResult]] = relationship(back_populates="user", cascade="all, delete-orphan")
     job_list_snapshots: Mapped[list[JobListSnapshot]] = relationship(
@@ -54,8 +59,22 @@ class User(Base):
     applications: Mapped[list[Application]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    application_kits: Mapped[list[ApplicationKit]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     llm_config: Mapped[LlmConfig | None] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
+    # User-level applicant profile (the autofill data source for phase-2
+    # auto-apply): one scalar record plus repeating education/experience rows.
+    profile: Mapped[ApplicantProfile | None] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
+    profile_education: Mapped[list[ProfileEducation]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    profile_experience: Mapped[list[ProfileExperience]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -90,6 +109,11 @@ class Resume(Base):
     # Deleting a resume removes the matches scored against it (and its on-disk
     # file, handled in the router) so reports never reference a missing resume.
     matches: Mapped[list[MatchResult]] = relationship(
+        back_populates="resume", cascade="all, delete-orphan"
+    )
+    # Application kits are tailored to a specific resume, so replacing/deleting the
+    # resume drops them too (they'd be stale) — same lifecycle as ``matches``.
+    application_kits: Mapped[list[ApplicationKit]] = relationship(
         back_populates="resume", cascade="all, delete-orphan"
     )
 
@@ -127,6 +151,11 @@ class Company(Base):
     positions: Mapped[list[Position]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
+    # Users' saved application-portal accounts for this company (preset companies
+    # only; cascades so a removed company never leaves orphaned credentials).
+    accounts: Mapped[list[CompanyAccount]] = relationship(
+        back_populates="company", cascade="all, delete-orphan"
+    )
 
     @property
     def is_preset(self) -> bool:
@@ -151,6 +180,38 @@ class Subscription(Base):
 
     user: Mapped[User] = relationship(back_populates="subscriptions")
     company: Mapped[Company] = relationship()
+
+
+class CompanyAccount(Base):
+    """A user's login for the application portal of a (preset) company that
+    requires registering an account to apply — e.g. Google Careers or NVIDIA's
+    Workday. One row per (user, company); only created for companies whose preset
+    has ``requires_account`` set. The username and password are encrypted at rest
+    (see ``app/crypto.py``) — unlike the Telegram token / LLM key, which are stored
+    plaintext — because these are credentials to a third-party site. The portal URL
+    and notes are non-secret and stored as-is. Feeds the phase-2 auto-apply."""
+
+    __tablename__ = "company_accounts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "company_id", name="uq_company_account_user_company"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    # Encrypted (Fernet) — never store/echo the plaintext. The username is the
+    # identifier the user logs in with (often an email); presence of a username is
+    # what "account attached" means in the UI.
+    username_enc: Mapped[str | None] = mapped_column(Text)
+    password_enc: Mapped[str | None] = mapped_column(Text)
+    # Non-secret: where the user registers/signs in (defaults from the preset).
+    portal_url: Mapped[str | None] = mapped_column(String(1024))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="company_accounts")
+    company: Mapped[Company] = relationship(back_populates="accounts")
 
 
 class Interest(Base):
@@ -208,6 +269,9 @@ class Position(Base):
         back_populates="position", cascade="all, delete-orphan"
     )
     applications: Mapped[list[Application]] = relationship(
+        back_populates="position", cascade="all, delete-orphan"
+    )
+    application_kits: Mapped[list[ApplicationKit]] = relationship(
         back_populates="position", cascade="all, delete-orphan"
     )
 
@@ -318,3 +382,174 @@ class LlmLog(Base):
     eval_tokens: Mapped[int | None] = mapped_column(Integer)
     response_content: Mapped[str | None] = mapped_column(Text)
     error_detail: Mapped[str | None] = mapped_column(Text)
+
+
+class InviteCode(Base):
+    """A registration invitation. The plaintext code is shown once at mint time and
+    never stored: we keep only ``code_hash`` = HMAC-SHA256(root_secret, code), so a DB
+    leak yields irreversible hashes (no usable codes, and no way to forge new ones) and
+    the root key never touches a row. See ``app/invites.py`` for the derivation and the
+    atomic redeem that enforces ``max_uses``/``expires_at``. Not user-owned — a code is
+    shared and consumed by whoever registers with it, so it carries no ``user_id``."""
+
+    __tablename__ = "invite_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    max_uses: Mapped[int] = mapped_column(Integer, default=1)
+    uses: Mapped[int] = mapped_column(Integer, default=0)
+    # Null = never expires. Stored as naive UTC like every other timestamp (timeutil).
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ApplicationKit(Base):
+    """LLM-generated application materials for one (user, position): a summary of
+    what the role is looking for, detected open application questions with advice +
+    a draft answer, a cover letter, and a tailored resume.
+
+    Generated on demand from the position detail page (an explicit "Generate"
+    click), in the background (see ``services/kit_worker.py``), never during the
+    bulk scan — which would multiply cost across every posting. The row is cached
+    and shown as-is on every later page open; it is re-generated only when the user
+    explicitly asks (a fresh POST), so reads never trigger LLM calls. One row per
+    (user, position)."""
+
+    __tablename__ = "application_kits"
+    __table_args__ = (UniqueConstraint("user_id", "position_id", name="uq_kit_user_position"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    position_id: Mapped[int] = mapped_column(ForeignKey("positions.id"), index=True)
+    # Which resume the kit was tailored against (nullable so a kit survives even if
+    # we couldn't resolve a resume; in practice generation requires an active one).
+    resume_id: Mapped[int | None] = mapped_column(ForeignKey("resumes.id"))
+
+    # "generating" while the background worker runs, "ok" once complete, "error" on
+    # a terminal LLM failure (with ``error_detail`` set). The detail page polls this.
+    status: Mapped[str] = mapped_column(String(16), default="generating")
+    looking_for: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
+    # JSON list[{question, advice, suggested_answer}] — detected open application
+    # questions plus how to approach them and a draft answer.
+    open_questions: Mapped[str | None] = mapped_column(Text)
+    cover_letter: Mapped[str | None] = mapped_column(Text)
+    # The tailored resume, as copy-paste-ready Markdown.
+    revised_resume: Mapped[str | None] = mapped_column(Text)
+    # A short (3-4 sentence) note on what was optimized for this position, shown
+    # below the resume block (not part of the copyable Markdown).
+    resume_optimization: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="application_kits")
+    position: Mapped[Position] = relationship(back_populates="application_kits")
+    resume: Mapped[Resume | None] = relationship(back_populates="application_kits")
+
+
+class ApplicantProfile(Base):
+    """The user-level information a job application asks for, kept once so it can
+    autofill the bulk of an application form (à la the Simplify extension) and feed
+    the phase-2 auto-apply. One row per user; repeating education/work history live
+    in their own tables. Free-text/nullable throughout — applications vary wildly,
+    so we store what the user gives and never force a shape."""
+
+    __tablename__ = "applicant_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+
+    # Identity + contact
+    first_name: Mapped[str | None] = mapped_column(String(128))
+    last_name: Mapped[str | None] = mapped_column(String(128))
+    preferred_name: Mapped[str | None] = mapped_column(String(128))
+    pronouns: Mapped[str | None] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(64))
+    address_line1: Mapped[str | None] = mapped_column(String(255))
+    address_line2: Mapped[str | None] = mapped_column(String(255))
+    city: Mapped[str | None] = mapped_column(String(128))
+    state_region: Mapped[str | None] = mapped_column(String(128))
+    postal_code: Mapped[str | None] = mapped_column(String(32))
+    country: Mapped[str | None] = mapped_column(String(128))
+
+    # Links
+    linkedin_url: Mapped[str | None] = mapped_column(String(512))
+    github_url: Mapped[str | None] = mapped_column(String(512))
+    portfolio_url: Mapped[str | None] = mapped_column(String(512))
+    other_url: Mapped[str | None] = mapped_column(String(512))
+
+    # Work authorization. The booleans are nullable on purpose: NULL = "not
+    # answered" (distinct from an explicit no), which application forms care about.
+    work_authorization: Mapped[str | None] = mapped_column(String(255))  # e.g. "US citizen", "H-1B"
+    authorized_to_work: Mapped[bool | None] = mapped_column(Boolean)
+    requires_sponsorship: Mapped[bool | None] = mapped_column(Boolean)
+    open_to_relocation: Mapped[bool | None] = mapped_column(Boolean)
+
+    # Job preferences
+    desired_salary: Mapped[str | None] = mapped_column(String(64))
+    salary_currency: Mapped[str | None] = mapped_column(String(16))
+    remote_preference: Mapped[str | None] = mapped_column(String(32))  # remote | hybrid | onsite | any
+    preferred_locations: Mapped[str | None] = mapped_column(Text)
+    earliest_start_date: Mapped[str | None] = mapped_column(String(64))
+    notice_period: Mapped[str | None] = mapped_column(String(64))
+
+    # Voluntary self-identification (EEO). Sensitive and optional — treat the DB as
+    # secret (as with tokens/keys). NULL throughout when the user declines.
+    gender: Mapped[str | None] = mapped_column(String(64))
+    race_ethnicity: Mapped[str | None] = mapped_column(String(128))
+    hispanic_latino: Mapped[str | None] = mapped_column(String(32))
+    # Standard self-ID phrasings are long ("I identify as one or more of the
+    # classifications of a protected veteran"), so these are wide.
+    veteran_status: Mapped[str | None] = mapped_column(String(128))
+    disability_status: Mapped[str | None] = mapped_column(String(128))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="profile")
+
+
+class ProfileEducation(Base):
+    """One education entry on a user's applicant profile. Dates are free text
+    ('Jun 2020 – Present', '2019'), since that's how résumés state them and how
+    application forms accept them. Replaced wholesale when the profile is saved."""
+
+    __tablename__ = "profile_education"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    school: Mapped[str | None] = mapped_column(String(255))
+    degree: Mapped[str | None] = mapped_column(String(255))
+    field_of_study: Mapped[str | None] = mapped_column(String(255))
+    start_date: Mapped[str | None] = mapped_column(String(64))
+    end_date: Mapped[str | None] = mapped_column(String(64))
+    gpa: Mapped[str | None] = mapped_column(String(32))
+    location: Mapped[str | None] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="profile_education")
+
+
+class ProfileExperience(Base):
+    """One work-experience entry on a user's applicant profile. Replaced wholesale
+    when the profile is saved (mirrors ProfileEducation)."""
+
+    __tablename__ = "profile_experience"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    company: Mapped[str | None] = mapped_column(String(255))
+    title: Mapped[str | None] = mapped_column(String(255))
+    location: Mapped[str | None] = mapped_column(String(255))
+    start_date: Mapped[str | None] = mapped_column(String(64))
+    end_date: Mapped[str | None] = mapped_column(String(64))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False)
+    description: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="profile_experience")
