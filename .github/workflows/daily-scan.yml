@@ -1,0 +1,39 @@
+name: Daily scan
+
+# The daily scrape+score+report pipeline. It runs here, NOT as a Vercel Cron,
+# because Vercel Hobby caps functions at 60s and a single Ollama request alone can
+# take up to JOBSCOUT_OLLAMA_TIMEOUT (120s). A GitHub Actions runner has no such
+# limit, so `jobscout run-daily` finishes the whole scan synchronously and the
+# per-user Telegram reports fire normally — exactly like the in-process scheduler
+# on a long-lived server, just triggered by cron here.
+on:
+  schedule:
+    - cron: "0 8 * * *" # 08:00 UTC daily (GitHub cron is always UTC)
+  workflow_dispatch: # manual "Run workflow" button
+
+concurrency:
+  group: daily-scan
+  cancel-in-progress: false # never kill an in-progress scan
+
+jobs:
+  scan:
+    name: Run daily scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 # safety cap; a normal run takes minutes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install -e .
+      - name: Run daily scan
+        # Both are REQUIRED: the DB URL, and JOBSCOUT_SECRET_KEY to decrypt each
+        # user's LLM API key + Telegram bot token (encrypted at rest). The key MUST
+        # be the same value Vercel runs with, or decryption returns garbage and
+        # scoring/Telegram fail.
+        env:
+          JOBSCOUT_DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+          JOBSCOUT_SECRET_KEY: ${{ secrets.JOBSCOUT_SECRET_KEY }}
+        run: jobscout run-daily

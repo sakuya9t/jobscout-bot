@@ -16,6 +16,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from .crypto import EncryptedString
 from .timeutil import utcnow
 
 
@@ -33,9 +34,9 @@ class User(Base):
 
     # Telegram is per-user: the user supplies their own bot token (created via
     # @BotFather) and links the chat reports go to by DMing ``/start <code>`` to
-    # that bot. ``telegram_bot_token`` is sensitive — treat the DB as secret, and
-    # never echo it back over the API (see routers/telegram_config.py).
-    telegram_bot_token: Mapped[str | None] = mapped_column(String(128))
+    # that bot. ``telegram_bot_token`` is a secret: encrypted at rest via
+    # ``EncryptedString`` and never echoed back over the API (see routers/telegram_config.py).
+    telegram_bot_token: Mapped[str | None] = mapped_column(EncryptedString)
     telegram_chat_id: Mapped[str | None] = mapped_column(String(64), index=True)
     telegram_link_code: Mapped[str | None] = mapped_column(String(32), index=True)
 
@@ -320,9 +321,10 @@ class LlmConfig(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
     provider: Mapped[str] = mapped_column(String(32), default="ollama_cloud")
-    # User-supplied API key for the provider. Stored as-is (like the Telegram
-    # token); treat the DB as sensitive. NULL falls back to the global settings key.
-    api_key: Mapped[str | None] = mapped_column(String(512))
+    # User-supplied API key for the provider. A secret: encrypted at rest via
+    # ``EncryptedString`` (like the Telegram token). NULL falls back to the global
+    # settings key.
+    api_key: Mapped[str | None] = mapped_column(EncryptedString)
     main_model: Mapped[str | None] = mapped_column(String(128))  # scoring ("good") model
     light_model: Mapped[str | None] = mapped_column(String(128))  # cheap relevance filter
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

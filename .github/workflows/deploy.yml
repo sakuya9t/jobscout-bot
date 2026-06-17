@@ -43,11 +43,17 @@ jobs:
       - name: Apply schema (jobscout init-db)
         # create_all + preset seed: additive and idempotent, safe on every deploy.
         # Prod starts as a brand-new, empty DB — no local data is copied to it.
-        # init-db doesn't use the secret key, so it isn't needed here (it lives only
-        # in Vercel as the app's runtime JOBSCOUT_SECRET_KEY).
         env:
           JOBSCOUT_DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: jobscout init-db
+      - name: Encrypt credential columns at rest (idempotent)
+        # Widens + Fernet-encrypts users.telegram_bot_token and llm_configs.api_key.
+        # Needs JOBSCOUT_SECRET_KEY — and it MUST match the value Vercel runs with,
+        # or the app can't decrypt what this writes. No-op once everything is encrypted.
+        env:
+          JOBSCOUT_DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+          JOBSCOUT_SECRET_KEY: ${{ secrets.JOBSCOUT_SECRET_KEY }}
+        run: jobscout encrypt-secrets
 
   deploy:
     name: Deploy to Vercel

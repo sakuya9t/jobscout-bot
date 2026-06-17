@@ -5,6 +5,8 @@ Commands:
   mcp              Run the MCP server over stdio (for openclaw/hermes/agents).
   run-daily        Run the scrape+score pipeline once for all users (cron-friendly).
   init-db          Create database tables.
+  encrypt-secrets  Encrypt the telegram-token / LLM-key columns at rest (one-time,
+                   idempotent migration; widens the columns on Postgres first).
   health           Check DB + Ollama connectivity.
   token <email>    Mint a bearer token for a user (for MCP / API clients).
   invite           Mint / list / revoke registration invite codes
@@ -68,6 +70,54 @@ def cmd_init_db(_: argparse.Namespace) -> int:
 
     init_db()
     print("Database initialized.")
+    return 0
+
+
+def cmd_encrypt_secrets(_: argparse.Namespace) -> int:
+    """Encrypt the credential columns (users.telegram_bot_token, llm_configs.api_key)
+    at rest, in place. One-time migration for a DB that predates ``EncryptedString``;
+    idempotent, so it's safe to re-run (and is run on every deploy). On Postgres it
+    first widens each column to TEXT — Fernet ciphertext outgrows the old VARCHAR caps.
+    Reads/writes raw values via Core SQL so it bypasses the EncryptedString type and
+    can tell an already-encrypted value from a plaintext one.
+
+    Must run with the SAME JOBSCOUT_SECRET_KEY the app uses, or the app can't decrypt
+    what this writes."""
+    from sqlalchemy import text
+
+    from .crypto import decrypt, encrypt
+    from .db import engine, init_db
+
+    init_db()
+    targets = [("users", "telegram_bot_token"), ("llm_configs", "api_key")]
+    converted = 0
+    with engine.begin() as conn:
+        is_pg = conn.dialect.name == "postgresql"
+        for table, col in targets:
+            if is_pg:
+                dtype = conn.execute(
+                    text("SELECT data_type FROM information_schema.columns "
+                         "WHERE table_name = :t AND column_name = :c"),
+                    {"t": table, "c": col},
+                ).scalar()
+                if dtype and dtype != "text":
+                    conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "{col}" TYPE text'))
+                    print(f"  {table}.{col}: widened {dtype} -> text")
+            rows = conn.execute(
+                text(f'SELECT id, "{col}" AS v FROM "{table}" WHERE "{col}" IS NOT NULL')
+            ).all()
+            n = 0
+            for row_id, value in rows:
+                if decrypt(value) is not None:
+                    continue  # already valid ciphertext for the current key
+                conn.execute(
+                    text(f'UPDATE "{table}" SET "{col}" = :v WHERE id = :id'),
+                    {"v": encrypt(value), "id": row_id},
+                )
+                n += 1
+            converted += n
+            print(f"  {table}.{col}: {len(rows)} value(s) present, {n} newly encrypted")
+    print(f"Done — encrypted {converted} previously-plaintext secret(s). Re-running is a no-op.")
     return 0
 
 
@@ -318,6 +368,10 @@ def main() -> None:
                    help="Clear prior scoring-error markers so failed pairs are re-scored")
     p.set_defaults(func=cmd_run_daily)
     sub.add_parser("init-db", help="Create database tables").set_defaults(func=cmd_init_db)
+    sub.add_parser(
+        "encrypt-secrets",
+        help="Encrypt telegram_bot_token + llm api_key at rest (idempotent one-time migration)",
+    ).set_defaults(func=cmd_encrypt_secrets)
     sub.add_parser("health", help="Check DB + Ollama").set_defaults(func=cmd_health)
 
     p = sub.add_parser("backfill-descriptions",

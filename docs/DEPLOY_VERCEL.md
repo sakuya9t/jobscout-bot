@@ -6,25 +6,37 @@
 from the Actions tab → **Run workflow**). It runs three gated stages:
 
 1. **test** — `pytest`.
-2. **migrate** — `jobscout init-db` against the prod Supabase Postgres. This is
-   `create_all` + preset seed: additive and idempotent, so it's safe on every deploy.
-   It only creates tables and seeds the built-in company presets — **prod starts as a
-   brand-new, empty database**; no local data is ever copied to it.
-3. **deploy** — builds and deploys to Vercel with the Vercel CLI (`vercel pull`/
-   `build`/`deploy --prebuilt --prod`).
+2. **migrate** — `jobscout init-db` then `jobscout encrypt-secrets` against the prod
+   Supabase Postgres. `init-db` (`create_all` + preset seed) is additive and idempotent;
+   it only creates tables and seeds the built-in company presets — **prod starts as a
+   brand-new, empty database**, no local data is ever copied. `encrypt-secrets` then
+   Fernet-encrypts the credential columns (`users.telegram_bot_token`,
+   `llm_configs.api_key`) at rest; it's idempotent (a no-op once everything's encrypted)
+   and needs `JOBSCOUT_SECRET_KEY`.
+3. **deploy** — `vercel deploy --prod`. Vercel builds **remotely** (its image has
+   `uv` + the Python toolchain), so there's no `vercel build`/`--prebuilt` step and the
+   CI runner needs no Python build tools.
+
+A second workflow, `.github/workflows/daily-scan.yml`, runs the daily scan on a cron
+schedule (see below).
 
 ### How the app runs on Vercel (serverless)
 
-The app is normally a long-lived server, so three small adaptations let it run as
+The app is normally a long-lived server, so a few small adaptations let it run as
 serverless functions:
 
-- `api/index.py` re-exports the FastAPI `app`; `vercel.json` rewrites every path to it.
+- `api/index.py` re-exports the FastAPI `app`; `vercel.json` declares an
+  `@vercel/python` build and routes every path to it.
 - The in-process scheduler and background worker threads are turned **off** on Vercel
   (`JOBSCOUT_SCHEDULER_ENABLED=0`, `JOBSCOUT_BACKGROUND_WORKERS=0`) since threads don't
   survive a function freeze.
-- The daily scan runs instead via a **Vercel Cron** entry (in `vercel.json`) that hits
-  `GET /api/cron/run-daily` once a day. That endpoint runs the same synchronous
-  scrape+score as `jobscout run-daily`, authenticated by Vercel's `CRON_SECRET` bearer.
+- The **daily scan runs in GitHub Actions**, not on Vercel. A full scrape+score can't
+  finish within a Vercel function's time limit (60s on Hobby; a single Ollama request
+  alone can take up to `JOBSCOUT_OLLAMA_TIMEOUT`), so `.github/workflows/daily-scan.yml`
+  runs `jobscout run-daily` on a runner with no time cap — the whole pipeline, including
+  per-user Telegram reports, completes there. The `GET /api/cron/run-daily` endpoint
+  still exists as an optional manual trigger (bearer-authed with `CRON_SECRET`), but it
+  is not the scheduled path.
 
 ### First-time bootstrap (once)
 
@@ -45,20 +57,18 @@ local environment is carried over.
 4. **Set GitHub repo secrets** (Settings → Secrets and variables → Actions):
    | Secret | Value |
    | --- | --- |
-   | `SUPABASE_DB_URL` | the Supabase URL above (`?sslmode=require`) |
+   | `SUPABASE_DB_URL` | the Supabase URL above (`?sslmode=require`) — used by `init-db`, `encrypt-secrets`, **and** the daily scan |
+   | `JOBSCOUT_SECRET_KEY` | the prod key from step 2 — **required** and **must be byte-for-byte identical to the value in Vercel**. It's the Fernet key for the encrypted credential columns, so `encrypt-secrets` and the daily scan can't decrypt what the web app wrote unless it matches |
    | `VERCEL_TOKEN` | a Vercel access token |
    | `VERCEL_ORG_ID` | from step 3 |
    | `VERCEL_PROJECT_ID` | from step 3 |
-
-   The prod secret key is **not** a GitHub secret — `init-db` doesn't use it, so it only
-   lives in Vercel (next step).
 5. **Set Vercel project env vars** (Project → Settings → Environment Variables, Production):
    | Variable | Value / note |
    | --- | --- |
    | `JOBSCOUT_DATABASE_URL` | same Supabase URL as `SUPABASE_DB_URL` |
-   | `JOBSCOUT_SECRET_KEY` | the brand-new key from step 2 — unique to prod, never your local key |
+   | `JOBSCOUT_SECRET_KEY` | the brand-new key from step 2 — unique to prod, never your local key, and **identical to the GitHub secret of the same name** (it's the at-rest encryption key for the Telegram-token / LLM-key columns) |
    | `JOBSCOUT_DATA_DIR` | `/tmp/jobscout-data` — **required**: Vercel's FS is read-only except `/tmp`, and the app `mkdir`s this dir at import |
-   | `CRON_SECRET` | long random string; Vercel signs cron calls with it and the endpoint checks it |
+   | `CRON_SECRET` | optional — long random string gating the manual `GET /api/cron/run-daily` trigger. Not required for the daily scan (that runs in GitHub Actions); set it only if you want the HTTP trigger usable |
    | `JOBSCOUT_SCHEDULER_ENABLED` | `0` |
    | `JOBSCOUT_BACKGROUND_WORKERS` | `0` |
    | `JOBSCOUT_COOKIE_SECURE` | `1` (served over HTTPS) |
@@ -69,12 +79,15 @@ After that, **push to `main`** (or run the workflow manually) to deploy.
 
 ### Limitations of the minimal serverless deploy
 
-- **Cron scan is time-bounded.** It runs inline within one invocation, capped by the
-  function `maxDuration` (≤300s on Pro). A very large first-run backlog can time out;
-  it picks up where it left off on the next run (scoring is idempotent and persisted).
+- **Daily scan runs in GitHub Actions, not on Vercel.** Vercel's function time limit
+  (60s on Hobby) can't fit a full scrape+score, so the scan lives in
+  `.github/workflows/daily-scan.yml` (no time cap) — see "How the app runs" above. The
+  schedule is GitHub cron (`0 8 * * *`, **UTC**); change it there, and trigger an ad-hoc
+  run from the Actions tab → **Run workflow**.
 - **Dashboard "Run scan now" scoring may not fully drain** on Vercel — its scrape
   enqueues to the background evaluator, which doesn't survive a function freeze. The
-  daily cron (synchronous) is the reliable path. The crawl/scrape itself still runs.
+  GitHub Actions daily scan (synchronous, no time limit) is the reliable scoring path;
+  the dashboard still shows results from the DB. The crawl/scrape itself still runs.
 - **Resume original-file preview isn't durable.** Uploaded files land in `/tmp`; the
   dashboard already falls back to the DB-stored extracted text, and matching/scoring
   use that text, so this is cosmetic. Supabase Storage is the real fix later.
