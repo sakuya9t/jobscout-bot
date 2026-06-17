@@ -444,6 +444,36 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     assert p.description and "distributed systems" in p.description and "BS degree" in p.description
 
 
+def test_google_coverage_complete_vs_capped(monkeypatch):
+    """Google paging reports completeness for removal reconciliation: 'complete' only
+    when an empty page is reached within the cap (whole board seen); capping out at
+    max_pages leaves it incomplete, so absence can't be read as removed."""
+    import json
+    import re
+    from app.services import scraper
+
+    base = "https://www.google.com/about/careers/applications/jobs/results/"
+
+    def page_for(jid):
+        gid = str(900000000000000 + jid)  # Google ids are long numeric strings (>=15 digits)
+        rec = [gid, f"Role {jid}", f"{base}{gid}",
+               [None, "<p>Build things</p>"], [None, ""], "projects/x", None, "Google", None,
+               [["NYC, USA", ["NYC, USA"], "NYC", None, "NY", "US"]]]
+        return "AF_initDataCallback({key:'ds:0', data:" + json.dumps([[rec]]) + ", sideChannel: {}});"
+
+    # Reaches an empty page within the cap → complete.
+    monkeypatch.setattr(scraper, "_fetch_text",
+        lambda url: page_for(1) if "page=1" in url else "<html>no jobs</html>")
+    out, complete = scraper._google_paged(base, max_pages=5)
+    assert complete is True and len(out) == 1
+
+    # Every page has a fresh role and we exhaust max_pages → not complete.
+    monkeypatch.setattr(scraper, "_fetch_text",
+        lambda url: page_for(100 + int(re.search(r"page=(\d+)", url).group(1))))
+    out2, complete2 = scraper._google_paged(base, max_pages=3)
+    assert complete2 is False and len(out2) == 3
+
+
 def test_eightfold_description_extracted_from_jsonld(monkeypatch):
     """Eightfold's search API carries no description; we pull it from the job page's
     schema.org JobPosting JSON-LD (HTML stripped to text). Failures never raise."""
@@ -660,6 +690,195 @@ def test_duplicate_external_ids_in_one_scrape_deduped(monkeypatch):
         rows = list(db.scalars(matcher.select(models.Position)
                                .where(models.Position.external_id == "dup")))
         assert len(rows) == 1
+
+
+# ── Position availability / removal tracking ─────────────────────────────────
+def _gh_result(*ext_ids, live=None):
+    """A ScrapeResult for a Greenhouse-style (full-board) crawl: a described posting
+    per id, with ``live`` defaulting to exactly those ids on the board."""
+    from app.services import scraper
+
+    positions = [
+        scraper.ScrapedPosition(external_id=e, title=f"Backend Engineer {e}",
+                                location="Remote", description="Build APIs")
+        for e in ext_ids
+    ]
+    ids = set(ext_ids) if live is None else live
+    return scraper.ScrapeResult(positions=positions, live_external_ids=ids, coverage="full")
+
+
+def test_reconcile_marks_removed_then_clears_on_reappear(monkeypatch):
+    """An authoritative crawl marks a stored posting removed once it leaves the
+    board, and clears the flag if it later reappears."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    with session_scope() as db:
+        company = models.Company(name="GH", ats_type="greenhouse", ats_token="gh")
+        db.add(company); db.flush()
+        cid = company.id
+
+    def crawl(company):
+        return crawl.result
+    monkeypatch.setattr(scraper, "scrape_company", crawl)
+
+    crawl.result = _gh_result("a", "b")              # both live
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+
+    crawl.result = _gh_result("a")                   # "b" gone from the board
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+    with session_scope() as db:
+        by_id = {p.external_id: p for p in db.scalars(
+            matcher.select(models.Position).where(models.Position.company_id == cid))}
+        assert by_id["a"].removed_at is None
+        assert by_id["b"].removed_at is not None
+
+    crawl.result = _gh_result("a", "b")              # "b" relisted
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+    with session_scope() as db:
+        b = db.scalar(matcher.select(models.Position).where(models.Position.external_id == "b"))
+        assert b.removed_at is None
+
+
+def test_reconcile_skips_partial_and_empty_scrapes(monkeypatch):
+    """A partial scrape (coverage=None) and a suspect empty board both leave stored
+    postings untouched — neither can prove a removal."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    with session_scope() as db:
+        company = models.Company(name="GH", ats_type="greenhouse", ats_token="gh")
+        db.add(company); db.flush()
+        cid = company.id
+    monkeypatch.setattr(scraper, "scrape_company", lambda c: _gh_result("a", "b"))
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+
+    # Partial coverage: only "a" on the (partial) board, coverage=None → no removals.
+    monkeypatch.setattr(scraper, "scrape_company", lambda c: scraper.ScrapeResult(
+        positions=[], live_external_ids={"a"}, coverage=None))
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+    # Empty live set even under "full" coverage: treated as a flukey fetch, never
+    # mass-closes the company.
+    monkeypatch.setattr(scraper, "scrape_company", lambda c: scraper.ScrapeResult(
+        positions=[], live_external_ids=set(), coverage="full"))
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+    with session_scope() as db:
+        removed = [p for p in db.scalars(
+            matcher.select(models.Position).where(models.Position.company_id == cid))
+            if p.removed_at is not None]
+        assert removed == []
+
+
+def test_reconcile_floor_scopes_removals_to_covered_window(monkeypatch):
+    """With datetime (floor) coverage — a newest-first walk that reached the age
+    cutoff — only absent postings newer than the floor are closed; the older tail,
+    outside what the scrape actually covered, is left untouched."""
+    from app.services import scraper
+    from app.services.matcher import _upsert_positions
+
+    now = matcher.utcnow()
+    floor = now - timedelta(days=90)
+    with session_scope() as db:
+        company = models.Company(name="NV", ats_type="eightfold",
+                                 careers_url="https://jobs.nvidia.com/careers")
+        db.add(company); db.flush()
+        cid = company.id
+        for ext, age in [("live", 5), ("recent", 10), ("ancient", 200)]:
+            db.add(models.Position(company_id=cid, external_id=ext, title=ext,
+                                   description="d", posted_at=now - timedelta(days=age)))
+    # Only "live" is still on the board; coverage is complete down to the floor.
+    monkeypatch.setattr(scraper, "scrape_company", lambda c: scraper.ScrapeResult(
+        positions=[], live_external_ids={"live"}, coverage=floor))
+    with session_scope() as db:
+        _upsert_positions(db, db.get(models.Company, cid))
+    with session_scope() as db:
+        by_id = {p.external_id: p for p in db.scalars(
+            matcher.select(models.Position).where(models.Position.company_id == cid))}
+        assert by_id["live"].removed_at is None        # on the board → stays
+        assert by_id["recent"].removed_at is not None  # absent, within window → closed
+        assert by_id["ancient"].removed_at is None     # absent, older than floor → kept
+
+
+def test_removed_position_hidden_unless_applied(monkeypatch):
+    """A removed posting drops out of the job list / detail / visibility gate — but
+    one the user applied to stays, flagged removed, so its record survives."""
+    from app.services import scraper
+
+    with session_scope() as db:
+        uid = _seed_user(db)  # custom greenhouse company + posting "1" + interest
+    monkeypatch.setattr(matcher.scraper, "scrape_company",
+                        lambda c: _gh_result("1", "2"))
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid),
+                             client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:
+        pid2 = db.scalar(matcher.select(models.Position.id)
+                         .where(models.Position.external_id == "2"))
+
+    # Close posting "2".
+    with session_scope() as db:
+        db.get(models.Position, pid2).removed_at = matcher.utcnow()
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, _ = reporter.build_job_list(db, user, category="matching")
+        assert pid2 not in {i["position_id"] for i in items}
+        assert reporter.position_visible(db, user, pid2) is False
+        assert reporter.build_position_detail(db, user, pid2) is None
+
+    # Apply to it → it returns to the list, badged removed, and the detail opens.
+    with session_scope() as db:
+        db.add(models.Application(user_id=uid, position_id=pid2))
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, _ = reporter.build_job_list(db, user, category="matching")
+        row = next(i for i in items if i["position_id"] == pid2)
+        assert row["removed"] is True
+        assert reporter.position_visible(db, user, pid2) is True
+        assert reporter.build_position_detail(db, user, pid2)["removed"] is True
+
+
+def test_removed_positions_are_not_scored():
+    """A closed posting is never (re)scored or counted as pending."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.scalar(matcher.select(models.Position)).removed_at = matcher.utcnow()
+    with session_scope() as db:
+        assert matcher.count_pending(db, db.get(models.User, uid)) == 0
+    # BoomClient fails loudly if either model is called → proves the pair was skipped.
+    with session_scope() as db:
+        res = matcher.run_for_user(db, db.get(models.User, uid),
+                                   client=BoomClient(), filter_client=BoomClient())
+        assert res.scored == 0
+    with session_scope() as db:
+        assert list(db.scalars(matcher.select(models.MatchResult))) == []
+
+
+def test_apply_and_kit_rejected_on_removed_posting():
+    """The write actions refuse a closed posting: re-marking applied and generating a
+    kit both 409, even when the user already has an application/match on record."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'rm@x.com').json()['access_token']}"}
+        with session_scope() as db:
+            user = db.scalar(matcher.select(models.User).where(models.User.email == "rm@x.com"))
+            company = models.Company(user_id=user.id, name="Acme",
+                                     ats_type="greenhouse", ats_token="acme")
+            db.add(company); db.flush()
+            pos = models.Position(company_id=company.id, external_id="x", title="Backend",
+                                  description="d", removed_at=matcher.utcnow())
+            db.add(pos); db.flush()
+            db.add(models.Resume(user_id=user.id, filename="r", content_text="py", is_active=True))
+            db.add(models.MatchResult(user_id=user.id, position_id=pos.id,
+                                      passed_filter=True, match_score=80, win_probability=50))
+            db.add(models.Application(user_id=user.id, position_id=pos.id))  # applied before it closed
+            pid = pos.id
+        assert c.post(f"/api/applications/{pid}", headers=h).status_code == 409
+        assert c.post(f"/api/positions/{pid}/kit", headers=h).status_code == 409
 
 
 def test_excluded_by_keyword_emits_warning():

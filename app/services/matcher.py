@@ -10,6 +10,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
@@ -351,11 +352,18 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
     """Scrape one company and upsert. Returns (new_positions, errors)."""
     errors: list[str] = []
     try:
-        scraped = scraper.scrape_company(company)
+        result = scraper.scrape_company(company)
     except scraper.ScrapeError as exc:
         return [], [str(exc)]
     except Exception as exc:  # defensive: never let one company kill the run
         return [], [f"{company.name}: unexpected scrape error: {exc}"]
+
+    # Normalize: production returns a ScrapeResult; tests that monkeypatch
+    # scrape_company may still return a bare list (no availability signal).
+    if isinstance(result, scraper.ScrapeResult):
+        scraped, live_ids, coverage = result.positions, result.live_external_ids, result.coverage
+    else:
+        scraped, live_ids, coverage = result, None, None
 
     new_positions: list[Position] = []
     # Positions still missing a description that this ATS only exposes on the job
@@ -403,9 +411,50 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
             if text:
                 pos.description = text
 
+    _reconcile_removals(db, company, live_ids, coverage, existing)
+
     company.last_scraped_at = utcnow()
     db.flush()  # assign ids
     return new_positions, errors
+
+
+def _reconcile_removals(
+    db: Session,
+    company: Company,
+    live_ids: set[str] | None,
+    coverage: str | datetime | None,
+    existing: dict[str, Position],
+) -> None:
+    """Mark stored positions removed when they drop off the company's board, and clear
+    the flag for any that reappear. ``coverage`` (from the scrape) bounds what may be
+    inferred removed:
+
+      * ``"full"`` – the whole board; any stored id that's absent is closed.
+      * a ``datetime`` floor – the board is fully covered only for postings listed
+        on/after it (a newest-first walk that reached the age cutoff), so a stored
+        posting absent *and* newer than the floor is closed, while the older tail —
+        outside what the scrape covered — is left untouched.
+      * ``None`` – partial/unknown coverage; no removals are inferred.
+
+    An empty ``live_ids`` is treated as a suspect fetch (a flukey-empty response would
+    otherwise close the whole company) and skipped — a genuine reappearance heals the
+    flag on the next non-empty crawl. ``existing`` is the (already-loaded) map of this
+    company's stored positions, reused so we don't re-query."""
+    if coverage is None or not live_ids:  # nothing authoritative to act on
+        return
+    floor = coverage if isinstance(coverage, datetime) else None  # None ⇒ "full"
+    now = utcnow()
+    for ext_id, pos in existing.items():
+        if ext_id in live_ids:
+            if pos.removed_at is not None:
+                pos.removed_at = None  # relisted → available again
+            continue
+        if pos.removed_at is not None:
+            continue  # absent and already marked removed
+        # Absent from the board: only close it if it falls within what we covered.
+        if floor is not None and (pos.posted_at is None or pos.posted_at < floor):
+            continue  # older than the covered window (or undated) → can't conclude
+        pos.removed_at = now
 
 
 def _score_batch(
@@ -572,7 +621,11 @@ def count_pending(db: Session, user: User) -> int:
         return 0
     company_ids = [c.id for c in companies]
     described_ids = {
-        p.id for p in db.scalars(select(Position).where(Position.company_id.in_(company_ids)))
+        p.id for p in db.scalars(
+            select(Position).where(
+                Position.company_id.in_(company_ids), Position.removed_at.is_(None)
+            )
+        )
         if (p.description or "").strip()
     }
     if not described_ids:
@@ -646,7 +699,11 @@ def _score_locked(
 
     company_ids = [c.id for c in companies]
     described = _described(
-        list(db.scalars(select(Position).where(Position.company_id.in_(company_ids))))
+        list(db.scalars(
+            select(Position).where(
+                Position.company_id.in_(company_ids), Position.removed_at.is_(None)
+            )
+        ))
     )
     already = {
         (m.position_id, m.interest_id)

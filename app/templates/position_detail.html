@@ -210,6 +210,7 @@ function renderDetail(){
         </div>
         ${head}
       </div>
+      ${m.removed ? `<div class="pill" style="background:#eceff1; color:var(--muted); margin-top:8px;">✕ No longer listed — this posting has been removed from the company's board. Your application record is kept.</div>` : ""}
       <div class="actions">
         <button type="button" id="applyBtn" class="apply-btn${m.applied ? " applied" : ""}"
                 aria-pressed="${m.applied ? "true" : "false"}" onclick="toggleApplied(this)">
@@ -223,8 +224,8 @@ function renderDetail(){
       <p class="muted">A tailored cover letter, a revised resume, what this role is looking for,
         and draft answers to its likely application questions — generated from your resume and this posting.</p>
       <div class="kit-controls">
-        <button type="button" id="genBtn" onclick="generateKit()">Generate application kit</button>
-        <span id="kitStatus" class="muted"></span>
+        <button type="button" id="genBtn" onclick="generateKit()"${m.removed ? " disabled" : ""}>Generate application kit</button>
+        <span id="kitStatus" class="muted">${m.removed ? "This posting is no longer listed — kit generation is disabled." : ""}</span>
       </div>
       <div id="kitBody"></div>
     </div>`;
@@ -376,6 +377,7 @@ function mdToHtml(md){
 }
 
 async function generateKit(){
+  if(detail && detail.removed){ return; }  // closed posting — server rejects too
   const btn = document.getElementById("genBtn");
   btn.disabled = true;
   const r = await api(`/api/positions/${POSITION_ID}/kit`, {method:"POST"});

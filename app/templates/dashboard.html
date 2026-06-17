@@ -1212,6 +1212,7 @@ function renderJobList(data){
         </div>
         ${head}
       </div>
+      ${m.removed ? '<span class="pill" style="background:#eceff1; color:var(--muted);">✕ Closed — no longer listed</span>' : ""}
       ${(!m.non_matching && m.below_threshold) ? '<span class="pill warn">below threshold</span>' : ""}
       ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
       ${strengths.length ? `<div class="muted">Strengths</div><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>` : ""}

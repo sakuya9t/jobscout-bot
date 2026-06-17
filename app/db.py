@@ -76,9 +76,17 @@ def _reconcile_schema(bind: Engine) -> None:
     any missing indexes. It is deliberately limited to *safe, additive* changes —
     new nullable columns (or ones with a literal default) and new indexes; column
     drops, renames and type changes are out of scope and still need a real
-    migration. SQLite only (other backends should use Alembic)."""
-    if bind.dialect.name != "sqlite":
+    migration.
+
+    The additive passes (1: ADD COLUMN, 3: CREATE INDEX) run on SQLite **and**
+    Postgres — both support ``ALTER TABLE ADD COLUMN`` for a nullable/defaulted
+    column instantly, so prod (Supabase Postgres) picks up a new model field without a
+    hand-written migration. The table-rebuild pass (2) stays SQLite-only: it exists to
+    work around SQLite's inability to ALTER a column constraint, which Postgres can do
+    natively and which is out of scope here anyway."""
+    if bind.dialect.name not in ("sqlite", "postgresql"):
         return
+    is_sqlite = bind.dialect.name == "sqlite"
     from . import models
 
     insp = inspect(bind)
@@ -110,11 +118,13 @@ def _reconcile_schema(bind: Engine) -> None:
                 log.info("schema reconcile: adding column %s.%s", table.name, column.name)
                 conn.execute(text(ddl))
     # 2) Rebuild any table whose column constraints (e.g. a NOT NULL that the model
-    # relaxed to nullable) drifted — ALTER can't change those in SQLite.
-    insp = inspect(bind)  # refresh: the additive pass above changed the schema
-    for table in models.Base.metadata.sorted_tables:
-        if table.name in existing_tables and _nullability_drift(insp, table):
-            _rebuild_table(bind, table)
+    # relaxed to nullable) drifted — ALTER can't change those in SQLite. SQLite only;
+    # Postgres can ALTER constraints natively and this rebuild is unsafe there.
+    if is_sqlite:
+        insp = inspect(bind)  # refresh: the additive pass above changed the schema
+        for table in models.Base.metadata.sorted_tables:
+            if table.name in existing_tables and _nullability_drift(insp, table):
+                _rebuild_table(bind, table)
     # 3) create_all skips existing tables entirely, so an index added alongside a
     # column won't exist yet; checkfirst makes this a no-op for indexes present.
     for table in models.Base.metadata.sorted_tables:

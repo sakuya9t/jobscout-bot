@@ -166,10 +166,14 @@ def get_job_list(
             m for m in all_items
             if m.get("match_score", 0) >= min_score and m.get("win_probability", 0) >= min_win
         ]
+    # Overlay live applied + removed state onto the frozen rows, then drop postings
+    # that have since left the board unless the user applied to them — same rule the
+    # live list enforces in SQL — before paging so counts stay consistent.
+    reporter.tag_applied(db, user, all_items)
+    reporter.tag_removed(db, user, all_items)
+    all_items = [m for m in all_items if not m.get("removed") or m.get("applied")]
     start = max(0, offset)
     page = all_items[start : start + _safe_limit(limit)]
-    # Overlay live applied + kit status onto the frozen list.
-    reporter.tag_applied(db, user, page)
     reporter.tag_kit_status(db, user, page)
     errors = reporter.job_list_errors(snapshot)
     return JobListOut(

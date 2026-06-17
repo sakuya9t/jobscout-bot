@@ -311,6 +311,9 @@ class MatchOut(BaseModel):
     # True for a non-matching job (filter-rejected or keyword-excluded) shown only
     # in the dashboard's "all jobs" view — score fields are not meaningful for it.
     non_matching: bool = False
+    # True once the posting left the company's board. Such a row only appears at all
+    # because the user applied to it; the UI badges it "Closed" and locks its actions.
+    removed: bool = False
     # Effective "listed" date (ISO, naive UTC): the ATS post date when known, else
     # when our crawler first saw it. Drives the dashboard's post-date filter/label.
     listed_at: str | None = None
@@ -379,6 +382,9 @@ class PositionDetailOut(BaseModel):
     # True when the best stored match for this position did not pass the relevance
     # filter (score fields aren't meaningful) — the page shows a "not a match" pill.
     non_matching: bool = False
+    # True once the posting left the company's board (the page shows a "No longer
+    # listed" banner and locks apply/kit actions). Only reachable for applied postings.
+    removed: bool = False
     applied: bool = False
     kit: ApplicationKitOut | None = None
 

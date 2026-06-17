@@ -120,8 +120,10 @@ class Settings(BaseSettings):
     # Only pull postings posted/updated within this many days, to bound how much we
     # store and score. Applies only to sources that expose a date (greenhouse/
     # lever/ashby); Google careers and the HTML fallback carry no per-posting date,
-    # so their postings are always kept. 0 = no age filter.
-    scrape_max_age_days: int = 30
+    # so their postings are always kept. 0 = no age filter. Availability tracking now
+    # prunes closed roles independently (Position.removed_at), so this window can be
+    # generous without leaving stale postings around.
+    scrape_max_age_days: int = 90
 
     # Scoring
     # Stage-1 relevance filtering is batched: one cheap call screens this many

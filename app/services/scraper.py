@@ -39,6 +39,32 @@ class ScrapedPosition:
     posted_at: datetime | None = None
 
 
+# Full-board ATS APIs whose single response is the company's *entire* live listing,
+# so an id's absence reliably means "removed". Paginated sources (Google/Eightfold)
+# report their coverage per-scrape instead (see ScrapeResult.coverage).
+_AUTHORITATIVE_ATS = frozenset({"greenhouse", "lever", "ashby"})
+
+
+@dataclass
+class ScrapeResult:
+    """One company's scrape: ``positions`` is the age-filtered set to upsert (same
+    rows we've always stored); ``live_external_ids`` is the *unfiltered* set of ids
+    the board currently lists, used to reconcile availability.
+
+    ``coverage`` says how much of the board ``live_external_ids`` represents, which
+    bounds what a crawl may infer is removed:
+      * ``"full"``   – the complete board; any stored id that's absent is closed.
+      * a ``datetime`` floor – a newest-first walk that reached the age cutoff, so the
+        board is fully covered for postings listed on/after the floor; absent ids
+        newer than it are closed, the older tail is left untouched.
+      * ``None``     – partial/unknown coverage (capped paging, or the lossy HTML
+        fallback); a crawl never infers removals from it."""
+
+    positions: list[ScrapedPosition]
+    live_external_ids: set[str] | None = None
+    coverage: str | datetime | None = None
+
+
 def _hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
 
@@ -327,15 +353,22 @@ def _google_position(rec) -> ScrapedPosition:
     )
 
 
-def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPosition]:
+def _google_paged(careers_url: str | None, max_pages: int) -> tuple[list[ScrapedPosition], bool]:
+    """Page Google careers results. Returns (positions, complete), where ``complete``
+    is True only when we hit the true end of the board (an empty page) within the cap
+    — i.e. we saw the whole listing, so absence reliably means removed. Capping out at
+    ``max_pages`` (or a no-progress repeated page) leaves ``complete`` False: we can't
+    tell an absent role from one on a page we never fetched."""
     base = careers_url or _GOOGLE_RESULTS_URL
     sep = "&" if urlparse(base).query else "?"
     out: list[ScrapedPosition] = []
     seen: set[str] = set()
+    complete = False
     for page in range(1, max_pages + 1):
         records = _google_records(_fetch_text(f"{base}{sep}page={page}"))
         if not records:
-            break  # past the last page (or layout changed)
+            complete = True  # reached the end of the board (no more results)
+            break
         added = 0
         for rec in records:
             try:
@@ -348,8 +381,12 @@ def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPositi
             out.append(pos)
             added += 1
         if added == 0:
-            break  # a full page of already-seen ids: no progress, stop paging
-    return out
+            break  # a full page of already-seen ids: ambiguous, don't claim completeness
+    return out, complete
+
+
+def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPosition]:
+    return _google_paged(careers_url, max_pages)[0]
 
 
 # ── Eightfold (PCSX) careers ──────────────────────────────────────────────────
@@ -447,9 +484,15 @@ def _eightfold_position(rec: dict, origin: str) -> ScrapedPosition:
     )
 
 
-def scrape_eightfold(
+def _eightfold_paged(
     careers_url: str, domain: str | None, max_pages: int
-) -> list[ScrapedPosition]:
+) -> tuple[list[ScrapedPosition], str | datetime | None]:
+    """Walk the Eightfold board newest-first. Returns (positions, coverage):
+      * ``"full"`` – we reached an empty page, so we saw the entire board.
+      * the ``cutoff`` datetime – we stopped because a whole page predated the age
+        cutoff, so the board is fully covered for postings on/after that cutoff.
+      * ``None`` – we hit ``max_pages`` (or a no-progress page) first, so coverage is
+        partial and a crawl can't conclude any role is removed."""
     parsed = urlparse(careers_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     dom = _eightfold_domain(careers_url, domain)
@@ -460,6 +503,7 @@ def scrape_eightfold(
     )
     out: list[ScrapedPosition] = []
     seen: set[str] = set()
+    coverage: str | datetime | None = None
     for page in range(max_pages):
         start = page * _EIGHTFOLD_PAGE
         api = (
@@ -469,7 +513,8 @@ def scrape_eightfold(
         data = _fetch_json(api)
         positions = ((data or {}).get("data") or {}).get("positions") or []
         if not positions:
-            break  # past the last page
+            coverage = "full"  # reached the end of the board: complete listing seen
+            break
         added = 0
         any_within_cutoff = False
         for rec in positions:
@@ -484,13 +529,21 @@ def scrape_eightfold(
             if cutoff is None or pos.posted_at is None or pos.posted_at >= cutoff:
                 any_within_cutoff = True
         if added == 0:
-            break  # a full page of already-seen ids: no progress, stop paging
-        # Results are newest-first; once a whole page predates the cutoff, every
-        # later page does too, so stop (the final _within_max_age filter is the
-        # authoritative trim — this just bounds how many pages we fetch).
+            break  # a full page of already-seen ids: ambiguous, leave coverage partial
+        # Results are newest-first; once a whole page predates the cutoff, every later
+        # page does too, so stop. We've now seen every posting on/after the cutoff —
+        # the board is fully covered down to it (the final _within_max_age trim is
+        # authoritative; this just bounds how many pages we fetch).
         if cutoff is not None and not any_within_cutoff:
+            coverage = cutoff
             break
-    return out
+    return out, coverage
+
+
+def scrape_eightfold(
+    careers_url: str, domain: str | None, max_pages: int
+) -> list[ScrapedPosition]:
+    return _eightfold_paged(careers_url, domain, max_pages)[0]
 
 
 # ── Generic HTML fallback ────────────────────────────────────────────────────
@@ -581,9 +634,10 @@ def _infer_ats(careers_url: str | None) -> tuple[str, str | None]:
     return "html", None
 
 
-def scrape_company(company) -> list[ScrapedPosition]:
-    """Resolve the right adapter for a Company ORM object and run it.
-    Truncates to the configured per-company cap."""
+def scrape_company(company) -> ScrapeResult:
+    """Resolve the right adapter for a Company ORM object and run it. Returns a
+    ``ScrapeResult``: the age-filtered postings to upsert, plus the live id set and
+    its ``coverage`` (see ScrapeResult) used to reconcile availability."""
     ats_type = company.ats_type or "auto"
     token = company.ats_token
 
@@ -591,32 +645,48 @@ def scrape_company(company) -> list[ScrapedPosition]:
         ats_type, inferred = _infer_ats(company.careers_url)
         token = token or inferred
 
-    if ats_type in {"greenhouse", "lever", "ashby"} and not token:
+    if ats_type in _AUTHORITATIVE_ATS and not token:
         # Inference may still recover a token from the URL.
         _, token = _infer_ats(company.careers_url)
         if not token:
             raise ScrapeError(f"{company.name}: ats_type={ats_type} but no ats_token/url token")
 
+    # ``coverage`` says how much of the board ``results`` represents (drives removal
+    # reconciliation): "full" for whole-board sources, a datetime floor for a
+    # newest-first walk that reached the age cutoff, None when only a partial slice
+    # was seen (capped paging, or the lossy HTML fallback).
+    coverage: str | datetime | None = None
     if ats_type == "greenhouse":
         results = scrape_greenhouse(token)
+        coverage = "full"
     elif ats_type == "lever":
         results = scrape_lever(token)
+        coverage = "full"
     elif ats_type == "ashby":
         results = scrape_ashby(token)
+        coverage = "full"
     elif ats_type == "google":
-        results = scrape_google(company.careers_url, settings.scrape_google_max_pages)
+        results, complete = _google_paged(company.careers_url, settings.scrape_google_max_pages)
+        coverage = "full" if complete else None
     elif ats_type == "eightfold":
         if not company.careers_url:
             raise ScrapeError(f"{company.name}: eightfold scrape needs careers_url")
-        results = scrape_eightfold(
+        results, coverage = _eightfold_paged(
             company.careers_url, token, settings.scrape_eightfold_max_pages
         )
     elif ats_type == "html":
         if not company.careers_url:
             raise ScrapeError(f"{company.name}: html scrape needs careers_url")
         results = scrape_html(company.careers_url, settings.scrape_max_positions_per_company)
+        # coverage stays None: the HTML fallback is lossy (JS-rendered pages, a hard
+        # cap), so an absent role usually means "we couldn't parse it", not "removed".
     else:
         raise ScrapeError(f"{company.name}: unknown ats_type {ats_type!r}")
+
+    # Capture the live id set before any age trim — availability reconciliation needs
+    # the board as scraped, not the recent slice (else an old-but-live role looks
+    # removed). Only meaningful when we have coverage to act on.
+    live_external_ids = {p.external_id for p in results} if coverage is not None else None
 
     # No global cap: the ATS adapters return a company's full board (large boards
     # have 200+ postings, and external_id dedup means a dropped one is never seen
@@ -625,4 +695,7 @@ def scrape_company(company) -> list[ScrapedPosition]:
     #
     # Drop stale postings last, so every adapter is filtered uniformly: only roles
     # posted/updated within scrape_max_age_days are pulled (undated sources kept).
-    return _within_max_age(results, settings.scrape_max_age_days)
+    positions = _within_max_age(results, settings.scrape_max_age_days)
+    return ScrapeResult(
+        positions=positions, live_external_ids=live_external_ids, coverage=coverage
+    )

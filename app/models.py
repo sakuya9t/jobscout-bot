@@ -264,6 +264,11 @@ class Position(Base):
     description: Mapped[str | None] = mapped_column(Text)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Set when a crawl no longer finds this posting on the company's board (full-board
+    # ATS only — Greenhouse/Lever/Ashby; partial sources can't conclude removal). NULL =
+    # currently listed. Removed positions are hidden everywhere except an application the
+    # user already made; a later reappearance on the board clears this back to NULL.
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
 
     company: Mapped[Company] = relationship(back_populates="positions")
     matches: Mapped[list[MatchResult]] = relationship(
