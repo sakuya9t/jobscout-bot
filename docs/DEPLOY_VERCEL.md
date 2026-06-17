@@ -1,4 +1,92 @@
-# Deploying on Vercel: DoS protection & rate limiting
+# Deploying on Vercel
+
+## Automated CI/CD: GitHub Actions → Supabase + Vercel
+
+`.github/workflows/deploy.yml` ships the app on every push to `main` (and on demand
+from the Actions tab → **Run workflow**). It runs three gated stages:
+
+1. **test** — `pytest`.
+2. **migrate** — `jobscout init-db` against the prod Supabase Postgres. This is
+   `create_all` + preset seed: additive and idempotent, so it's safe on every deploy.
+   It only creates tables and seeds the built-in company presets — **prod starts as a
+   brand-new, empty database**; no local data is ever copied to it.
+3. **deploy** — builds and deploys to Vercel with the Vercel CLI (`vercel pull`/
+   `build`/`deploy --prebuilt --prod`).
+
+### How the app runs on Vercel (serverless)
+
+The app is normally a long-lived server, so three small adaptations let it run as
+serverless functions:
+
+- `api/index.py` re-exports the FastAPI `app`; `vercel.json` rewrites every path to it.
+- The in-process scheduler and background worker threads are turned **off** on Vercel
+  (`JOBSCOUT_SCHEDULER_ENABLED=0`, `JOBSCOUT_BACKGROUND_WORKERS=0`) since threads don't
+  survive a function freeze.
+- The daily scan runs instead via a **Vercel Cron** entry (in `vercel.json`) that hits
+  `GET /api/cron/run-daily` once a day. That endpoint runs the same synchronous
+  scrape+score as `jobscout run-daily`, authenticated by Vercel's `CRON_SECRET` bearer.
+
+### First-time bootstrap (once)
+
+Prod is a fresh, empty deployment with its **own** secret key — nothing from your
+local environment is carried over.
+
+1. **Create the Supabase project** and grab its connection string — use the
+   *Session pooler* / direct connection (port 5432) with `?sslmode=require`. Leave the
+   database empty; CI's `init-db` creates the schema + presets on the first deploy.
+2. **Generate a brand-new prod secret key** (do **not** reuse your local one):
+   ```bash
+   python -c "import secrets; print(secrets.token_urlsafe(64))"
+   ```
+   This becomes `JOBSCOUT_SECRET_KEY` in Vercel below. Since prod starts empty, it has
+   no encrypted rows or sessions tied to any other key — a unique key is exactly right.
+3. **Link the Vercel project**: `vercel link` in the repo (creates `.vercel/`), or create
+   it in the dashboard. Note its **Org ID** and **Project ID**.
+4. **Set GitHub repo secrets** (Settings → Secrets and variables → Actions):
+   | Secret | Value |
+   | --- | --- |
+   | `SUPABASE_DB_URL` | the Supabase URL above (`?sslmode=require`) |
+   | `VERCEL_TOKEN` | a Vercel access token |
+   | `VERCEL_ORG_ID` | from step 3 |
+   | `VERCEL_PROJECT_ID` | from step 3 |
+
+   The prod secret key is **not** a GitHub secret — `init-db` doesn't use it, so it only
+   lives in Vercel (next step).
+5. **Set Vercel project env vars** (Project → Settings → Environment Variables, Production):
+   | Variable | Value / note |
+   | --- | --- |
+   | `JOBSCOUT_DATABASE_URL` | same Supabase URL as `SUPABASE_DB_URL` |
+   | `JOBSCOUT_SECRET_KEY` | the brand-new key from step 2 — unique to prod, never your local key |
+   | `JOBSCOUT_DATA_DIR` | `/tmp/jobscout-data` — **required**: Vercel's FS is read-only except `/tmp`, and the app `mkdir`s this dir at import |
+   | `CRON_SECRET` | long random string; Vercel signs cron calls with it and the endpoint checks it |
+   | `JOBSCOUT_SCHEDULER_ENABLED` | `0` |
+   | `JOBSCOUT_BACKGROUND_WORKERS` | `0` |
+   | `JOBSCOUT_COOKIE_SECURE` | `1` (served over HTTPS) |
+   | `JOBSCOUT_ADMIN_TOKEN` | optional — long random string to enable `/api/admin/*` |
+   | `JOBSCOUT_REQUIRE_INVITE` | `1` (recommended for a public deploy) |
+
+After that, **push to `main`** (or run the workflow manually) to deploy.
+
+### Limitations of the minimal serverless deploy
+
+- **Cron scan is time-bounded.** It runs inline within one invocation, capped by the
+  function `maxDuration` (≤300s on Pro). A very large first-run backlog can time out;
+  it picks up where it left off on the next run (scoring is idempotent and persisted).
+- **Dashboard "Run scan now" scoring may not fully drain** on Vercel — its scrape
+  enqueues to the background evaluator, which doesn't survive a function freeze. The
+  daily cron (synchronous) is the reliable path. The crawl/scrape itself still runs.
+- **Resume original-file preview isn't durable.** Uploaded files land in `/tmp`; the
+  dashboard already falls back to the DB-stored extracted text, and matching/scoring
+  use that text, so this is cosmetic. Supabase Storage is the real fix later.
+- **Rate limiting is per-instance** on serverless — rely on the Vercel WAF (below).
+
+For a deploy where the scheduler, workers, and rate limiter all work as-is, run the
+long-lived server on a VM / container / Fly.io / Render instead (still pointed at
+Supabase), and front it with a CDN/WAF.
+
+---
+
+# DoS protection & rate limiting
 
 ## Does Vercel already protect against DoS? — Yes, partly, and some of it is free.
 

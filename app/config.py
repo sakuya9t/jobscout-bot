@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     daily_run_hour: int = 8
     daily_run_minute: int = 0
     scheduler_enabled: bool = True
+    # Background worker threads (evaluator + kit_worker) started in the app lifespan.
+    # They drain scoring/kit-generation backlogs off the request path on a long-lived
+    # server. Set JOBSCOUT_BACKGROUND_WORKERS=0 on serverless (Vercel), where threads
+    # don't survive a function freeze — there the daily cron does scoring synchronously.
+    background_workers_enabled: bool = True
 
     # Scraping
     # TODO(browser): reserved flag for a future Playwright fallback for JS-heavy

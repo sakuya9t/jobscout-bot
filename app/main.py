@@ -16,6 +16,7 @@ from .routers import (
     applications,
     auth,
     companies,
+    cron,
     interests,
     llm_config,
     pages,
@@ -41,10 +42,14 @@ async def lifespan(app: FastAPI):
         )
     init_db()
     scheduler.start()
-    # Resume any evaluation backlog left unfinished by a prior process.
-    evaluator.resume_pending_on_startup()
-    # Finish any application kit left mid-generation by a prior process.
-    kit_worker.resume_pending_on_startup()
+    # Background worker threads don't survive a serverless function freeze, so they're
+    # gated off (JOBSCOUT_BACKGROUND_WORKERS=0) on Vercel — there the daily cron scores
+    # synchronously. On a long-lived server they drain backlogs off the request path.
+    if settings.background_workers_enabled:
+        # Resume any evaluation backlog left unfinished by a prior process.
+        evaluator.resume_pending_on_startup()
+        # Finish any application kit left mid-generation by a prior process.
+        kit_worker.resume_pending_on_startup()
     yield
     scheduler.shutdown()
     evaluator.shutdown()
@@ -81,6 +86,7 @@ app.include_router(profile.router)
 app.include_router(llm_config.router)
 app.include_router(telegram_config.router)
 app.include_router(admin.router)
+app.include_router(cron.router)
 app.include_router(pages.router)
 
 
