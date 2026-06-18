@@ -518,6 +518,130 @@ def test_fetch_eightfold_descriptions_caps_and_dedups(monkeypatch):
     assert scraper.fetch_eightfold_descriptions(urls, cap=0) == {}  # disabled
 
 
+def test_eightfold_falls_back_to_smartapply_on_pcsx_403(monkeypatch):
+    """Eightfold tenants serve PCSX *or* SmartApply and 403 the other. PCSX is tried
+    first; on a 403 the adapter switches to SmartApply (Netflix) and maps its differing
+    field names (canonicalPositionUrl, t_create/t_update)."""
+    import time
+    from app.services import scraper
+
+    recent = int(time.time()) - 3600  # within the age cutoff so paging continues
+    calls: list[str] = []
+
+    def fake_json(url: str) -> dict:
+        calls.append(url)
+        if "pcsx" in url:
+            raise scraper._EightfoldFlavourUnavailable()
+        if "start=0" in url:
+            return {"positions": [{
+                "id": 790, "name": "AI Engineer",
+                "locations": ["USA - Remote"], "department": "Data",
+                "work_location_option": "remote",
+                "canonicalPositionUrl": "https://explore.jobs.netflix.net/careers/job/790",
+                "t_create": recent,
+            }]}
+        return {"positions": []}  # next page empty -> whole board seen
+
+    monkeypatch.setattr(scraper, "_eightfold_json", fake_json)
+    out, coverage = scraper._eightfold_paged(
+        "https://explore.jobs.netflix.net/careers", "netflix.com", max_pages=3)
+
+    assert any("pcsx" in u for u in calls) and any("apply/v2/jobs" in u for u in calls)
+    assert coverage == "full"  # reached an empty page within the cap
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "790" and p.title == "AI Engineer"
+    assert p.location == "USA - Remote" and p.department == "Data"
+    assert p.url == "https://explore.jobs.netflix.net/careers/job/790"
+    assert p.posted_at is not None  # t_create parsed (epoch seconds)
+
+
+def test_amazon_scrape_parses_json_and_pages_newest_first(monkeypatch):
+    """amazon.jobs has no third-party ATS; the adapter pages /en/search.json by offset,
+    keys on the stable id_icims, and folds the inline description + qualifications in."""
+    from app.services import scraper
+
+    def fake_json(url: str) -> dict:
+        if "offset=0" in url:
+            return {"jobs": [{
+                "id_icims": "111", "id": "uuid-churns", "title": " SDE II ",
+                "location": "Seattle, WA", "job_category": "Software Development",
+                "job_schedule_type": "Full-Time", "job_path": "/en/jobs/111/sde-ii",
+                "description": "<p>Build <b>things</b></p>",
+                "basic_qualifications": "<p>CS degree</p>",
+                "posted_date": "June 18, 2026",
+            }]}
+        return {"jobs": []}  # next page empty -> stop
+
+    monkeypatch.setattr(scraper, "_fetch_json", fake_json)
+    out = scraper.scrape_amazon(max_pages=5)
+
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "111"  # id_icims, not the churning UUID
+    assert p.title == "SDE II"
+    assert p.url == "https://www.amazon.jobs/en/jobs/111/sde-ii"
+    assert p.department == "Software Development"
+    assert p.description and "things" in p.description and "CS degree" in p.description
+    assert p.posted_at and p.posted_at.year == 2026 and p.posted_at.month == 6
+
+
+def test_apple_scrape_uses_csrf_then_pages(monkeypatch):
+    """Apple's search needs a CSRF token (fetched once) then pages the POST search,
+    parsing the inline jobSummary as the description and building the details URL."""
+    from app.services import scraper
+
+    monkeypatch.setattr(scraper, "_apple_csrf_token", lambda client: "tok")
+
+    def fake_page(client, token, page):
+        assert token == "tok"
+        if page == 0:
+            return {"searchResults": [{
+                "positionId": "200", "postingTitle": "Machine Learning Engineer",
+                "transformedPostingTitle": "machine-learning-engineer",
+                "locations": [{"name": "Cupertino"}, {"city": "Austin"}],
+                "team": {"teamName": "Hardware"},
+                "jobSummary": "Do <b>great</b> work",
+                "postDateInGMT": "2026-06-18T04:51:53.395483689Z",
+            }]}
+        return {"searchResults": []}  # next page empty -> stop
+
+    monkeypatch.setattr(scraper, "_apple_search_page", fake_page)
+    out = scraper.scrape_apple(max_pages=3)
+
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "200"
+    assert p.title == "Machine Learning Engineer"
+    assert p.url == "https://jobs.apple.com/en-us/details/200/machine-learning-engineer"
+    assert p.location == "Cupertino; Austin"
+    assert p.department == "Hardware"
+    assert p.description == "Do great work"
+    assert p.posted_at and p.posted_at.year == 2026  # nanosecond ISO parses on 3.11
+
+
+def test_new_company_presets_registered_and_dispatchable():
+    """The five new presets use ats_types the scraper actually dispatches on, and the
+    account gating matches each board (Amazon's portal needs a sign-in; Apple's does
+    not gate browsing)."""
+    from app.company_presets import PRESETS_BY_KEY
+
+    supported = {"greenhouse", "lever", "ashby", "eightfold", "google",
+                 "amazon", "apple", "html", "auto"}
+    expected = {
+        "airbnb": "greenhouse", "databricks": "greenhouse",
+        "netflix": "eightfold", "amazon": "amazon", "apple": "apple",
+    }
+    for key, ats in expected.items():
+        p = PRESETS_BY_KEY[key]
+        assert p.ats_type == ats and p.ats_type in supported
+    assert PRESETS_BY_KEY["airbnb"].ats_token == "airbnb"
+    assert PRESETS_BY_KEY["databricks"].ats_token == "databricks"
+    assert PRESETS_BY_KEY["netflix"].ats_token == "netflix.com"
+    assert PRESETS_BY_KEY["amazon"].requires_account is True
+    assert PRESETS_BY_KEY["apple"].requires_account is False
+
+
 def test_eightfold_upsert_enriches_new_and_backfills_existing(monkeypatch):
     """_upsert_positions fetches detail-page descriptions for eightfold: new rows are
     enriched, and a previously-stored description-less row is healed (backfill)."""

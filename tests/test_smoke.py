@@ -140,7 +140,7 @@ def test_eightfold_parses_and_builds_absolute_urls(monkeypatch):
     import app.services.scraper as scraper
 
     monkeypatch.setattr(
-        scraper, "_fetch_json",
+        scraper, "_eightfold_json",
         lambda url: _eightfold_page([(111, 1)]) if "start=0" in url else _eightfold_page([]),
     )
     out = scraper.scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 60)
@@ -173,7 +173,7 @@ def test_eightfold_paginates_and_stops_past_age_cutoff(monkeypatch):
                 return payload
         return _eightfold_page([])
 
-    monkeypatch.setattr(scraper, "_fetch_json", fake_fetch)
+    monkeypatch.setattr(scraper, "_eightfold_json", fake_fetch)
     out = scraper.scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 60)
     ids = {p.external_id for p in out}
     # Both pages are pulled (the stale page is trimmed later by _within_max_age),
@@ -193,20 +193,20 @@ def test_eightfold_coverage_signals(monkeypatch):
     monkeypatch.setattr(settings, "scrape_max_age_days", 30)
 
     # Reaches an empty page → whole board seen → "full".
-    monkeypatch.setattr(scraper, "_fetch_json",
+    monkeypatch.setattr(scraper, "_eightfold_json",
         lambda url: _eightfold_page([(111, 1)]) if "start=0" in url else _eightfold_page([]))
     _, cov_full = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 60)
     assert cov_full == "full"
 
     # A whole page predates the 30-day cutoff → covered down to the cutoff → datetime.
     pages = {"start=0": _eightfold_page([(1, 2)]), "start=10": _eightfold_page([(2, 90)])}
-    monkeypatch.setattr(scraper, "_fetch_json",
+    monkeypatch.setattr(scraper, "_eightfold_json",
         lambda url: next((p for k, p in pages.items() if k in url), _eightfold_page([])))
     _, cov_floor = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 60)
     assert isinstance(cov_floor, datetime)
 
     # Hits max_pages before the end or the cutoff → partial → None.
-    monkeypatch.setattr(scraper, "_fetch_json", lambda url: _eightfold_page([(1, 2)]))
+    monkeypatch.setattr(scraper, "_eightfold_json", lambda url: _eightfold_page([(1, 2)]))
     _, cov_partial = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 1)
     assert cov_partial is None
 

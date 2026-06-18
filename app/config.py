@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     # batches (scrape_eightfold_desc_workers) to stay polite. 0 disables enrichment.
     scrape_eightfold_max_descriptions: int = 150
     scrape_eightfold_desc_workers: int = 10
+    # Amazon (amazon.jobs) and Apple (jobs.apple.com) have no third-party ATS but
+    # expose JSON search APIs we page newest-first like eightfold; these cap the
+    # request count per crawl (amazon ~100 roles/page, apple 20/page) — paging stops
+    # early once postings predate scrape_max_age_days.
+    scrape_amazon_max_pages: int = 30
+    scrape_apple_max_pages: int = 50
     # Only pull postings posted/updated within this many days, to bound how much we
     # store and score. Applies only to sources that expose a date (greenhouse/
     # lever/ashby); Google careers and the HTML fallback carry no per-posting date,

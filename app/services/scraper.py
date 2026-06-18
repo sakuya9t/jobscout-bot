@@ -126,32 +126,42 @@ def _is_transient(exc: BaseException) -> bool:
     wait=wait_exponential_jitter(initial=0.5, max=8),
     reraise=True,
 )
-def _fetch_bytes_once(url: str) -> bytes:
-    """One SSRF-guarded GET attempt (retried on transient errors by the
-    decorator). Validates the host on every redirect hop and caps body size."""
+def _send(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[bytes, httpx.Response]:
+    """One SSRF-guarded request on ``client`` (retried on transient errors by the
+    decorator). Validates the host on every redirect hop and caps body size. Returns
+    ``(body, response)``: the body is drained, but the response's status/headers stay
+    readable — Apple reads a CSRF token off a GET before POSTing its search. Pass a
+    shared ``client`` to persist cookies across calls (Apple's CSRF cookie must ride
+    along on the search POST)."""
     # Cap on any single response we'll buffer, to bound memory from a hostile or
     # misconfigured endpoint (we stream and abort past this).
     max_bytes = settings.scrape_max_response_mb * 1024 * 1024
-    with _client() as c:
-        for _ in range(_MAX_REDIRECTS + 1):
-            _validate_url(url)
-            with c.stream("GET", url) as resp:
-                if resp.is_redirect:
-                    loc = resp.headers.get("location")
-                    if loc:
-                        url = urljoin(url, loc)
-                        continue
-                resp.raise_for_status()
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in resp.iter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise ScrapeError(
-                            f"response from {url} exceeds {max_bytes} bytes"
-                        )
-                    chunks.append(chunk)
-                return b"".join(chunks)
+    for _ in range(_MAX_REDIRECTS + 1):
+        _validate_url(url)
+        with client.stream(method, url, json=json_body, headers=headers) as resp:
+            if resp.is_redirect:
+                loc = resp.headers.get("location")
+                if loc:
+                    url = urljoin(url, loc)
+                    continue
+            resp.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ScrapeError(
+                        f"response from {url} exceeds {max_bytes} bytes"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks), resp
     raise ScrapeError(f"too many redirects from {url}")
 
 
@@ -159,7 +169,8 @@ def _fetch_bytes(url: str) -> bytes:
     """SSRF-guarded GET with transient-error retries; wraps leftover transport
     errors as ``ScrapeError`` so callers only deal with one exception type."""
     try:
-        return _fetch_bytes_once(url)
+        with _client() as c:
+            return _send(c, "GET", url)[0]
     except httpx.HTTPError as exc:
         raise ScrapeError(f"fetch {url}: {exc}") from exc
 
@@ -389,16 +400,17 @@ def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPositi
     return _google_paged(careers_url, max_pages)[0]
 
 
-# ── Eightfold (PCSX) careers ──────────────────────────────────────────────────
-# Eightfold-hosted boards (e.g. NVIDIA at jobs.nvidia.com) render their listing
-# client-side but expose an unauthenticated JSON search API. Two API flavours
-# exist — SmartApply (``/api/apply/v2/jobs``) and PCSX (``/api/pcsx/search``); a
-# given tenant serves one and 403s the other, and we target PCSX here. The board
-# is paged 10 at a time, newest-first by ``postedTs``, so rather than pull a whole
-# multi-thousand-role board we walk pages until we cross the age cutoff (or hit
-# ``max_pages``). The ``domain`` query param is the org's registrable domain
-# (``nvidia.com``), NOT the careers host (``jobs.nvidia.com``) — pass it via
-# ``ats_token``; if omitted we derive it by stripping a leading careers subdomain.
+# ── Eightfold careers ─────────────────────────────────────────────────────────
+# Eightfold-hosted boards (NVIDIA at jobs.nvidia.com, Netflix at
+# explore.jobs.netflix.net) render their listing client-side but expose an
+# unauthenticated JSON search API. Two API flavours exist — PCSX
+# (``/api/pcsx/search``, e.g. NVIDIA) and SmartApply (``/api/apply/v2/jobs``, e.g.
+# Netflix); a given tenant serves one and 403s the other, so we try PCSX first and
+# fall back to SmartApply. Either way the board is paged 10 at a time, newest-first,
+# so rather than pull a whole multi-thousand-role board we walk pages until we cross
+# the age cutoff (or hit ``max_pages``). The ``domain`` query param is the org's
+# registrable domain (``nvidia.com``/``netflix.com``), NOT the careers host — pass it
+# via ``ats_token``; if omitted we derive it by stripping a leading careers subdomain.
 _EIGHTFOLD_PAGE = 10
 _CAREERS_SUBDOMAINS = {"jobs", "careers", "career", "job", "apply", "talent", "recruiting"}
 # Pull JSON-LD <script> blocks out of an eightfold job detail page.
@@ -463,25 +475,68 @@ def _eightfold_domain(careers_url: str, explicit: str | None) -> str:
 
 def _eightfold_position(rec: dict, origin: str) -> ScrapedPosition:
     locs = rec.get("locations") or rec.get("standardizedLocations") or []
-    posted = rec.get("postedTs") or rec.get("creationTs")
+    # PCSX uses postedTs/creationTs; SmartApply uses t_update/t_create. Both are
+    # epoch *seconds* (unlike Lever/Ashby millis), so we convert here, not via _parse_ts.
+    posted = (
+        rec.get("postedTs") or rec.get("creationTs")
+        or rec.get("t_update") or rec.get("t_create")
+    )
     posted_at = None
     if isinstance(posted, (int, float)):
-        # PCSX timestamps are epoch *seconds* (unlike Lever/Ashby millis), so we
-        # convert here rather than via _parse_ts.
         try:
             posted_at = to_naive_utc(datetime.fromtimestamp(posted, tz=timezone.utc))
         except (ValueError, OSError):
             posted_at = None
-    rel = rec.get("positionUrl") or ""
+    # PCSX gives a relative positionUrl; SmartApply an absolute canonicalPositionUrl
+    # (urljoin leaves an absolute URL untouched).
+    rel = rec.get("positionUrl") or rec.get("canonicalPositionUrl") or ""
     return ScrapedPosition(
         external_id=str(rec.get("id")),
         title=(rec.get("name") or "Untitled")[:300],
         location="; ".join(loc for loc in locs if loc) or None,
         department=rec.get("department"),
-        employment_type=rec.get("workLocationOption"),  # onsite/remote/hybrid
+        # onsite/remote/hybrid (PCSX workLocationOption / SmartApply work_location_option)
+        employment_type=rec.get("workLocationOption") or rec.get("work_location_option"),
         url=_http_url(urljoin(origin, rel)) if rel else None,
         posted_at=posted_at,
     )
+
+
+class _EightfoldFlavourUnavailable(Exception):
+    """Internal: an Eightfold tenant 403'd this API flavour (it serves the other),
+    so the adapter should try the alternative (PCSX <-> SmartApply)."""
+
+
+def _eightfold_endpoint(origin: str, dom: str, flavour: str, start: int) -> str:
+    path = "api/apply/v2/jobs" if flavour == "smartapply" else "api/pcsx/search"
+    return (
+        f"{origin}/{path}?domain={dom}"
+        f"&query=&location=&start={start}&num={_EIGHTFOLD_PAGE}"
+    )
+
+
+def _eightfold_extract(data: dict, flavour: str) -> list:
+    if flavour == "smartapply":
+        return (data or {}).get("positions") or []  # SmartApply: top-level positions
+    return ((data or {}).get("data") or {}).get("positions") or []  # PCSX: data.positions
+
+
+def _eightfold_json(url: str) -> dict:
+    """GET an Eightfold JSON endpoint, distinguishing a 403 (this tenant serves the
+    *other* API flavour) from real failures so the adapter can switch flavours."""
+    try:
+        with _client() as c:
+            body, _ = _send(c, "GET", url)
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code == 403:
+            raise _EightfoldFlavourUnavailable() from exc
+        raise ScrapeError(f"fetch {url}: {exc}") from exc
+    except httpx.HTTPError as exc:
+        raise ScrapeError(f"fetch {url}: {exc}") from exc
+    try:
+        return _json.loads(body)
+    except _json.JSONDecodeError as exc:
+        raise ScrapeError(f"invalid JSON from {url}: {exc}") from exc
 
 
 def _eightfold_paged(
@@ -492,7 +547,10 @@ def _eightfold_paged(
       * the ``cutoff`` datetime – we stopped because a whole page predated the age
         cutoff, so the board is fully covered for postings on/after that cutoff.
       * ``None`` – we hit ``max_pages`` (or a no-progress page) first, so coverage is
-        partial and a crawl can't conclude any role is removed."""
+        partial and a crawl can't conclude any role is removed.
+
+    The first request picks the flavour: PCSX is tried first and, if the tenant 403s
+    it, SmartApply is used instead (see ``_EightfoldFlavourUnavailable``)."""
     parsed = urlparse(careers_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     dom = _eightfold_domain(careers_url, domain)
@@ -504,14 +562,19 @@ def _eightfold_paged(
     out: list[ScrapedPosition] = []
     seen: set[str] = set()
     coverage: str | datetime | None = None
+    flavour: str | None = None
     for page in range(max_pages):
         start = page * _EIGHTFOLD_PAGE
-        api = (
-            f"{origin}/api/pcsx/search?domain={dom}"
-            f"&query=&location=&start={start}&num={_EIGHTFOLD_PAGE}"
-        )
-        data = _fetch_json(api)
-        positions = ((data or {}).get("data") or {}).get("positions") or []
+        if flavour is None:
+            try:
+                data = _eightfold_json(_eightfold_endpoint(origin, dom, "pcsx", start))
+                flavour = "pcsx"
+            except _EightfoldFlavourUnavailable:
+                flavour = "smartapply"
+                data = _eightfold_json(_eightfold_endpoint(origin, dom, flavour, start))
+        else:
+            data = _eightfold_json(_eightfold_endpoint(origin, dom, flavour, start))
+        positions = _eightfold_extract(data, flavour)
         if not positions:
             coverage = "full"  # reached the end of the board: complete listing seen
             break
@@ -544,6 +607,190 @@ def scrape_eightfold(
     careers_url: str, domain: str | None, max_pages: int
 ) -> list[ScrapedPosition]:
     return _eightfold_paged(careers_url, domain, max_pages)[0]
+
+
+# ── Newest-first paging (capped custom boards) ────────────────────────────────
+def _paged_newest_first(
+    fetch, max_pages: int
+) -> tuple[list[ScrapedPosition], str | datetime | None]:
+    """Walk a newest-first paginated source. ``fetch(page)`` (0-based) returns that
+    page's ``ScrapedPosition``s, or ``[]`` at the end. Returns (positions, coverage):
+      * the ``cutoff`` datetime – a whole page predated the age cutoff, so the source
+        is fully covered for postings on/after it (absent newer ids are removed).
+      * ``None`` – ran out of data, or hit ``max_pages``.
+
+    Unlike the ATS adapters this never reports ``"full"``: these boards cap how deep
+    you can page (amazon.jobs ~10k, Apple paginates a slice), so an empty page is an
+    ambiguous window edge, not a proven board end — a crawl must not infer removals
+    from it."""
+    cutoff = (
+        utcnow() - timedelta(days=settings.scrape_max_age_days)
+        if settings.scrape_max_age_days > 0
+        else None
+    )
+    out: list[ScrapedPosition] = []
+    seen: set[str] = set()
+    coverage: str | datetime | None = None
+    for page in range(max_pages):
+        batch = fetch(page)
+        if not batch:
+            break
+        added = 0
+        any_within_cutoff = False
+        for pos in batch:
+            if not pos.external_id or pos.external_id in seen:
+                continue
+            seen.add(pos.external_id)
+            out.append(pos)
+            added += 1
+            if cutoff is None or pos.posted_at is None or pos.posted_at >= cutoff:
+                any_within_cutoff = True
+        if added == 0:
+            break  # a full page of already-seen ids: ambiguous, leave coverage partial
+        if cutoff is not None and not any_within_cutoff:
+            coverage = cutoff
+            break
+    return out, coverage
+
+
+# ── Amazon (amazon.jobs, no third-party ATS) ──────────────────────────────────
+# amazon.jobs is a custom board, but exposes an unauthenticated JSON search at
+# /en/search.json: GET, paged by ``offset``, newest-first (``sort=recent``), with the
+# description inline (no detail fetch needed). The API caps results at ~10k, so we
+# page newest-first and stop at the age cutoff like the other paged sources.
+_AMAZON_SEARCH = "https://www.amazon.jobs/en/search.json"
+_AMAZON_PAGE = 100  # amazon.jobs honours result_limit up to 100
+
+
+def _parse_amazon_date(value) -> datetime | None:
+    """amazon.jobs renders posted_date as e.g. 'June 18, 2026' (day granularity)."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(str(value).strip(), "%B %d, %Y").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return to_naive_utc(parsed)
+
+
+def _amazon_position(job: dict) -> ScrapedPosition:
+    # id_icims is the stable requisition id; the UUID `id` can churn between scrapes.
+    ext = str(job.get("id_icims") or job.get("id") or "")
+    path = job.get("job_path") or ""
+    desc = " ".join(
+        part for part in (
+            job.get("description"),
+            job.get("basic_qualifications"),
+            job.get("preferred_qualifications"),
+        ) if part
+    )
+    return ScrapedPosition(
+        external_id=ext,
+        title=(job.get("title") or "Untitled").strip()[:300],
+        location=job.get("normalized_location") or job.get("location"),
+        department=job.get("job_category") or job.get("business_category"),
+        employment_type=job.get("job_schedule_type"),
+        url=_http_url(urljoin(_AMAZON_SEARCH, path)) if path else None,
+        description=_strip_html(desc) or None,
+        posted_at=_parse_amazon_date(job.get("posted_date")),
+    )
+
+
+def _amazon_paged(max_pages: int) -> tuple[list[ScrapedPosition], str | datetime | None]:
+    def fetch(page: int) -> list[ScrapedPosition]:
+        url = (
+            f"{_AMAZON_SEARCH}?result_limit={_AMAZON_PAGE}"
+            f"&offset={page * _AMAZON_PAGE}&sort=recent"
+        )
+        data = _fetch_json(url)
+        jobs = (data.get("jobs") if isinstance(data, dict) else None) or []
+        return [_amazon_position(j) for j in jobs if isinstance(j, dict)]
+
+    return _paged_newest_first(fetch, max_pages)
+
+
+def scrape_amazon(max_pages: int) -> list[ScrapedPosition]:
+    return _amazon_paged(max_pages)[0]
+
+
+# ── Apple (jobs.apple.com, no third-party ATS) ────────────────────────────────
+# Apple's careers board is a JS SPA backed by a JSON search API that needs a CSRF
+# token: GET /api/v1/csrfToken returns it in the ``x-apple-csrf-token`` header (and
+# sets a matching cookie), then POST /api/v1/search returns 20 roles/page with the
+# summary inline. The token's cookie must ride along on the POST, so both requests
+# share one client. Paged newest-first like the other capped custom boards.
+_APPLE_ORIGIN = "https://jobs.apple.com"
+_APPLE_CSRF_URL = f"{_APPLE_ORIGIN}/api/v1/csrfToken"
+_APPLE_SEARCH_URL = f"{_APPLE_ORIGIN}/api/v1/search"
+
+
+def _apple_csrf_token(client: httpx.Client) -> str:
+    try:
+        _, resp = _send(client, "GET", _APPLE_CSRF_URL)
+    except httpx.HTTPError as exc:
+        raise ScrapeError(f"apple: CSRF fetch failed: {exc}") from exc
+    token = resp.headers.get("x-apple-csrf-token")
+    if not token:
+        raise ScrapeError("apple: search API returned no CSRF token")
+    return token
+
+
+def _apple_search_page(client: httpx.Client, token: str, page: int) -> dict:
+    body = {
+        "query": "", "filters": {}, "page": page + 1, "locale": "en-us", "sort": "newest",
+        # The API returns zero results unless a date-format block is present.
+        "format": {"longDate": "MMMM D, YYYY", "mediumDate": "MMM D, YYYY"},
+    }
+    headers = {"X-Apple-CSRF-Token": token, "Accept": "application/json"}
+    try:
+        data, _ = _send(client, "POST", _APPLE_SEARCH_URL, json_body=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ScrapeError(f"apple: search request failed: {exc}") from exc
+    try:
+        parsed = _json.loads(data)
+    except _json.JSONDecodeError as exc:
+        raise ScrapeError(f"apple: invalid JSON from search: {exc}") from exc
+    return (parsed or {}).get("res") or {}
+
+
+def _apple_position(rec: dict) -> ScrapedPosition:
+    pid = str(rec.get("positionId") or rec.get("id") or "")
+    slug = rec.get("transformedPostingTitle") or ""
+    locs = rec.get("locations") or []
+    loc = "; ".join(
+        l.get("name") or l.get("city")
+        for l in locs
+        if isinstance(l, dict) and (l.get("name") or l.get("city"))
+    ) or None
+    team = rec.get("team")
+    return ScrapedPosition(
+        external_id=pid,
+        title=(rec.get("postingTitle") or "Untitled")[:300],
+        location=loc,
+        department=team.get("teamName") if isinstance(team, dict) else None,
+        url=_http_url(f"{_APPLE_ORIGIN}/en-us/details/{pid}/{slug}") if pid else None,
+        description=_strip_html(rec.get("jobSummary")),
+        posted_at=_parse_ts(rec.get("postDateInGMT")),
+    )
+
+
+def _apple_paged(max_pages: int) -> tuple[list[ScrapedPosition], str | datetime | None]:
+    with _client() as client:
+        token = _apple_csrf_token(client)
+
+        def fetch(page: int) -> list[ScrapedPosition]:
+            res = _apple_search_page(client, token, page)
+            return [
+                _apple_position(r)
+                for r in (res.get("searchResults") or [])
+                if isinstance(r, dict)
+            ]
+
+        return _paged_newest_first(fetch, max_pages)
+
+
+def scrape_apple(max_pages: int) -> list[ScrapedPosition]:
+    return _apple_paged(max_pages)[0]
 
 
 # ── Generic HTML fallback ────────────────────────────────────────────────────
@@ -625,6 +872,10 @@ def _infer_ats(careers_url: str | None) -> tuple[str, str | None]:
         return "ashby", parts[0]
     if "google.com" in host and "careers" in path:
         return "google", None
+    if "amazon.jobs" in host:
+        return "amazon", None
+    if "jobs.apple.com" in host:
+        return "apple", None
     if "eightfold.ai" in host:
         # A *.eightfold.ai tenant URL; the org domain still must be supplied
         # explicitly via ats_token (it isn't recoverable from the host), so the
@@ -674,6 +925,10 @@ def scrape_company(company) -> ScrapeResult:
         results, coverage = _eightfold_paged(
             company.careers_url, token, settings.scrape_eightfold_max_pages
         )
+    elif ats_type == "amazon":
+        results, coverage = _amazon_paged(settings.scrape_amazon_max_pages)
+    elif ats_type == "apple":
+        results, coverage = _apple_paged(settings.scrape_apple_max_pages)
     elif ats_type == "html":
         if not company.careers_url:
             raise ScrapeError(f"{company.name}: html scrape needs careers_url")
