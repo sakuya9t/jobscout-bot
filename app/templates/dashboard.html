@@ -55,6 +55,11 @@
   }
   .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
   .toolbar .grow { flex:1 1 220px; }
+  /* Keep the run button pinned to the top-right; let its long status line ("…
+     evaluating N in the background…") stack underneath instead of widening the
+     row and pushing the button leftward. */
+  #primaryActions { flex-direction:column; flex-wrap:nowrap; align-items:flex-end; gap:6px; }
+  #runStatus { text-align:right; }
   /* Inline "label + select" group, so toolbar/filter/pager controls share one
      baseline instead of stacking unevenly. */
   .control { display:flex; align-items:center; gap:8px; }
@@ -116,6 +121,9 @@
   .pill {
     display:inline-flex; align-items:center; min-height:22px; padding:2px 8px;
     border-radius:999px; font-size:12px; background:#eef7f5; color:var(--accent);
+    /* A chip is a single label — never let a long job title/location next to it in
+       .job-head squeeze it into wrapping (e.g. "not a match" over two lines). */
+    white-space:nowrap; flex-shrink:0;
   }
   .pill.warn { background:#fff4df; color:var(--amber); }
   /* Always-visible info badge (e.g. next to a section heading); hover/focus for
@@ -822,10 +830,11 @@ function updateScanGate(hasResume){
 }
 
 // The daily cron only scrapes; scoring happens here. So once the user already has
-// a saved (scored) list, the button is really "score again", not a first scan.
+// a saved (scored) list, the button is really "score again" — "Recalculate" reads
+// clearer than "Refresh" (esp. when the list is blank after a watch-list change).
 function updateRunButtonLabel(hasSavedList){
   document.getElementById("runBtn").textContent =
-    hasSavedList ? "Refresh matching scores" : "Run scan now";
+    hasSavedList ? "Recalculate matching scores" : "Run scan now";
 }
 
 async function delResume(id){
@@ -1176,6 +1185,18 @@ function renderPager(total){
   document.getElementById("nextPage").disabled = current >= totalPages;
 }
 
+// What to show when the list is empty — a bare "nothing here" is confusing right
+// after a watch-list change (the live list only shows *scored* matches, and a newly
+// added company has none yet). Point the user at the button instead.
+function jobListEmptyMessage(){
+  if(selectedSnapshotId !== null){ return "This saved list has no positions."; }
+  if(minScore > 0 || minWin > 0 || postedWithin > 0 || companyFilter){
+    return "No jobs match the current filters — try relaxing them.";
+  }
+  const action = document.getElementById("runBtn").textContent.trim();
+  return `No scored matches yet — click “${action}” to score your current watch-list.`;
+}
+
 function renderJobList(data){
   renderPager(data.total || 0);
   const countLabel = jobViewMode === "all" ? "jobs listed" : "matches listed";
@@ -1225,7 +1246,7 @@ function renderJobList(data){
         ${kitIcon(m.kit_status)}
       </div>
     </article>`;
-  }).join("") || '<div class="empty">No positions in this list yet.</div>';
+  }).join("") || `<div class="empty">${esc(jobListEmptyMessage())}</div>`;
   maybePollKits(data.items);
 }
 
