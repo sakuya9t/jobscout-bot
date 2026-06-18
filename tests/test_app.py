@@ -1605,6 +1605,81 @@ def test_build_job_list_filters_by_company():
         assert none_total == 0
 
 
+def _seed_preset_subscription_match(db, uid, *, key="nvidia", name="NVIDIA"):
+    """Add a global preset company, subscribe the user, and score one passing match
+    against its shared position. Returns (company_id, position_id)."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    company = models.Company(preset_key=key, user_id=None, name=name,
+                             ats_type="eightfold", ats_token=f"{key}.com")
+    db.add(company); db.flush()
+    db.add(models.Subscription(user_id=uid, company_id=company.id))
+    pos = models.Position(company_id=company.id, external_id="nv1", title="GPU Engineer",
+                          description="CUDA")
+    db.add(pos); db.flush()
+    db.add(models.MatchResult(
+        user_id=uid, position_id=pos.id, resume_id=rid, interest_id=interest.id,
+        passed_filter=True, match_score=90, win_probability=85, reasoning="r", model="good"))
+    db.flush()
+    return company.id, pos.id
+
+
+def test_unfollowing_preset_drops_its_jobs_from_lists():
+    """Unfollowing a preset deletes only the Subscription; its shared positions and the
+    user's MatchResults persist (other followers still use them). The job list, report,
+    and detail/visibility gates must stop surfacing them — regression: NVIDIA jobs kept
+    showing after unfollow."""
+    with session_scope() as db:
+        uid = _seed_user(db)  # also seeds a custom "Acme" company + a position
+        interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+        rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+        acme_pos = db.scalar(matcher.select(models.Position))  # the custom company's position
+        acme_pid = acme_pos.id
+        db.add(models.MatchResult(
+            user_id=uid, position_id=acme_pid, resume_id=rid, interest_id=interest.id,
+            passed_filter=True, match_score=88, win_probability=80, reasoning="r", model="good"))
+        nv_cid, nv_pid = _seed_preset_subscription_match(db, uid)
+
+    with session_scope() as db:  # while subscribed: both companies show
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 2 and {m["company"] for m in items} == {"Acme", "NVIDIA"}
+        assert reporter.position_visible(db, user, nv_pid) is True
+
+    with session_scope() as db:  # unfollow NVIDIA (API path: delete the subscription)
+        sub = db.scalar(matcher.select(models.Subscription).where(
+            models.Subscription.user_id == uid, models.Subscription.company_id == nv_cid))
+        db.delete(sub)
+
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 1 and {m["company"] for m in items} == {"Acme"}  # NVIDIA gone
+        assert "NVIDIA" not in {m["company"] for m in reporter.build_report(db, user, min_results=10)}
+        assert reporter.position_visible(db, user, nv_pid) is False
+        assert reporter.build_position_detail(db, user, nv_pid) is None
+        # The user's own custom-company match is untouched.
+        assert reporter.position_visible(db, user, acme_pid) is True
+
+
+def test_applied_job_survives_unfollow():
+    """A job the user already applied to stays on the list after they unfollow its
+    company (mirrors the removed-but-applied exception) so the application isn't lost."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        nv_cid, nv_pid = _seed_preset_subscription_match(db, uid)
+        db.add(models.Application(user_id=uid, position_id=nv_pid))
+    with session_scope() as db:
+        sub = db.scalar(matcher.select(models.Subscription).where(
+            models.Subscription.user_id == uid, models.Subscription.company_id == nv_cid))
+        db.delete(sub)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 1 and items[0]["company"] == "NVIDIA" and items[0]["applied"] is True
+        assert reporter.position_visible(db, user, nv_pid) is True
+
+
 def test_job_list_endpoint_filters_by_company(monkeypatch):
     from app.auth import create_access_token
     from app.services import evaluator
@@ -1749,10 +1824,12 @@ def test_applied_status_is_per_user(monkeypatch):
     monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
     with session_scope() as db:
         uid_a = _seed_user(db, email="a@x.com")
-        _seed_match_mix(db, uid_a)
-        pid = _first_matched_position_id(db, uid_a)
         uid_b = _seed_user(db, email="b@x.com")
-        _add_match(db, uid_b, pid)  # B is matched on the SAME position
+        # Two users legitimately share a position only via a preset they both follow
+        # (custom companies are per-user). Subscribe both and match both on it.
+        cid, pid = _seed_preset_subscription_match(db, uid_a)
+        db.add(models.Subscription(user_id=uid_b, company_id=cid))
+        _add_match(db, uid_b, pid)  # B is matched on the SAME shared position
     ha = {"Authorization": f"Bearer {create_access_token(uid_a)}"}
     hb = {"Authorization": f"Bearer {create_access_token(uid_b)}"}
     with TestClient(app) as c:

@@ -16,6 +16,7 @@ from ..models import (
     JobListSnapshot,
     MatchResult,
     Position,
+    Subscription,
     User,
 )
 from ..timeutil import utcnow
@@ -47,6 +48,27 @@ def _visible_positions_clause(user: User):
     vanishing with its application record. Applied to every match-listing query."""
     applied = select(Application.position_id).where(Application.user_id == user.id)
     return or_(Position.removed_at.is_(None), Position.id.in_(applied))
+
+
+def _followed_companies_clause(user: User):
+    """WHERE clause keeping only positions the user still has a reason to see: ones
+    whose company they currently follow (a custom company they own, or a preset they
+    still subscribe to), plus any they've already applied to.
+
+    Unfollowing a preset only deletes the ``Subscription`` — the shared positions and
+    the user's ``MatchResult`` rows persist (other followers still use them) — so
+    without this every match-listing query would keep surfacing the unfollowed
+    company's jobs. The applied-to exception mirrors ``_visible_positions_clause``:
+    a job you've already applied to stays on your list even after you unfollow the
+    company, rather than vanishing along with its application record."""
+    owned = select(Company.id).where(Company.user_id == user.id)
+    subscribed = select(Subscription.company_id).where(Subscription.user_id == user.id)
+    applied = select(Application.position_id).where(Application.user_id == user.id)
+    return or_(
+        Position.company_id.in_(owned),
+        Position.company_id.in_(subscribed),
+        Position.id.in_(applied),
+    )
 
 
 def _match_row(match: MatchResult, pos: Position, company: Company, *,
@@ -162,6 +184,7 @@ def build_report(
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id, MatchResult.passed_filter == True)  # noqa: E712
         .where(_visible_positions_clause(user))
+        .where(_followed_companies_clause(user))
         .order_by(MatchResult.match_score.desc(), MatchResult.win_probability.desc())
     )
     if on_date is not None:
@@ -237,6 +260,7 @@ def build_job_list(
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id)
         .where(_visible_positions_clause(user))
+        .where(_followed_companies_clause(user))
     )
     if company_id is not None:
         base = base.where(Position.company_id == company_id)
@@ -294,6 +318,7 @@ def position_visible(db: Session, user: User, position_id: int) -> bool:
         .join(Position, MatchResult.position_id == Position.id)
         .where(MatchResult.user_id == user.id, MatchResult.position_id == position_id)
         .where(_visible_positions_clause(user))
+        .where(_followed_companies_clause(user))
         .limit(1)
     ) is not None
 
@@ -309,6 +334,7 @@ def build_position_detail(db: Session, user: User, position_id: int) -> dict | N
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id, MatchResult.position_id == position_id)
         .where(_visible_positions_clause(user))
+        .where(_followed_companies_clause(user))
         .order_by(
             MatchResult.passed_filter.desc(),
             MatchResult.match_score.desc(),
