@@ -77,6 +77,11 @@ class User(Base):
     profile_experience: Mapped[list[ProfileExperience]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    # Operational queue row driving the periodic background scoring drain (one per
+    # user; see services/scoring_queue.py). Cascade-deleted with the user.
+    scoring_job: Mapped[ScoringJob | None] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
 
 
 class JobListSnapshot(Base):
@@ -560,3 +565,34 @@ class ProfileExperience(Base):
     description: Mapped[str | None] = mapped_column(Text)
 
     user: Mapped[User] = relationship(back_populates="profile_experience")
+
+
+class ScoringJob(Base):
+    """A user's slot in the periodic background-scoring queue. One row per user
+    (``uq_scoring_job_user``), so enqueue is an idempotent upsert and a user can
+    never have two queued jobs. The row is the durable, cross-process claim record
+    the GitHub Actions scoring cron drains (see services/scoring_queue.py): a worker
+    flips ``pending`` -> ``running`` atomically via ``SELECT … FOR UPDATE SKIP
+    LOCKED`` (Postgres), drains the user's whole backlog, then marks it ``done`` /
+    re-arms ``pending`` if work remains / ``error`` on failure. The backlog itself
+    lives in MatchResult gaps (``matcher.count_pending``); this table only schedules
+    and serializes the draining so concurrent DB connections stay bounded."""
+
+    __tablename__ = "scoring_jobs"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_scoring_job_user"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # pending (work to do) | running (claimed by a worker) | done | error.
+    state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # Lower drains first; reserved for a future on-demand jump-ahead. Tie-broken by
+    # enqueued_at so the queue is FIFO within a priority.
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # When a worker claimed it (used to reclaim rows stuck running after a crash).
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    user: Mapped[User] = relationship(back_populates="scoring_job")

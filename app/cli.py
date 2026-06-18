@@ -5,6 +5,9 @@ Commands:
   mcp              Run the MCP server over stdio (for openclaw/hermes/agents).
   run-daily        Scrape all users' companies and save new positions (cron-friendly;
                    no scoring — matching runs on-demand from the job-list view).
+  run-scoring      Drain every user's matching backlog via the scoring queue, with a
+                   bounded worker pool so concurrent DB connections stay capped. Runs
+                   on its own schedule (scoring.yml), separate from the daily scrape.
   init-db          Create database tables.
   encrypt-secrets  Encrypt the telegram-token / LLM-key columns at rest (one-time,
                    idempotent migration; widens the columns on Postgres first).
@@ -60,6 +63,34 @@ def cmd_run_daily(_: argparse.Namespace) -> int:
     errors = [e for s in summaries.values() for e in s.errors]
     print(f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)}")
     for e in errors:
+        print(f"  - {e}")
+    return 0
+
+
+def cmd_run_scoring(_: argparse.Namespace) -> int:
+    """Periodic scoring drain (the scoring.yml cron). Enqueue every user with a
+    non-empty matching backlog, then drain the queue with a bounded worker pool —
+    capping concurrent DB connections regardless of how many users have work. Separate
+    from ``run-daily`` (scrape-only) on purpose; safe to run on its own schedule."""
+    from .config import settings
+    from .db import init_db, session_scope
+    from .services import evaluator, scoring_queue
+
+    init_db()
+    with session_scope() as db:
+        enqueued = scoring_queue.reconcile(db)
+    summary = evaluator.drain_queue(
+        max_workers=settings.scoring_max_concurrency,
+        budget_seconds=settings.scoring_run_budget_seconds,
+    )
+    with session_scope() as db:
+        states = scoring_queue.counts_by_state(db)
+    print(
+        f"Enqueued: {enqueued} | users drained: {summary.users} | "
+        f"scored: {summary.scored} | failed: {summary.failed}"
+    )
+    print(f"Queue: {states or '{}'}")  # e.g. {'done': 3, 'error': 1, 'pending': 2}
+    for e in summary.errors:
         print(f"  - {e}")
     return 0
 
@@ -366,6 +397,10 @@ def main() -> None:
         "run-daily",
         help="Scrape all users' companies and save new positions (no scoring)",
     ).set_defaults(func=cmd_run_daily)
+    sub.add_parser(
+        "run-scoring",
+        help="Drain the matching backlog for all users (bounded; cron-friendly)",
+    ).set_defaults(func=cmd_run_scoring)
     sub.add_parser("init-db", help="Create database tables").set_defaults(func=cmd_init_db)
     sub.add_parser(
         "encrypt-secrets",

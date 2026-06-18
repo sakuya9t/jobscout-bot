@@ -14,6 +14,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -279,17 +280,33 @@ def _filter_batch(
     return _parse_filter_batch(text, positions), None
 
 
+def _flush_match(db: Session, result: MatchResult) -> bool:
+    """Flush one new MatchResult inside a SAVEPOINT, tolerating the cross-process
+    race where another drain (the periodic scoring cron vs. an on-demand web scan)
+    already scored this (user, position, resume, interest) pair. The ``uq_match_unique``
+    violation is swallowed and ``False`` returned; the SAVEPOINT rolls back only this
+    row, so the rest of the batch (and its LLM spend) is kept rather than re-billed.
+    Returns True when the row was inserted."""
+    try:
+        with db.begin_nested():
+            db.add(result)
+            db.flush()
+        return True
+    except IntegrityError:
+        log.debug("match row already scored by a concurrent drain — skipping the pair")
+        return False
+
+
 def _persist_error_marker(
     db: Session, user: User, resume: Resume, interest: Interest, pos: Position, message: str
 ) -> None:
     """Mark a (position, interest) pair as terminally failed so it isn't re-billed
     until ``clear_failed_markers`` clears it."""
-    db.add(MatchResult(
+    _flush_match(db, MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=message[:1000], model=ERROR_MODEL,
     ))
-    db.flush()
 
 
 def _persist_filter_reject(
@@ -298,13 +315,12 @@ def _persist_filter_reject(
 ) -> None:
     """Record a cheap-filter 'not a match' so it ranks out of the report and the
     pair lands in the ``already`` set (not re-screened next run)."""
-    db.add(MatchResult(
+    _flush_match(db, MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=(reason or "Screened out as not a match.")[:1000],
         strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model,
     ))
-    db.flush()
 
 
 def _persist_exclude_reject(
@@ -312,13 +328,12 @@ def _persist_exclude_reject(
 ) -> None:
     """Record a keyword-exclusion 'not a match' so the pair leaves the backlog and
     ranks out of the report (passed_filter=False), without spending an LLM call."""
-    db.add(MatchResult(
+    _flush_match(db, MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning="Dropped by an interest exclude keyword.",
         strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL,
     ))
-    db.flush()
 
 
 def _persist_score_result(
@@ -329,7 +344,9 @@ def _persist_score_result(
     pos: Position,
     verdict: MatchVerdict,
     model: str,
-) -> int:
+) -> int | None:
+    """Persist one scored verdict; returns the new row id, or None if a concurrent
+    drain already scored this pair (see ``_flush_match``)."""
     result = MatchResult(
         user_id=user.id,
         position_id=pos.id,
@@ -343,8 +360,8 @@ def _persist_score_result(
         gaps=json.dumps(verdict.gaps),
         model=model,
     )
-    db.add(result)
-    db.flush()
+    if not _flush_match(db, result):
+        return None
     return result.id
 
 
@@ -517,7 +534,9 @@ def _score_batch(
             missing += 1
             _persist_error_marker(db, user, resume, interest, pos, marker_message)
             continue
-        match_ids.append(_persist_score_result(db, user, resume, interest, pos, verdict, client.model))
+        match_id = _persist_score_result(db, user, resume, interest, pos, verdict, client.model)
+        if match_id is not None:  # None ⇒ a concurrent drain already scored this pair
+            match_ids.append(match_id)
 
     if invalid or missing:
         return (

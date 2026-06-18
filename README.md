@@ -18,8 +18,15 @@ LLM and Telegram bot are **per-user**: every account brings its own API key and 
 
 ## How matching works
 The daily cron only runs step 1 (**scrape**), saving new positions. Steps 3–6 (the
-LLM filter, score, and report) run **on-demand**, when a user clicks *Run scan now*
-/ *Refresh matching scores* — keeping the expensive per-user matching off the cron.
+LLM filter, score, and report) are the expensive per-user work and all run through a
+**Postgres-backed scoring queue** drained by a bounded worker pool
+(`JOBSCOUT_SCORING_MAX_CONCURRENCY`) — so the number of users scored at once, and thus
+concurrent DB connections, stays capped no matter how many users have work. Two things
+feed that queue: clicking *Run scan now* / *Refresh matching scores* enqueues you
+on-demand, and a few-hourly cron (`jobscout run-scoring`, in
+`.github/workflows/scoring.yml`) enqueues everyone with a non-empty backlog so matches
+stay fresh without a manual click. A peak of users all hitting *Run scan* therefore
+just enqueues cheap rows; it can never spin up more than N concurrent scorers.
 
 1. **Scrape** — ATS-API-first: **Greenhouse / Lever / Ashby** JSON (robust, stable
    IDs), plus dedicated adapters for **Google Careers** and **Eightfold** (e.g.
@@ -116,10 +123,13 @@ dashboard's **Telegram settings** page and Save, then DM the bot `/start <code>`
 pushes are currently disabled while that flow is reworked.
 
 ### Cron instead of the in-process scheduler
-Set `JOBSCOUT_SCHEDULER_ENABLED=0` and run the daily scrape from cron (it saves new
-positions; scoring stays on-demand from the dashboard):
+Set `JOBSCOUT_SCHEDULER_ENABLED=0` and run the two crons separately — `run-daily`
+scrapes (new positions only), `run-scoring` drains the matching backlog through the
+bounded queue (see *How matching works*). They're split so scoring's cost and DB load
+are decoupled from the cheap daily scrape:
 ```bash
-0 8 * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-daily
+0 8   * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-daily
+0 */4 * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-scoring
 ```
 
 ### Production database (Supabase / Postgres)

@@ -70,7 +70,7 @@ local environment is carried over.
    | `JOBSCOUT_DATA_DIR` | `/tmp/jobscout-data` — **required**: Vercel's FS is read-only except `/tmp`, and the app `mkdir`s this dir at import |
    | `CRON_SECRET` | optional — long random string gating the manual `GET /api/cron/run-daily` trigger. Not required for the daily scan (that runs in GitHub Actions); set it only if you want the HTTP trigger usable |
    | `JOBSCOUT_SCHEDULER_ENABLED` | `0` |
-   | `JOBSCOUT_BACKGROUND_WORKERS` | `0` |
+   | `JOBSCOUT_BACKGROUND_WORKERS_ENABLED` | `0` — threads don't survive a function freeze; scoring is enqueued and drained by the `run-scoring` GitHub Actions cron instead |
    | `JOBSCOUT_COOKIE_SECURE` | `1` (served over HTTPS) |
    | `JOBSCOUT_ADMIN_TOKEN` | optional — long random string to enable `/api/admin/*` |
    | `JOBSCOUT_REQUIRE_INVITE` | `1` (recommended for a public deploy) |
@@ -79,23 +79,28 @@ After that, **push to `main`** (or run the workflow manually) to deploy.
 
 ### Limitations of the minimal serverless deploy
 
-- **Daily scan runs in GitHub Actions, not on Vercel.** Vercel's function time limit
-  (60s on Hobby) can't fit a full scrape+score, so the scan lives in
-  `.github/workflows/daily-scan.yml` (no time cap) — see "How the app runs" above. The
-  schedule is GitHub cron (`0 8 * * *`, **UTC**); change it there, and trigger an ad-hoc
-  run from the Actions tab → **Run workflow**.
-- **Dashboard "Run scan now" scoring may not fully drain** on Vercel — its scrape
-  enqueues to the background evaluator, which doesn't survive a function freeze. The
-  GitHub Actions daily scan (synchronous, no time limit) is the reliable scoring path;
-  the dashboard still shows results from the DB. The crawl/scrape itself still runs.
+- **Scrape and scoring both run in GitHub Actions, not on Vercel.** Vercel's function
+  time limit (60s on Hobby) can't fit them, so they live in two crons with no time cap:
+  `.github/workflows/daily-scan.yml` (`jobscout run-daily`, scrape only, `0 8 * * *`) and
+  `.github/workflows/scoring.yml` (`jobscout run-scoring`, drains the matching backlog via
+  the bounded queue, every 4h) — both **UTC**; change the schedules there, or trigger an
+  ad-hoc run from the Actions tab → **Run workflow**.
+- **Dashboard "Run scan now" scoring is queued, not inline,** on Vercel — its scrape runs
+  synchronously, then it **enqueues** the user to the durable scoring queue (background
+  threads don't survive a function freeze). The `run-scoring` GitHub Actions cron drains
+  the queue reliably; the dashboard shows matches from the DB as they're scored. So a
+  manual refresh's results appear once the next scoring run picks it up rather than within
+  the request.
 - **Resume original-file preview isn't durable.** Uploaded files land in `/tmp`; the
   dashboard already falls back to the DB-stored extracted text, and matching/scoring
   use that text, so this is cosmetic. Supabase Storage is the real fix later.
 - **Rate limiting is per-instance** on serverless — rely on the Vercel WAF (below).
 - **Database connections go through Supabase's pooler.** The app uses SQLAlchemy
   `NullPool` on Postgres (no in-process connection pool), so serverless instances and
-  the daily-scan job don't hoard idle connections and exhaust the pooler's per-client
-  cap. Use the **session pooler** URL (port `5432`) as documented; if you later run
+  the daily-scan / run-scoring jobs don't hoard idle connections and exhaust the pooler's
+  per-client cap. The scoring cron additionally bounds how many users score at once
+  (`JOBSCOUT_SCORING_MAX_CONCURRENCY`), so a backlog spike can't blow the connection cap.
+  Use the **session pooler** URL (port `5432`) as documented; if you later run
   enough concurrency to still hit "max clients reached in session mode", switch the
   connection string to the **transaction pooler** (port `6543`), which multiplexes and
   raises the ceiling — change it in both `SUPABASE_DB_URL` and `JOBSCOUT_DATABASE_URL`.
