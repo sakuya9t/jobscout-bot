@@ -212,6 +212,52 @@ def test_register_login_roundtrip():
                       json={"email": "a@b.com", "password": "wrongpass"}).status_code == 401
 
 
+def test_register_enforces_password_complexity():
+    """Registration requires >= 8 chars with a letter and a number; too-short,
+    all-letter, and all-digit passwords are rejected with a 422. Login is left on
+    the laxer rule (the wrong-password roundtrip above asserts it stays a 401)."""
+    with TestClient(app) as c:
+        for weak in ("short1", "allletters", "12345678"):
+            r = c.post("/api/auth/register", json={"email": "weak@x.com", "password": weak})
+            assert r.status_code == 422, weak
+        # A compliant password registers fine.
+        assert _register(c, "strong@x.com", "secret123").status_code == 200
+
+
+def test_change_password():
+    """A logged-in user can rotate their password: the wrong current password and a
+    same/weak new password are rejected, and after a valid change the old password no
+    longer logs in while the new one does."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'cp@x.com').json()['access_token']}"}
+        # Wrong current password -> 400 (not a re-auth 401; the session is valid).
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "nope", "new_password": "brandnew1"}
+                      ).status_code == 400
+        # New password must meet complexity (this one has no digit) -> 422.
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "secret123", "new_password": "allletters"}
+                      ).status_code == 422
+        # Reusing the current password is rejected.
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "secret123", "new_password": "secret123"}
+                      ).status_code == 400
+        # Valid change succeeds.
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "secret123", "new_password": "brandnew1"}
+                      ).status_code == 200
+        # Old password no longer works; the new one does.
+        assert c.post("/api/auth/login",
+                      json={"email": "cp@x.com", "password": "secret123"}).status_code == 401
+        assert c.post("/api/auth/login",
+                      json={"email": "cp@x.com", "password": "brandnew1"}).status_code == 200
+    # The endpoint requires authentication (fresh client carries no session cookie).
+    with TestClient(app) as c2:
+        assert c2.post("/api/auth/change-password",
+                       json={"current_password": "brandnew1", "new_password": "another12"}
+                       ).status_code == 401
+
+
 def test_email_normalized_case_insensitive():
     """A@b.com and a@b.com are the same account; login is case-insensitive."""
     with TestClient(app) as c:

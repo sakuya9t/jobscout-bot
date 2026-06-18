@@ -28,16 +28,52 @@ class MatchVerdict(BaseModel):
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
+def _require_password_complexity(v: str) -> str:
+    """The new-password policy shared by registration and change-password: >= 8 chars
+    with at least one letter and one digit, which rejects "12345678" / "password"
+    without forcing character-class gymnastics on users. Login is deliberately NOT
+    held to this (it validates against plain Credentials) so an existing account with
+    an older/weaker password still gets a clean 401 on a wrong password, not a 422."""
+    if len(v) < 8 or not any(c.isalpha() for c in v) or not any(c.isdigit() for c in v):
+        raise ValueError(
+            "Password must be at least 8 characters and include a letter and a number"
+        )
+    return v
+
+
 class Credentials(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)
 
 
 class RegisterCredentials(Credentials):
+    # Redeclared to drop the parent's min_length=6 so the complexity validator below
+    # is the single source of truth for the registration password policy (and always
+    # produces its own message). Login keeps the laxer Credentials rule on purpose.
+    password: str
     # Required at registration only when JOBSCOUT_REQUIRE_INVITE is on (the route, not
     # the schema, enforces presence, so the field is optional here and ignored when
     # invites are disabled). Login uses plain Credentials and never carries a code.
     invite_code: str | None = None
+
+    @field_validator("password")
+    @classmethod
+    def _password_complexity(cls, v: str) -> str:
+        return _require_password_complexity(v)
+
+
+class PasswordChange(BaseModel):
+    """Change-password request for a logged-in user. ``current_password`` is verified
+    in the route (not here); ``new_password`` must meet the same complexity rule as
+    registration."""
+
+    current_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_complexity(cls, v: str) -> str:
+        return _require_password_complexity(v)
 
 
 class Token(BaseModel):

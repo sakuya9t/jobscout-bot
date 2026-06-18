@@ -8,8 +8,12 @@
     <label>Email</label>
     <input id="email" type="email" autocomplete="username" />
     <label>Password</label>
-    <input id="password" type="password" autocomplete="current-password" />
+    <input id="password" type="password"
+           autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" />
     {% if mode == "register" %}
+    <p class="muted" style="margin-top:-8px; font-size:0.85em;">
+      At least 8 characters, including a letter and a number.
+    </p>
     <label>Invitation code</label>
     <input id="invite_code" type="text" autocomplete="off" placeholder="Required to register" />
     {% endif %}
