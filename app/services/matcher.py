@@ -10,9 +10,11 @@ import logging
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -84,7 +86,7 @@ _SCORE_BATCH_DESC_CHARS = 1500  # batch scoring keeps one resume + N postings in
 
 # Marker stored on the `model` column of a MatchResult when scoring terminally
 # failed, so the pair is skipped on re-runs rather than re-billed. Cleared by
-# `clear_failed_markers` (CLI: run-daily --retry-failed).
+# `clear_failed_markers` so a later scan re-scores the pair.
 ERROR_MODEL = "error"
 # Marker for a pair dropped by an explicit exclude keyword before any LLM call.
 # Persisting it (instead of just counting) means the pair leaves the evaluation
@@ -278,17 +280,33 @@ def _filter_batch(
     return _parse_filter_batch(text, positions), None
 
 
+def _flush_match(db: Session, result: MatchResult) -> bool:
+    """Flush one new MatchResult inside a SAVEPOINT, tolerating the cross-process
+    race where another drain (the periodic scoring cron vs. an on-demand web scan)
+    already scored this (user, position, resume, interest) pair. The ``uq_match_unique``
+    violation is swallowed and ``False`` returned; the SAVEPOINT rolls back only this
+    row, so the rest of the batch (and its LLM spend) is kept rather than re-billed.
+    Returns True when the row was inserted."""
+    try:
+        with db.begin_nested():
+            db.add(result)
+            db.flush()
+        return True
+    except IntegrityError:
+        log.debug("match row already scored by a concurrent drain — skipping the pair")
+        return False
+
+
 def _persist_error_marker(
     db: Session, user: User, resume: Resume, interest: Interest, pos: Position, message: str
 ) -> None:
     """Mark a (position, interest) pair as terminally failed so it isn't re-billed
-    until ``--retry-failed`` clears it."""
-    db.add(MatchResult(
+    until ``clear_failed_markers`` clears it."""
+    _flush_match(db, MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=message[:1000], model=ERROR_MODEL,
     ))
-    db.flush()
 
 
 def _persist_filter_reject(
@@ -297,13 +315,12 @@ def _persist_filter_reject(
 ) -> None:
     """Record a cheap-filter 'not a match' so it ranks out of the report and the
     pair lands in the ``already`` set (not re-screened next run)."""
-    db.add(MatchResult(
+    _flush_match(db, MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=(reason or "Screened out as not a match.")[:1000],
         strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model,
     ))
-    db.flush()
 
 
 def _persist_exclude_reject(
@@ -311,13 +328,12 @@ def _persist_exclude_reject(
 ) -> None:
     """Record a keyword-exclusion 'not a match' so the pair leaves the backlog and
     ranks out of the report (passed_filter=False), without spending an LLM call."""
-    db.add(MatchResult(
+    _flush_match(db, MatchResult(
         user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning="Dropped by an interest exclude keyword.",
         strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL,
     ))
-    db.flush()
 
 
 def _persist_score_result(
@@ -328,7 +344,9 @@ def _persist_score_result(
     pos: Position,
     verdict: MatchVerdict,
     model: str,
-) -> int:
+) -> int | None:
+    """Persist one scored verdict; returns the new row id, or None if a concurrent
+    drain already scored this pair (see ``_flush_match``)."""
     result = MatchResult(
         user_id=user.id,
         position_id=pos.id,
@@ -342,8 +360,8 @@ def _persist_score_result(
         gaps=json.dumps(verdict.gaps),
         model=model,
     )
-    db.add(result)
-    db.flush()
+    if not _flush_match(db, result):
+        return None
     return result.id
 
 
@@ -351,11 +369,18 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
     """Scrape one company and upsert. Returns (new_positions, errors)."""
     errors: list[str] = []
     try:
-        scraped = scraper.scrape_company(company)
+        result = scraper.scrape_company(company)
     except scraper.ScrapeError as exc:
         return [], [str(exc)]
     except Exception as exc:  # defensive: never let one company kill the run
         return [], [f"{company.name}: unexpected scrape error: {exc}"]
+
+    # Normalize: production returns a ScrapeResult; tests that monkeypatch
+    # scrape_company may still return a bare list (no availability signal).
+    if isinstance(result, scraper.ScrapeResult):
+        scraped, live_ids, coverage = result.positions, result.live_external_ids, result.coverage
+    else:
+        scraped, live_ids, coverage = result, None, None
 
     new_positions: list[Position] = []
     # Positions still missing a description that this ATS only exposes on the job
@@ -403,9 +428,50 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
             if text:
                 pos.description = text
 
+    _reconcile_removals(db, company, live_ids, coverage, existing)
+
     company.last_scraped_at = utcnow()
     db.flush()  # assign ids
     return new_positions, errors
+
+
+def _reconcile_removals(
+    db: Session,
+    company: Company,
+    live_ids: set[str] | None,
+    coverage: str | datetime | None,
+    existing: dict[str, Position],
+) -> None:
+    """Mark stored positions removed when they drop off the company's board, and clear
+    the flag for any that reappear. ``coverage`` (from the scrape) bounds what may be
+    inferred removed:
+
+      * ``"full"`` – the whole board; any stored id that's absent is closed.
+      * a ``datetime`` floor – the board is fully covered only for postings listed
+        on/after it (a newest-first walk that reached the age cutoff), so a stored
+        posting absent *and* newer than the floor is closed, while the older tail —
+        outside what the scrape covered — is left untouched.
+      * ``None`` – partial/unknown coverage; no removals are inferred.
+
+    An empty ``live_ids`` is treated as a suspect fetch (a flukey-empty response would
+    otherwise close the whole company) and skipped — a genuine reappearance heals the
+    flag on the next non-empty crawl. ``existing`` is the (already-loaded) map of this
+    company's stored positions, reused so we don't re-query."""
+    if coverage is None or not live_ids:  # nothing authoritative to act on
+        return
+    floor = coverage if isinstance(coverage, datetime) else None  # None ⇒ "full"
+    now = utcnow()
+    for ext_id, pos in existing.items():
+        if ext_id in live_ids:
+            if pos.removed_at is not None:
+                pos.removed_at = None  # relisted → available again
+            continue
+        if pos.removed_at is not None:
+            continue  # absent and already marked removed
+        # Absent from the board: only close it if it falls within what we covered.
+        if floor is not None and (pos.posted_at is None or pos.posted_at < floor):
+            continue  # older than the covered window (or undated) → can't conclude
+        pos.removed_at = now
 
 
 def _score_batch(
@@ -428,8 +494,8 @@ def _score_batch(
         data = client.chat_json(SYSTEM_PROMPT, prompt, MATCH_BATCH_SCHEMA)
     except OllamaBudgetError:
         # Recoverable — don't write error-markers, or these postings would be
-        # skipped until --retry-failed even after the user tops up. Propagate so
-        # the run loop stops and reports it once.
+        # skipped until clear_failed_markers runs even after the user tops up.
+        # Propagate so the run loop stops and reports it once.
         raise
     except OllamaError as exc:
         log.warning("batch scoring failed for %d postings: %s", len(positions), exc)
@@ -468,7 +534,9 @@ def _score_batch(
             missing += 1
             _persist_error_marker(db, user, resume, interest, pos, marker_message)
             continue
-        match_ids.append(_persist_score_result(db, user, resume, interest, pos, verdict, client.model))
+        match_id = _persist_score_result(db, user, resume, interest, pos, verdict, client.model)
+        if match_id is not None:  # None ⇒ a concurrent drain already scored this pair
+            match_ids.append(match_id)
 
     if invalid or missing:
         return (
@@ -572,7 +640,11 @@ def count_pending(db: Session, user: User) -> int:
         return 0
     company_ids = [c.id for c in companies]
     described_ids = {
-        p.id for p in db.scalars(select(Position).where(Position.company_id.in_(company_ids)))
+        p.id for p in db.scalars(
+            select(Position).where(
+                Position.company_id.in_(company_ids), Position.removed_at.is_(None)
+            )
+        )
         if (p.description or "").strip()
     }
     if not described_ids:
@@ -646,7 +718,11 @@ def _score_locked(
 
     company_ids = [c.id for c in companies]
     described = _described(
-        list(db.scalars(select(Position).where(Position.company_id.in_(company_ids))))
+        list(db.scalars(
+            select(Position).where(
+                Position.company_id.in_(company_ids), Position.removed_at.is_(None)
+            )
+        ))
     )
     already = {
         (m.position_id, m.interest_id)
@@ -756,10 +832,13 @@ def run_for_user(
     return res
 
 
-def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
-    """Entry point for the scheduler/CLI. Crawl the shared preset catalog ONCE, then
-    score each user (which also scrapes that user's custom companies) — committed
-    independently. ``retry_failed`` clears prior error-markers first."""
+def scrape_for_all_users() -> dict[int, RunResult]:
+    """Daily-cron entry point. Crawl the shared preset catalog ONCE, then scrape each
+    user's custom companies and persist any new positions — committed independently
+    per user. Deliberately does NOT score: matching is expensive per user, so it's
+    deferred to an on-demand scan from the job-list view (web ``/api/run`` -> the
+    background evaluator in ``services/evaluator``). New positions simply accumulate
+    until the user runs a scan, which scores the whole backlog."""
     from . import crawler
 
     crawler.crawl_presets()  # shared, once — not per user
@@ -770,16 +849,13 @@ def run_for_all_users(retry_failed: bool = False) -> dict[int, RunResult]:
     for uid in user_ids:
         try:
             with session_scope() as db:
-                from . import reporter
-
                 user = db.get(User, uid)
-                if retry_failed:
-                    clear_failed_markers(db, user_id=uid)
-                summaries[uid] = run_for_user(db, user)
-                reporter.record_job_list_snapshot(db, user, summaries[uid])
+                res = scrape_only(db, user)
+                res.finalize_errors()
+                summaries[uid] = res
         except Exception as exc:  # isolate per-user failures
-            log.exception("daily run failed for user %s", uid)
+            log.exception("daily scrape failed for user %s", uid)
             r = RunResult()
-            r.errors.append(f"run failed: {exc}")
+            r.errors.append(f"scrape failed: {exc}")
             summaries[uid] = r
     return summaries

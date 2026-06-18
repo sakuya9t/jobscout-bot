@@ -40,7 +40,7 @@ app/
     matcher.py       per-user pipeline: scrape -> dedup -> LLM filter+score -> persist
     reporter.py      build daily report (dict/markdown) from MatchResults
     telegram_bot.py  long-poll bot: /start linking + sends reports
-    scheduler.py     APScheduler daily trigger -> matcher.run_for_all_users
+    scheduler.py     APScheduler daily trigger -> matcher.scrape_for_all_users
   routers/           auth, resumes, companies, interests, positions, reports, pages
   templates/         dashboard Jinja templates
   mcp_server.py      MCP tools wrapping the same services
@@ -57,13 +57,16 @@ so the `already`-scored set no longer matches and every passing (position,
 interest) pair is re-scored against the new resume — a deliberate, one-time LLM
 cost when the candidate's resume materially changes.
 
-## Daily pipeline (per user)
+## Pipeline (per user)
+Step 1 runs **daily** (cron via `matcher.scrape_for_all_users`). Steps 2–4 run
+**on-demand** — when the user runs a scan (`POST /api/run` -> background evaluator
+-> `matcher.score_to_completion`) — because scoring is the expensive per-user step.
 1. For each active Company: scrape -> upsert Positions (new = unseen external_id).
 2. Candidate set = new positions (+ any never-scored). Cheap keyword/location
    pre-filter against the user's Interests to cut LLM calls.
 3. For each candidate + active resume: call Ollama -> `{passed, match_score,
    win_probability, reasoning, strengths[], gaps[]}`. Persist MatchResult.
-4. Reporter ranks results above the interest's `min_score`; dashboard + Telegram.
+4. Reporter ranks results above the interest's `min_score`; shown in the dashboard.
 
 ## Security / multi-tenancy
 Every user-owned query is scoped by `user_id`. Resumes stored as extracted text

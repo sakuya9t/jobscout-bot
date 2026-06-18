@@ -36,3 +36,6 @@ htmlcov/
 *.swp
 .DS_Store
 .vercel
+
+# Claude Code local settings
+.claude/

@@ -87,8 +87,9 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = True
     # Background worker threads (evaluator + kit_worker) started in the app lifespan.
     # They drain scoring/kit-generation backlogs off the request path on a long-lived
-    # server. Set JOBSCOUT_BACKGROUND_WORKERS=0 on serverless (Vercel), where threads
-    # don't survive a function freeze — there the daily cron does scoring synchronously.
+    # server. Set JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0 on serverless (Vercel), where
+    # threads don't survive a function freeze — there scoring is enqueued durably and
+    # drained by the run-scoring cron instead of in-process workers.
     background_workers_enabled: bool = True
 
     # Scraping
@@ -120,8 +121,10 @@ class Settings(BaseSettings):
     # Only pull postings posted/updated within this many days, to bound how much we
     # store and score. Applies only to sources that expose a date (greenhouse/
     # lever/ashby); Google careers and the HTML fallback carry no per-posting date,
-    # so their postings are always kept. 0 = no age filter.
-    scrape_max_age_days: int = 30
+    # so their postings are always kept. 0 = no age filter. Availability tracking now
+    # prunes closed roles independently (Position.removed_at), so this window can be
+    # generous without leaving stale postings around.
+    scrape_max_age_days: int = 90
 
     # Scoring
     # Stage-1 relevance filtering is batched: one cheap call screens this many
@@ -134,6 +137,21 @@ class Settings(BaseSettings):
     # completion off the request path (see app/services/evaluator.py). This bounds
     # how many users drain concurrently. Internal — not a user-facing knob.
     eval_max_workers: int = 2
+
+    # Periodic scoring queue (services/scoring_queue.py + the `jobscout run-scoring`
+    # cron in .github/workflows/scoring.yml). This drains every user's matching
+    # backlog on its own schedule, separate from the daily scrape.
+    # scoring_max_concurrency is THE database-connection throttle: at most this many
+    # users drain at once, so concurrent Supabase connections stay constant in the
+    # number of users (each held connection = one pooler client; the cap is ~15 and
+    # shared with the web app, so keep this well under it).
+    scoring_max_concurrency: int = 3
+    # Wall-clock cap for one cron run (under the workflow's 60-min timeout), so a huge
+    # backlog spans several runs instead of being killed mid-drain. 0 = no cap.
+    scoring_run_budget_seconds: int = 3000
+    # A job stuck "running" longer than this (its worker crashed/was killed) is
+    # reclaimed to "pending" by the next reconcile sweep so its user isn't stranded.
+    scoring_stale_minutes: int = 60
 
     @property
     def resume_dir(self) -> Path:

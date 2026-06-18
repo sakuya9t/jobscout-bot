@@ -9,6 +9,10 @@ import tempfile
 os.environ.setdefault("JOBSCOUT_DATABASE_URL", "sqlite:///" + tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("JOBSCOUT_SECRET_KEY", "test-secret-key-at-least-32-bytes-long!!")
 os.environ.setdefault("JOBSCOUT_SCHEDULER_ENABLED", "0")
+# Keep scoring deterministic: don't spawn the background drain pool (its persistent
+# workers would outlive a test and hit the next test's freshly-dropped tables). Tests
+# exercise draining explicitly via evaluator._run / evaluator.drain_queue instead.
+os.environ.setdefault("JOBSCOUT_BACKGROUND_WORKERS_ENABLED", "0")
 # Keep the broad suite on open registration and no throttling; the invite/rate-limit
 # tests (test_invite_ratelimit.py) flip these on explicitly per case.
 os.environ.setdefault("JOBSCOUT_REQUIRE_INVITE", "0")

@@ -33,6 +33,18 @@ def _register(client, email, *, code=None, password="secret123"):
 
 
 # ── invite codes ─────────────────────────────────────────────────────────────
+def test_generated_codes_are_clean_uppercase_alphanumeric():
+    """Codes read cleanly: a `JS-` prefix then only unambiguous uppercase letters
+    and digits — no base64 punctuation (-, _, +, /) or look-alike glyphs."""
+    import re
+
+    code = _mint(max_uses=1)
+    assert code.startswith("JS-")
+    body = code[len("JS-"):]
+    assert re.fullmatch(r"[A-Z0-9]+", body)
+    assert not (set(body) & set("01OIL")), "should drop look-alike characters"
+
+
 def test_only_the_hmac_is_stored_never_the_plaintext():
     code = _mint(max_uses=1)
     with session_scope() as db:

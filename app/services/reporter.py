@@ -5,7 +5,7 @@ import html
 import json
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -40,6 +40,15 @@ def _listed_at(pos: Position) -> datetime | None:
     return pos.posted_at or pos.first_seen_at
 
 
+def _visible_positions_clause(user: User):
+    """WHERE clause keeping only positions a user should still see: ones currently
+    listed (``removed_at`` NULL), plus any they've already applied to — so a posting
+    that closed after they applied stays on their list (badged removed) rather than
+    vanishing with its application record. Applied to every match-listing query."""
+    applied = select(Application.position_id).where(Application.user_id == user.id)
+    return or_(Position.removed_at.is_(None), Position.id.in_(applied))
+
+
 def _match_row(match: MatchResult, pos: Position, company: Company, *,
                below_threshold: bool, non_matching: bool = False) -> dict:
     """Build one dashboard/report row dict from a (match, position, company)."""
@@ -57,6 +66,9 @@ def _match_row(match: MatchResult, pos: Position, company: Company, *,
         "gaps": _loads(match.gaps),
         "below_threshold": below_threshold,
         "non_matching": non_matching,
+        # True once the posting left the company's board; the row only survives the
+        # listing query at all because the user applied to it (see _visible_positions_clause).
+        "removed": pos.removed_at is not None,
         "scored_at": match.created_at.isoformat() if match.created_at else None,
         "listed_at": listed.isoformat() if listed else None,
         "applied": False,  # overlaid per-user by tag_applied (live, not stored)
@@ -105,6 +117,25 @@ def tag_kit_status(db: Session, user: User, items: list[dict]) -> list[dict]:
     return items
 
 
+def tag_removed(db: Session, user: User, items: list[dict]) -> list[dict]:
+    """Set each item's ``removed`` flag from the current Position state. Overlaid live
+    at render time — like ``tag_applied`` — so a frozen saved job-list still reflects
+    a posting that has since left the board. Mutates and returns ``items``."""
+    ids = [m["position_id"] for m in items if m.get("position_id") is not None]
+    if not ids:
+        return items
+    removed = set(
+        db.scalars(
+            select(Position.id).where(
+                Position.id.in_(ids), Position.removed_at.is_not(None)
+            )
+        )
+    )
+    for m in items:
+        m["removed"] = m.get("position_id") in removed
+    return items
+
+
 def build_report(
     db: Session,
     user: User,
@@ -130,6 +161,7 @@ def build_report(
         .join(Position, MatchResult.position_id == Position.id)
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id, MatchResult.passed_filter == True)  # noqa: E712
+        .where(_visible_positions_clause(user))
         .order_by(MatchResult.match_score.desc(), MatchResult.win_probability.desc())
     )
     if on_date is not None:
@@ -204,6 +236,7 @@ def build_job_list(
         .join(Position, MatchResult.position_id == Position.id)
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id)
+        .where(_visible_positions_clause(user))
     )
     if company_id is not None:
         base = base.where(Position.company_id == company_id)
@@ -253,11 +286,14 @@ def build_job_list(
 
 def position_visible(db: Session, user: User, position_id: int) -> bool:
     """Whether ``position_id`` is in the user's job list — i.e. it has been scored
-    for them (a MatchResult exists). The same gate the 'Mark applied' action uses,
-    so the detail page and kit generation only ever touch positions the user can see."""
+    for them (a MatchResult exists) and is still listed (or they applied to it). The
+    same gate the detail page and kit generation use, so a removed posting the user
+    never applied to is treated as gone."""
     return db.scalar(
         select(MatchResult.id)
+        .join(Position, MatchResult.position_id == Position.id)
         .where(MatchResult.user_id == user.id, MatchResult.position_id == position_id)
+        .where(_visible_positions_clause(user))
         .limit(1)
     ) is not None
 
@@ -272,6 +308,7 @@ def build_position_detail(db: Session, user: User, position_id: int) -> dict | N
         .join(Position, MatchResult.position_id == Position.id)
         .join(Company, Position.company_id == Company.id)
         .where(MatchResult.user_id == user.id, MatchResult.position_id == position_id)
+        .where(_visible_positions_clause(user))
         .order_by(
             MatchResult.passed_filter.desc(),
             MatchResult.match_score.desc(),
@@ -299,6 +336,7 @@ def build_position_detail(db: Session, user: User, position_id: int) -> dict | N
         "strengths": _loads(match.strengths),
         "gaps": _loads(match.gaps),
         "non_matching": not match.passed_filter,
+        "removed": pos.removed_at is not None,
         "applied": False,
     }
     tag_applied(db, user, [detail])
@@ -309,7 +347,7 @@ def _match_out_payload(match: dict) -> dict:
     keep = {
         "position_id", "company", "title", "location", "url", "match_score",
         "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
-        "non_matching", "listed_at",
+        "non_matching", "removed", "listed_at",
     }
     return {k: v for k, v in match.items() if k in keep}
 

@@ -182,6 +182,35 @@ def test_eightfold_paginates_and_stops_past_age_cutoff(monkeypatch):
     assert not any("start=20" in u for u in fetched)
 
 
+def test_eightfold_coverage_signals(monkeypatch):
+    """The Eightfold walk reports coverage for removal reconciliation: 'full' when it
+    reaches the end of the board, a datetime floor when it stops at the age cutoff,
+    and None when it caps out at max_pages first."""
+    import app.services.scraper as scraper
+    from datetime import datetime
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "scrape_max_age_days", 30)
+
+    # Reaches an empty page → whole board seen → "full".
+    monkeypatch.setattr(scraper, "_fetch_json",
+        lambda url: _eightfold_page([(111, 1)]) if "start=0" in url else _eightfold_page([]))
+    _, cov_full = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 60)
+    assert cov_full == "full"
+
+    # A whole page predates the 30-day cutoff → covered down to the cutoff → datetime.
+    pages = {"start=0": _eightfold_page([(1, 2)]), "start=10": _eightfold_page([(2, 90)])}
+    monkeypatch.setattr(scraper, "_fetch_json",
+        lambda url: next((p for k, p in pages.items() if k in url), _eightfold_page([])))
+    _, cov_floor = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 60)
+    assert isinstance(cov_floor, datetime)
+
+    # Hits max_pages before the end or the cutoff → partial → None.
+    monkeypatch.setattr(scraper, "_fetch_json", lambda url: _eightfold_page([(1, 2)]))
+    _, cov_partial = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 1)
+    assert cov_partial is None
+
+
 @pytest.mark.skipif(os.environ.get("JOBSCOUT_SKIP_NET") == "1", reason="network disabled")
 def test_live_eightfold():
     from app.services.scraper import scrape_eightfold
@@ -205,7 +234,8 @@ def test_scrape_company_does_not_cap_ats_results(monkeypatch):
         name="Acme", ats_type="greenhouse", ats_token="acme", careers_url=None
     )
     out = scraper.scrape_company(company)
-    assert len(out) == 60  # default per-company cap is 40 — must NOT truncate ATS results
+    assert len(out.positions) == 60  # default per-company cap is 40 — must NOT truncate ATS results
+    assert len(out.live_external_ids) == 60  # full board id set for availability reconcile
 
 
 def test_scrape_company_filters_stale_postings(monkeypatch):
@@ -225,8 +255,12 @@ def test_scrape_company_filters_stale_postings(monkeypatch):
     monkeypatch.setattr(scraper.settings, "scrape_max_age_days", 30)
 
     company = SimpleNamespace(name="Acme", ats_type="greenhouse", ats_token="acme", careers_url=None)
-    kept = {p.external_id for p in scraper.scrape_company(company)}
+    result = scraper.scrape_company(company)
+    kept = {p.external_id for p in result.positions}
     assert kept == {"new", "undated"}  # stale dropped; recent + undated kept
+    # The live id set is the *full* board (pre-age-filter), so a still-live stale
+    # posting is never mistaken for removed during reconcile.
+    assert result.live_external_ids == {"new", "old", "undated"}
 
 
 def test_within_max_age_zero_disables_filter():

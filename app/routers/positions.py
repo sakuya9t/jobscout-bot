@@ -38,7 +38,7 @@ def list_positions(
     return list(
         db.scalars(
             select(Position)
-            .where(Position.company_id.in_(company_ids))
+            .where(Position.company_id.in_(company_ids), Position.removed_at.is_(None))
             .order_by(Position.first_seen_at.desc())
         )
     )
@@ -136,6 +136,11 @@ def generate_kit(
     hands the LLM work to the background worker, and returns immediately; the page
     polls ``GET .../kit``. Re-posting while one is in flight is a no-op restart."""
     position = _require_visible_position(db, user, position_id)
+    if position.removed_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This posting is no longer listed; can't generate an application kit.",
+        )
     resume = db.scalar(
         select(Resume)
         .where(Resume.user_id == user.id, Resume.is_active == True)  # noqa: E712

@@ -19,7 +19,7 @@
   Unique(user_id, position_id, resume_id, interest_id) — each interest scores a
   position independently, so the dedup key includes interest_id. A terminal
   scoring failure persists a row with `model="error"` so the pair is skipped on
-  re-runs (clear with `run-daily --retry-failed`).
+  re-runs (cleared by `matcher.clear_failed_markers`, so the next scan re-scores).
 
 ## LLM contract (Ollama structured output)
 `matcher` calls `OllamaClient.chat_json(system, user, schema)` where `schema` is

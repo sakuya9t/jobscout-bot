@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
 from ..db import get_db
-from ..models import Application, MatchResult, User
+from ..models import Application, MatchResult, Position, User
 from ..schemas import ApplicationOut
 
 router = APIRouter(prefix="/api/applications", tags=["applications"])
@@ -55,6 +55,12 @@ def mark_applied(
 ):
     """Mark a position applied. Idempotent: re-marking returns the existing row."""
     _require_visible(db, user, position_id)
+    position = db.get(Position, position_id)
+    if position is not None and position.removed_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This posting is no longer listed and can't be marked applied.",
+        )
     application = _get(db, user, position_id)
     if application is None:
         application = Application(user_id=user.id, position_id=position_id)

@@ -3,7 +3,11 @@
 Commands:
   serve            Run the web app (uvicorn) with the daily scheduler.
   mcp              Run the MCP server over stdio (for openclaw/hermes/agents).
-  run-daily        Run the scrape+score pipeline once for all users (cron-friendly).
+  run-daily        Scrape all users' companies and save new positions (cron-friendly;
+                   no scoring — matching runs on-demand from the job-list view).
+  run-scoring      Drain every user's matching backlog via the scoring queue, with a
+                   bounded worker pool so concurrent DB connections stay capped. Runs
+                   on its own schedule (scoring.yml), separate from the daily scrape.
   init-db          Create database tables.
   encrypt-secrets  Encrypt the telegram-token / LLM-key columns at rest (one-time,
                    idempotent migration; widens the columns on Postgres first).
@@ -49,18 +53,44 @@ def cmd_mcp(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run_daily(args: argparse.Namespace) -> int:
+def cmd_run_daily(_: argparse.Namespace) -> int:
     from .db import init_db
-    from .services import matcher, telegram_bot
+    from .services import matcher
 
     init_db()
-    summaries = matcher.run_for_all_users(retry_failed=args.retry_failed)
+    summaries = matcher.scrape_for_all_users()
     new = sum(s.new_positions for s in summaries.values())
-    scored = sum(s.scored for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
-    telegram_bot.send_daily_reports({uid: s.errors for uid, s in summaries.items() if s.errors})
-    print(f"Users: {len(summaries)} | new positions: {new} | scored: {scored} | warnings: {len(errors)}")
+    print(f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)}")
     for e in errors:
+        print(f"  - {e}")
+    return 0
+
+
+def cmd_run_scoring(_: argparse.Namespace) -> int:
+    """Periodic scoring drain (the scoring.yml cron). Enqueue every user with a
+    non-empty matching backlog, then drain the queue with a bounded worker pool —
+    capping concurrent DB connections regardless of how many users have work. Separate
+    from ``run-daily`` (scrape-only) on purpose; safe to run on its own schedule."""
+    from .config import settings
+    from .db import init_db, session_scope
+    from .services import evaluator, scoring_queue
+
+    init_db()
+    with session_scope() as db:
+        enqueued = scoring_queue.reconcile(db)
+    summary = evaluator.drain_queue(
+        max_workers=settings.scoring_max_concurrency,
+        budget_seconds=settings.scoring_run_budget_seconds,
+    )
+    with session_scope() as db:
+        states = scoring_queue.counts_by_state(db)
+    print(
+        f"Enqueued: {enqueued} | users drained: {summary.users} | "
+        f"scored: {summary.scored} | failed: {summary.failed}"
+    )
+    print(f"Queue: {states or '{}'}")  # e.g. {'done': 3, 'error': 1, 'pending': 2}
+    for e in summary.errors:
         print(f"  - {e}")
     return 0
 
@@ -190,7 +220,7 @@ def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
             db.commit()  # release the write lock between companies
             total += updated
             print(f"{company.name}: backfilled {updated} description(s).")
-    print(f"Done — backfilled {total} posting(s). Run a scan (or `jobscout run-daily`) "
+    print(f"Done — backfilled {total} posting(s). Run a scan from the job-list view "
           "to score the newly-described jobs.")
     return 0
 
@@ -363,10 +393,14 @@ def main() -> None:
     p.set_defaults(func=cmd_serve)
 
     sub.add_parser("mcp", help="Run the MCP server (stdio)").set_defaults(func=cmd_mcp)
-    p = sub.add_parser("run-daily", help="Run the pipeline once for all users")
-    p.add_argument("--retry-failed", action="store_true",
-                   help="Clear prior scoring-error markers so failed pairs are re-scored")
-    p.set_defaults(func=cmd_run_daily)
+    sub.add_parser(
+        "run-daily",
+        help="Scrape all users' companies and save new positions (no scoring)",
+    ).set_defaults(func=cmd_run_daily)
+    sub.add_parser(
+        "run-scoring",
+        help="Drain the matching backlog for all users (bounded; cron-friendly)",
+    ).set_defaults(func=cmd_run_scoring)
     sub.add_parser("init-db", help="Create database tables").set_defaults(func=cmd_init_db)
     sub.add_parser(
         "encrypt-secrets",

@@ -43,8 +43,10 @@ async def lifespan(app: FastAPI):
     init_db()
     scheduler.start()
     # Background worker threads don't survive a serverless function freeze, so they're
-    # gated off (JOBSCOUT_BACKGROUND_WORKERS=0) on Vercel — there the daily cron scores
-    # synchronously. On a long-lived server they drain backlogs off the request path.
+    # gated off (JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0) on Vercel — there scoring is
+    # enqueued durably and drained by the run-scoring cron (.github/workflows/scoring.yml),
+    # not by in-process workers. On a long-lived server they drain backlogs off the
+    # request path.
     if settings.background_workers_enabled:
         # Resume any evaluation backlog left unfinished by a prior process.
         evaluator.resume_pending_on_startup()

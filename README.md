@@ -1,20 +1,33 @@
 # JobScout
 
 Multi-user job-matching automation. Each user logs in, uploads a resume, lists
-companies to watch and the roles they want. Daily, JobScout scrapes each
-company's career page, finds **newly published** positions, and uses an **Ollama
-Cloud** model to (1) decide if a position matches the user's requirements and
-(2) score the resume↔role fit and realistic chance of landing it — then delivers
-a ranked report via **web dashboard**, **Telegram**, and an **MCP server** that
-external agents (openclaw / hermes) can drive. For each promising role it also
-generates a tailored **application kit** (cover letter, role-specific résumé, and
-draft answers to the posting's questions). The LLM and Telegram bot are
-**per-user**: every account brings its own API key and bot.
+companies to watch and the roles they want. **Daily**, JobScout scrapes each
+company's career page and saves **newly published** positions. Matching is
+**on-demand**: when a user runs a scan from the dashboard, an **Ollama Cloud**
+model (1) decides if each position matches the user's requirements and (2) scores
+the resume↔role fit and realistic chance of landing it — producing a ranked report
+in the **web dashboard** (and via an **MCP server** that external agents like
+openclaw / hermes can drive). Scoring is kept off the daily cron on purpose: it's
+the expensive, per-user step, so it runs only when a user asks for it. For each
+promising role JobScout also generates a tailored **application kit** (cover
+letter, role-specific résumé, and draft answers to the posting's questions). The
+LLM and Telegram bot are **per-user**: every account brings its own API key and bot.
 
 > Design lives in [`docs/DESIGN.md`](docs/DESIGN.md),
 > [`docs/SPEC.md`](docs/SPEC.md), and [`docs/PLAN.md`](docs/PLAN.md).
 
 ## How matching works
+The daily cron only runs step 1 (**scrape**), saving new positions. Steps 3–6 (the
+LLM filter, score, and report) are the expensive per-user work and all run through a
+**Postgres-backed scoring queue** drained by a bounded worker pool
+(`JOBSCOUT_SCORING_MAX_CONCURRENCY`) — so the number of users scored at once, and thus
+concurrent DB connections, stays capped no matter how many users have work. Two things
+feed that queue: clicking *Run scan now* / *Refresh matching scores* enqueues you
+on-demand, and a few-hourly cron (`jobscout run-scoring`, in
+`.github/workflows/scoring.yml`) enqueues everyone with a non-empty backlog so matches
+stay fresh without a manual click. A peak of users all hitting *Run scan* therefore
+just enqueues cheap rows; it can never spin up more than N concurrent scorers.
+
 1. **Scrape** — ATS-API-first: **Greenhouse / Lever / Ashby** JSON (robust, stable
    IDs), plus dedicated adapters for **Google Careers** and **Eightfold** (e.g.
    NVIDIA), and a generic HTML fallback for everything else. Companies on a known
@@ -37,8 +50,8 @@ draft answers to the posting's questions). The LLM and Telegram bot are
    `matches_requirements`, `match_score` (0–100), `win_probability` (0–100),
    `reasoning`, `strengths[]`, `gaps[]`.
 6. **Report** — ranked by match score. The web dashboard always shows the top
-   matches (at least a few, even below threshold); the Telegram push keeps only
-   matches above each interest's threshold.
+   matches (at least a few, even below threshold). (Automatic daily Telegram pushes
+   are currently disabled while that flow is reworked.)
 
 ## In the dashboard
 After registering, everything is managed from one dashboard:
@@ -85,8 +98,9 @@ jobscout health           # verify DB + Ollama reachability
 jobscout serve --reload   # web app at http://127.0.0.1:8000
 ```
 Open the dashboard, register, upload a resume, add companies + interests, and
-click **Run scan now**. The in-process scheduler also runs the scan daily at
-`JOBSCOUT_DAILY_RUN_HOUR`.
+click **Run scan now** to scrape and score. The in-process scheduler also scrapes
+daily at `JOBSCOUT_DAILY_RUN_HOUR` (new positions only — scoring stays on-demand,
+so the button reads **Refresh matching scores** once you have a saved list).
 
 ### Registration control (invite codes + rate limiting)
 Registration is **invite-gated** by default (`JOBSCOUT_REQUIRE_INVITE=1`). Mint codes
@@ -105,12 +119,17 @@ knobs and how this interacts with Vercel's edge DDoS/WAF protection.
 ### Telegram (optional, per-user)
 Each user brings their own bot. Create one with @BotFather, paste its token on the
 dashboard's **Telegram settings** page and Save, then DM the bot `/start <code>`
-(the page shows your code) and click **Link chat** to receive your daily report there.
+(the page shows your code) and click **Link chat**. Note: automatic daily Telegram
+pushes are currently disabled while that flow is reworked.
 
 ### Cron instead of the in-process scheduler
-Set `JOBSCOUT_SCHEDULER_ENABLED=0` and run the pipeline from cron:
+Set `JOBSCOUT_SCHEDULER_ENABLED=0` and run the two crons separately — `run-daily`
+scrapes (new positions only), `run-scoring` drains the matching backlog through the
+bounded queue (see *How matching works*). They're split so scoring's cost and DB load
+are decoupled from the cheap daily scrape:
 ```bash
-0 8 * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-daily
+0 8   * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-daily
+0 */4 * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-scoring
 ```
 
 ### Production database (Supabase / Postgres)
@@ -133,7 +152,7 @@ command works against a **local** Supabase/Postgres too (e.g. `supabase start`'s
 ### Maintenance
 ```bash
 jobscout backfill-descriptions --company nvidia   # fetch missing Eightfold descriptions
-jobscout run-daily --retry-failed                 # clear scoring-error markers and re-score
+jobscout run-daily                                # scrape all companies + save new positions
 ```
 Eightfold boards (e.g. NVIDIA) expose descriptions only on each job's detail page;
 crawls fetch them for new postings, and `backfill-descriptions` catches up postings

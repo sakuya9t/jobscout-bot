@@ -13,7 +13,7 @@ Implement remaining `[ ]` items in order. Each file's responsibility is in DESIG
 - [x] app/services/resume_parser.py — extract_text(filename, bytes)
 - [x] app/services/scraper.py        — ATS adapters + HTML fallback
 - [x] app/schemas.py                 — Pydantic in/out models
-- [x] app/services/matcher.py        — run_for_user / run_for_all_users pipeline
+- [x] app/services/matcher.py        — run_for_user / scrape_for_all_users pipeline
 - [x] app/services/reporter.py       — build_report -> dict + markdown + telegram
 - [x] app/services/telegram_bot.py   — long-poll: /start link + send report
 - [x] app/services/scheduler.py      — APScheduler daily trigger + telegram poller

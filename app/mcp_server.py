@@ -12,11 +12,12 @@ from __future__ import annotations
 import os
 
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from .auth import authenticate_token
 from .db import init_db, session_scope
-from .models import Company, Interest, Position, User
+from .models import Application, Company, Interest, Position, User
 from .schemas import CompanyIn, InterestIn
 from .services import matcher, reporter
 
@@ -167,6 +168,13 @@ def get_position(position_id: int) -> dict:
         user = _current_user(db)
         pos = db.get(Position, position_id)
         if not pos or pos.company.user_id != user.id:
+            raise ValueError("Position not found")
+        # A posting that left the board is hidden unless this user applied to it.
+        if pos.removed_at is not None and not db.scalar(
+            select(Application.id).where(
+                Application.user_id == user.id, Application.position_id == pos.id
+            ).limit(1)
+        ):
             raise ValueError("Position not found")
         return {
             "id": pos.id, "company": pos.company.name, "title": pos.title,

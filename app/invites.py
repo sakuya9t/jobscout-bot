@@ -23,9 +23,13 @@ from .config import settings
 from .models import InviteCode
 from .timeutil import utcnow
 
-# Token length in bytes before urlsafe-base64 (9 bytes -> 12 chars). Long enough that
-# online guessing is hopeless even before the auth rate limit; short enough to type.
-_CODE_BYTES = 9
+# The random part of a code is drawn from an unambiguous uppercase alphabet: no
+# URL-safe-base64 punctuation (-, _) and no easy-to-confuse glyphs (0/O, 1/I/L), so
+# codes read cleanly and transcribe without errors. 14 chars over this 31-symbol
+# alphabet ≈ 69 bits of entropy — online guessing is hopeless even before the auth
+# rate limit, yet it's short enough to type.
+_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_CODE_CHARS = 14
 _PREFIX = "JS-"
 
 
@@ -43,7 +47,8 @@ def hash_code(code: str) -> str:
 
 def generate() -> tuple[str, str]:
     """A fresh ``(plaintext, code_hash)`` pair. Only the hash is persisted."""
-    plaintext = _PREFIX + secrets.token_urlsafe(_CODE_BYTES)
+    body = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_CHARS))
+    plaintext = _PREFIX + body
     return plaintext, hash_code(plaintext)
 
 
