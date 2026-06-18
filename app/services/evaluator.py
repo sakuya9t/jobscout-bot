@@ -31,7 +31,7 @@ from ..config import settings
 from ..db import session_scope
 from ..logging_config import get_logger
 from ..models import User
-from . import dispatch, matcher, reporter, scoring_queue
+from . import dispatch, matcher, reporter, scoring_log, scoring_queue
 
 log = get_logger(__name__)
 
@@ -65,7 +65,10 @@ def ensure_running(user_id: int) -> None:
     instead fire the event-driven dispatch so a consumer drains now rather than at the
     next scheduled run (`dispatch.dispatch_scoring_run`, a no-op when unconfigured)."""
     with session_scope() as db:
-        scoring_queue.enqueue(db, user_id)
+        # force=True: this is a user-initiated re-run, so re-arm even a 'running' row —
+        # recovers a job orphaned by a crashed/frozen worker, which would otherwise
+        # block the click until the stale-reclaim sweep (scoring_stale_minutes).
+        scoring_queue.enqueue(db, user_id, force=True)
     if settings.background_workers_enabled:
         ensure_draining()
     else:
@@ -87,6 +90,12 @@ def ensure_draining() -> None:
     with _guard:
         spawn = _max_workers() - _active_workers
         _active_workers += spawn
+        active = _active_workers
+    if spawn > 0:
+        scoring_log.record(
+            "worker", state_to="spawn",
+            detail=f"spawned {spawn} worker(s); active {active}/{_max_workers()}",
+        )
     for _ in range(spawn):
         ex.submit(_web_worker)
 
@@ -112,6 +121,10 @@ def _web_worker() -> None:
             log.exception("scoring worker: claim failed; releasing slot")
             with _guard:
                 _release()
+                active = _active_workers
+            scoring_log.record(
+                "worker", state_to="exit", detail=f"claim error; active now {active}"
+            )
             return
         if user_id is None:
             with _guard:
@@ -123,6 +136,11 @@ def _web_worker() -> None:
                     user_id = None
                 if user_id is None:
                     _release()
+                    active = _active_workers
+                    scoring_log.record(
+                        "worker", state_to="exit",
+                        detail=f"queue empty; active now {active}",
+                    )
                     return
             # Claimed on the re-check — drain it OUTSIDE the guard (never hold the
             # lock across the LLM-heavy drain). `_drain_claimed_user` never raises.
@@ -145,10 +163,16 @@ def _run(user_id: int) -> None:
 def resume_pending_on_startup() -> None:
     """On boot, (re)enqueue every user with a non-empty backlog — finishing any drain
     interrupted by a restart and reclaiming jobs stranded `running` by a crash — then
-    kick the workers. Safe no-op when all caught up."""
+    kick the workers. Safe no-op when all caught up.
+
+    `reclaim_all_running=True` because this is process start: no worker thread exists
+    yet, so any `running` row is necessarily orphaned by the dead process — including
+    one claimed seconds before the restart, which the stale-window guard would
+    otherwise leave stuck `running` (never re-armed, never drained) until the window
+    elapsed. That's the "Evaluating — N still to score" view that never progresses."""
     try:
         with session_scope() as db:
-            scoring_queue.reconcile(db)
+            scoring_queue.reconcile(db, reclaim_all_running=True)
         ensure_draining()
     except Exception:
         log.exception("evaluator startup resume failed")
@@ -251,6 +275,14 @@ def _drain_claimed_user(
             if res.did_run:
                 res.finalize_errors()
                 reporter.record_job_list_snapshot(db, user, res)
+            scoring_log.record(
+                "drain", user_id=user_id,
+                detail=(
+                    f"did_run={res.did_run} scored={res.scored} filtered={res.filtered} "
+                    f"time_exhausted={res.time_exhausted} "
+                    f"budget_exhausted={res.budget_exhausted} errors={len(res.errors)}"
+                ),
+            )
             scoring_queue.finalize(db, user, res)
             if summary is not None:
                 summary.add(res)

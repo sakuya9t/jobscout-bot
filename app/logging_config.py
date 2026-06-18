@@ -13,7 +13,11 @@ from pathlib import Path
 
 from .config import settings
 
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# Include the thread name so the scoring worker pool is traceable: each web/cron
+# drain worker logs under its own thread (evaluator*/scoring-*), which lets you follow
+# one worker's claim -> drain -> finalize lifecycle (and spot a worker that exits while
+# work is still pending) in interleaved output.
+_LOG_FORMAT = "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
 
 _configured = False
 

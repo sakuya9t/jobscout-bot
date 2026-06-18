@@ -441,10 +441,18 @@ def filter_items_by_company(items: list[dict], company_name: str | None) -> list
 # failed", and budget/quota exhaustion names Ollama. Used to raise the dashboard's
 # "LLM requests failed" banner.
 _LLM_FAILURE_HINTS = ("filtering failed", "scoring failed", "ollama", "quota", "budget")
+# An *incomplete/invalid batch* is a content-quality issue, not a provider/auth
+# failure: the request succeeded (HTTP 200, valid JSON) — the model just omitted or
+# malformed some postings' verdicts, and those pairs are retried up to
+# ``score_max_attempts``. Keep the warning in the list but don't raise the red
+# "check your provider key and model names" banner, which would mislead.
+_LLM_CONTENT_HINTS = ("incomplete batch", "invalid batch")
 
 
 def is_llm_failure(message: str) -> bool:
     low = (message or "").lower()
+    if any(hint in low for hint in _LLM_CONTENT_HINTS):
+        return False
     return any(hint in low for hint in _LLM_FAILURE_HINTS)
 
 

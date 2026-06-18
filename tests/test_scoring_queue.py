@@ -42,6 +42,15 @@ class FilterPass:
         return "YES"
 
 
+class IncompleteScore:
+    """Stage-2 client that returns an empty batch — every posting is 'missing', so
+    each pair gets an error-marker (the incomplete-batch failure mode)."""
+    model = "fake-incomplete"
+
+    def chat_json(self, system, user, schema, temperature=0.2):
+        return {"results": []}
+
+
 def _seed_user(db, *, email="u@x.com") -> int:
     """A user with one described, scoreable position and one active interest → a
     backlog of exactly one (position × interest) pair."""
@@ -85,6 +94,33 @@ def test_enqueue_does_not_disturb_a_running_job():
         assert _job(db, uid).state == "running"
 
 
+def test_enqueue_force_rearms_a_running_job():
+    """A user-initiated re-run (force=True) re-arms even a 'running' row — recovering a
+    job orphaned by a dead worker — and resets attempts, unlike the default enqueue."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow(), attempts=4))
+        db.commit()
+        scoring_queue.enqueue(db, uid, force=True)
+        job = _job(db, uid)
+        assert job.state == "pending" and job.attempts == 0
+
+
+def test_ensure_running_recovers_an_orphaned_running_job(monkeypatch):
+    """The dashboard 'Recalculate' path (ensure_running) re-arms an orphaned 'running'
+    row so the click actually restarts scoring — regression: a stale running row left
+    enqueue a no-op and nothing drained."""
+    monkeypatch.setattr(evaluator, "ensure_draining", lambda: None)
+    monkeypatch.setattr(evaluator.dispatch, "dispatch_scoring_run", lambda: True)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow(), attempts=4))
+        db.commit()
+    evaluator.ensure_running(uid)
+    with session_scope() as db:
+        assert _job(db, uid).state == "pending"
+
+
 # ── reconcile ─────────────────────────────────────────────────────────────────
 def test_reconcile_enqueues_only_users_with_backlog():
     with session_scope() as db:
@@ -108,6 +144,30 @@ def test_reconcile_reclaims_stale_running_jobs():
         scoring_queue.reconcile(db)
         # The crashed worker's row is reclaimed to pending (then left pending since the
         # user still has a backlog).
+        assert _job(db, uid).state == "pending"
+
+
+def test_reconcile_leaves_a_fresh_running_job_mid_run():
+    """Mid-run (cron/dispatch) a recently-claimed 'running' row may belong to a live
+    in-process worker, so the default reconcile must NOT yank it — only stale ones."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow()))
+        db.commit()
+        scoring_queue.reconcile(db)
+        assert _job(db, uid).state == "running"
+
+
+def test_reconcile_reclaims_fresh_running_job_at_startup():
+    """Regression: after a restart, a job claimed seconds before the crash sits 'running'
+    but its worker is gone. At startup no worker exists yet, so reclaim_all_running pulls
+    it back to 'pending' to be re-drained — otherwise the dashboard shows
+    'Evaluating — N still to score' that never progresses until the stale window elapses."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow()))
+        db.commit()
+        scoring_queue.reconcile(db, reclaim_all_running=True)
         assert _job(db, uid).state == "pending"
 
 
@@ -397,3 +457,226 @@ def test_run_daily_endpoint_publishes_and_dispatches(monkeypatch):
         r = c.get("/api/cron/run-daily", headers={"Authorization": "Bearer s3cret"})
     assert r.status_code == 200 and r.json()["enqueued"] == 1
     assert fired == [1]
+
+
+# ── bounded retry for failed scoring pairs ────────────────────────────────────
+def test_failed_pair_retries_then_goes_terminal(monkeypatch):
+    """A failed (posting, interest) pair is retried up to score_max_attempts, staying
+    in the backlog meanwhile, then goes terminal (drops out) instead of looping forever."""
+    monkeypatch.setattr(settings, "score_max_attempts", 2)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+
+        # Attempt 1 fails → marker attempts=1, still retryable (1 < 2) → stays pending.
+        matcher.score_to_completion(db, user, client=IncompleteScore(), filter_client=FilterPass())
+        m = db.scalar(matcher.select(models.MatchResult))
+        assert m.model == matcher.ERROR_MODEL and m.attempts == 1
+        assert matcher.count_pending(db, user) == 1
+
+        # Attempt 2 fails → attempts=2 → terminal (2 >= 2) → leaves the backlog.
+        matcher.score_to_completion(db, user, client=IncompleteScore(), filter_client=FilterPass())
+        m = db.scalar(matcher.select(models.MatchResult))
+        assert m.attempts == 2
+        assert matcher.count_pending(db, user) == 0
+
+        # A further run does not touch it (terminal): attempts stays 2.
+        matcher.score_to_completion(db, user, client=IncompleteScore(), filter_client=FilterPass())
+        assert db.scalar(matcher.select(models.MatchResult)).attempts == 2
+
+
+def test_failed_pair_recovers_on_retry(monkeypatch):
+    """A retry that succeeds converts the pair's error-marker into a real result
+    in place (no duplicate row), and the retry counter resets."""
+    monkeypatch.setattr(settings, "score_max_attempts", 3)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+
+        matcher.score_to_completion(db, user, client=IncompleteScore(), filter_client=FilterPass())
+        assert db.scalar(matcher.select(models.MatchResult)).model == matcher.ERROR_MODEL
+
+        matcher.score_to_completion(db, user, client=GoodClient(), filter_client=FilterPass())
+        rows = list(db.scalars(matcher.select(models.MatchResult)))
+        assert len(rows) == 1                       # same row upserted, not duplicated
+        assert rows[0].model == "fake-good" and rows[0].passed_filter is True
+        assert rows[0].attempts == 0
+        assert matcher.count_pending(db, user) == 0
+
+
+def test_clear_failed_markers_reenqueues(monkeypatch):
+    """The escape hatch (jobscout retry-failed → clear_failed_markers) puts a terminal
+    pair back in the backlog for another round."""
+    monkeypatch.setattr(settings, "score_max_attempts", 1)  # fail once → terminal
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        matcher.score_to_completion(db, user, client=IncompleteScore(), filter_client=FilterPass())
+        assert matcher.count_pending(db, user) == 0     # terminal (attempts 1 >= 1)
+        assert matcher.clear_failed_markers(db, uid) == 1
+        assert matcher.count_pending(db, user) == 1     # back in the backlog
+
+
+# ── queue-level retry/backoff + auto-resolve (orphaned/parked jobs) ────────────
+def test_reconcile_retries_orphan_under_cap(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_job_max_attempts", 3)
+    stale = utcnow() - timedelta(minutes=10_000)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=stale, attempts=1))
+        db.commit()
+        scoring_queue.reconcile(db)
+        assert _job(db, uid).state == "pending"  # under the cap → reclaimed to retry
+
+
+def test_reconcile_parks_orphan_at_attempt_cap(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_job_max_attempts", 3)
+    monkeypatch.setattr(settings, "scoring_job_retry_cooldown_minutes", 60)
+    stale = utcnow() - timedelta(minutes=10_000)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=stale, attempts=3))
+        db.commit()
+        scoring_queue.reconcile(db)
+        job = _job(db, uid)
+        # used up its retries → parked (kicked out of the active queue), not requeued now
+        assert job.state == "error" and job.finished_at is not None
+
+
+def test_reconcile_requeues_parked_job_after_cooldown(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_job_max_attempts", 3)
+    monkeypatch.setattr(settings, "scoring_job_retry_cooldown_minutes", 60)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="error", attempts=3,
+                                 finished_at=utcnow() - timedelta(minutes=10_000)))
+        db.commit()
+        scoring_queue.reconcile(db)
+        job = _job(db, uid)
+        # cooldown elapsed → auto-resolved: requeued with a fresh retry budget
+        assert job.state == "pending" and job.attempts == 0
+
+
+def test_reconcile_keeps_parked_job_during_cooldown(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_job_max_attempts", 3)
+    monkeypatch.setattr(settings, "scoring_job_retry_cooldown_minutes", 60)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        db.add(models.ScoringJob(user_id=uid, state="error", attempts=3, finished_at=utcnow()))
+        db.commit()
+        scoring_queue.reconcile(db)
+        assert _job(db, uid).state == "error"  # still cooling down → stays parked
+
+
+def test_finalize_resets_attempts_on_clean_end():
+    with session_scope() as db:
+        # No interests/positions → count_pending 0 → finalize settles to done + reset.
+        user = models.User(email="fin@x.com", hashed_password="h")
+        db.add(user); db.flush()
+        uid = user.id
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow(), attempts=4))
+        db.commit()
+        scoring_queue.finalize(db, db.get(models.User, uid), matcher.RunResult())
+        job = _job(db, uid)
+        assert job.state == "done" and job.attempts == 0
+
+
+def _add_error_marker(db, uid, *, attempts, created_at):
+    resume = db.scalar(matcher.select(models.Resume).where(models.Resume.user_id == uid))
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    pos = db.scalar(matcher.select(models.Position))
+    db.add(models.MatchResult(
+        user_id=uid, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+        passed_filter=False, match_score=0, win_probability=0,
+        model=matcher.ERROR_MODEL, attempts=attempts, created_at=created_at))
+    db.commit()
+
+
+def test_reconcile_clears_expired_failed_markers(monkeypatch):
+    """Per-posting auto-resolve: a terminal marker older than the TTL is cleared so the
+    pair re-enters the backlog (never stuck forever)."""
+    monkeypatch.setattr(settings, "score_marker_retry_after_hours", 24)
+    monkeypatch.setattr(settings, "score_max_attempts", 3)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        _add_error_marker(db, uid, attempts=3, created_at=utcnow() - timedelta(hours=48))
+        assert matcher.count_pending(db, user) == 0  # terminal marker settles the pair
+        scoring_queue.reconcile(db)
+        assert matcher.count_pending(db, user) == 1  # stale marker swept → back in backlog
+
+
+def test_reconcile_keeps_recent_failed_markers(monkeypatch):
+    monkeypatch.setattr(settings, "score_marker_retry_after_hours", 24)
+    monkeypatch.setattr(settings, "score_max_attempts", 3)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        _add_error_marker(db, uid, attempts=3, created_at=utcnow())  # fresh terminal marker
+        scoring_queue.reconcile(db)
+        assert matcher.count_pending(db, user) == 0  # within TTL → kept (not retried yet)
+
+
+# ── Scoring-queue trace table (services/scoring_log.py + models.ScoringEvent) ──
+def _events(db, uid=None):
+    from app.services import scoring_log
+
+    scoring_log.flush()  # the writer is a background thread — drain before reading
+    q = matcher.select(models.ScoringEvent)
+    if uid is not None:
+        q = q.where(models.ScoringEvent.user_id == uid)
+    return list(db.scalars(q.order_by(models.ScoringEvent.id)))
+
+
+def test_trace_records_full_drain_lifecycle(monkeypatch):
+    """A clean drain leaves an ordered, queryable trail: enqueue -> claim -> drain ->
+    finalize(done). This is the trace that makes a flaky stop diagnosable after the fact."""
+    monkeypatch.setattr(settings, "log_scoring_events", True)
+    monkeypatch.setattr(
+        "app.services.llm.clients_for_user", lambda db, user: (GoodClient(), FilterPass())
+    )
+    with session_scope() as db:
+        uid = _seed_user(db)
+        scoring_queue.reconcile(db)
+
+    evaluator.drain_queue(max_workers=1, budget_seconds=0)
+
+    with session_scope() as db:
+        events = _events(db, uid)
+        kinds = [e.event for e in events]
+        assert "enqueue" in kinds and "claim" in kinds
+        assert "drain" in kinds and "finalize" in kinds
+        # The trail ends on a clean finish.
+        finalize = [e for e in events if e.event == "finalize"][-1]
+        assert finalize.state_to == "done"
+        # Every event is attributed to a thread (for following one worker's trail).
+        assert all(e.worker for e in events)
+
+
+def test_trace_records_error_event(monkeypatch):
+    """A drain that raises records an `error` transition — the stop point you grep for."""
+    monkeypatch.setattr(settings, "log_scoring_events", True)
+
+    def _explode(db, user):
+        raise RuntimeError("no clients")
+
+    monkeypatch.setattr("app.services.matcher.llm.clients_for_user", _explode)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        scoring_queue.reconcile(db)
+
+    evaluator.drain_queue(max_workers=1, budget_seconds=0)
+
+    with session_scope() as db:
+        errors = [e for e in _events(db, uid) if e.event == "error"]
+        assert errors and errors[-1].state_to == "error"
+        assert "no clients" in (errors[-1].detail or "")
+
+
+def test_trace_can_be_disabled(monkeypatch):
+    """JOBSCOUT_LOG_SCORING_EVENTS=0 turns the table off entirely (no rows written)."""
+    monkeypatch.setattr(settings, "log_scoring_events", False)
+    with session_scope() as db:
+        uid = _seed_user(db)
+        scoring_queue.enqueue(db, uid, force=True)
+        assert _events(db, uid) == []

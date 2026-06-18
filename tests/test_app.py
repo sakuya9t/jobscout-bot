@@ -339,7 +339,11 @@ def test_scoring_and_dedup_on_rerun():
     assert res2.scored == 0
 
 
-def test_failure_persists_marker_and_is_not_rebilled():
+def test_failure_persists_marker_and_is_not_rebilled(monkeypatch):
+    # score_max_attempts=1 → a failure is terminal immediately (no retry), so this
+    # exercises the terminal-marker path; bounded-retry behaviour is covered in
+    # tests/test_scoring_queue.py.
+    monkeypatch.setattr(matcher.settings, "score_max_attempts", 1)
     with session_scope() as db:
         uid = _seed_user(db)
     with session_scope() as db:
@@ -348,8 +352,9 @@ def test_failure_persists_marker_and_is_not_rebilled():
     with session_scope() as db:
         markers = list(db.scalars(
             matcher.select(models.MatchResult).where(models.MatchResult.model == matcher.ERROR_MODEL)))
-        assert len(markers) == 1
-    # Re-run must not call either model again (marker in the `already` set).
+        assert len(markers) == 1 and markers[0].attempts == 1
+    # A terminal marker (attempts == limit) settles the pair: re-run must not call
+    # either model again (it's in the `already` set).
     with session_scope() as db:
         matcher.run_for_user(db, db.get(models.User, uid), client=BoomClient(), filter_client=BoomClient())
     # --retry-failed clears markers so they re-score.
@@ -1678,6 +1683,20 @@ def test_applied_job_survives_unfollow():
         items, total = reporter.build_job_list(db, user, category="matching", limit=50)
         assert total == 1 and items[0]["company"] == "NVIDIA" and items[0]["applied"] is True
         assert reporter.position_visible(db, user, nv_pid) is True
+
+
+def test_incomplete_batch_warning_is_not_a_provider_failure():
+    """An incomplete/invalid-batch warning (a content issue, retried per-pair) must NOT
+    raise the red 'check your provider key' banner; real provider failures still do."""
+    assert reporter.is_llm_failure(
+        "Scoring failed for 9 posting(s): model returned an incomplete batch result") is False
+    assert reporter.is_llm_failure(
+        "Scoring failed: model returned an invalid batch result") is False
+    assert reporter.llm_failed(
+        ["Scoring failed for 2 posting(s): model returned an incomplete batch result"]) is False
+    # Genuine provider/auth/quota failures still trip the banner.
+    assert reporter.is_llm_failure("Scoring failed: Could not reach Ollama at https://x") is True
+    assert reporter.is_llm_failure("Ollama budget/quota appears to be exhausted") is True
 
 
 def test_job_list_endpoint_filters_by_company(monkeypatch):

@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     log_ollama: bool = True
     # Truncate each stored prompt/response to this many chars (0 = store in full).
     log_ollama_max_chars: int = 0
+    # Persist scoring-queue / worker lifecycle events (enqueue/claim/finalize/error/
+    # reconcile/worker spawn-exit) to the scoring_events table instead of stdout, so a
+    # flaky drain is traceable without the per-batch stdout noise (see
+    # services/scoring_log.py). Set JOBSCOUT_LOG_SCORING_EVENTS=0 to disable the table.
+    log_scoring_events: bool = True
 
     # Ollama / LLM
     # Provider base URL, API key, and the main/light model names are now per-user
@@ -139,6 +144,17 @@ class Settings(BaseSettings):
     # Stage-2 scoring is also batched: after the cheap filter passes postings,
     # one expensive request scores this many postings against the resume.
     score_batch_size: int = 10
+    # A single (posting, interest) pair can fail to score — a transient provider error,
+    # or the model returning an incomplete/invalid batch that omits it. Rather than mark
+    # it permanently failed on the first miss, retry it on later runs up to this many
+    # total attempts, then leave a terminal marker so it isn't re-billed forever.
+    # `jobscout retry-failed` clears terminal markers to force another round.
+    score_max_attempts: int = 3
+    # Auto-resolve for terminal per-posting failures: a marker that used up its retries
+    # is cleared once it's this old, so the pair re-enters the backlog and gets a fresh
+    # round on a later run — a failed posting never sits stuck forever. 0 disables the
+    # sweep (markers then stay until `jobscout retry-failed`).
+    score_marker_retry_after_hours: int = 24
     # Background evaluation: a worker drains each user's whole scoring backlog to
     # completion off the request path (see app/services/evaluator.py). This bounds
     # how many users drain concurrently. Internal — not a user-facing knob.
@@ -156,8 +172,16 @@ class Settings(BaseSettings):
     # backlog spans several runs instead of being killed mid-drain. 0 = no cap.
     scoring_run_budget_seconds: int = 3000
     # A job stuck "running" longer than this (its worker crashed/was killed) is
-    # reclaimed to "pending" by the next reconcile sweep so its user isn't stranded.
+    # reclaimed by the next reconcile sweep so its user isn't stranded.
     scoring_stale_minutes: int = 60
+    # Self-healing retry/backoff for queue jobs (see scoring_queue.reconcile). A job
+    # that keeps orphaning/erroring is reclaimed and retried up to this many consecutive
+    # failed attempts, then "parked" (kicked out of the active queue) so it stops
+    # hot-looping...
+    scoring_job_max_attempts: int = 5
+    # ...and is automatically requeued for a fresh round once it's been parked this
+    # long — so a parked job never sits failed forever (auto-resolve).
+    scoring_job_retry_cooldown_minutes: int = 60
 
     # Event-driven scoring drain (services/dispatch.py). When work becomes pending and
     # this process can't drain it in-process (serverless), POST a trigger here so a
