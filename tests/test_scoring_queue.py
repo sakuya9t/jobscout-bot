@@ -4,11 +4,17 @@ the LLM clients are faked via llm.clients_for_user and the scraper is never touc
 (the drain only scores an already-seeded backlog)."""
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 
+import httpx
+from fastapi.testclient import TestClient
+
 from app import models
+from app.config import settings
 from app.db import session_scope
-from app.services import evaluator, matcher, scoring_queue
+from app.main import app
+from app.services import dispatch, evaluator, matcher, scoring_queue
 from app.timeutil import utcnow
 
 
@@ -252,3 +258,142 @@ def test_flush_match_tolerates_duplicate_pair():
         db.commit()
         rows = list(db.scalars(matcher.select(models.MatchResult).where(models.MatchResult.position_id == pos.id)))
         assert len(rows) == 1
+
+
+# ── per-user run budget (stop cleanly instead of being killed mid-drain) ───────
+def test_score_to_completion_stops_at_deadline_and_rearms(monkeypatch):
+    """A run past its wall-clock budget stops before scoring, flags time_exhausted, and
+    leaves the backlog intact — so finalize re-arms the queue row to pending (continue
+    next run) rather than the worker overrunning the job timeout and stranding it."""
+    monkeypatch.setattr("app.services.llm.clients_for_user", lambda db, u: (GoodClient(), FilterPass()))
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        res = matcher.score_to_completion(db, user, deadline=time.monotonic() - 1)  # already past
+        assert res.time_exhausted is True and res.scored == 0
+        assert matcher.count_pending(db, user) == 1  # nothing drained
+
+        db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow()))
+        db.commit()
+        scoring_queue.finalize(db, user, res)
+        assert _job(db, uid).state == "pending"  # re-armed, not done/error
+
+
+def test_score_to_completion_drains_within_budget(monkeypatch):
+    """A generous deadline drains the whole backlog (time_exhausted stays False)."""
+    monkeypatch.setattr("app.services.llm.clients_for_user", lambda db, u: (GoodClient(), FilterPass()))
+    with session_scope() as db:
+        uid = _seed_user(db)
+        user = db.get(models.User, uid)
+        res = matcher.score_to_completion(db, user, deadline=time.monotonic() + 60)
+        assert res.time_exhausted is False and res.scored == 1
+        assert matcher.count_pending(db, user) == 0
+
+
+# ── dispatch hook (the pub/sub kick) ──────────────────────────────────────────
+def test_dispatch_is_noop_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_dispatch_url", "")
+    called = []
+    monkeypatch.setattr(dispatch.httpx, "post", lambda *a, **k: called.append(1))
+    assert dispatch.dispatch_scoring_run() is False
+    assert called == []  # no URL → no request
+
+
+def test_dispatch_posts_when_configured(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_dispatch_url", "https://api.github.test/repos/o/r/dispatches")
+    monkeypatch.setattr(settings, "scoring_dispatch_token", "tok")
+    monkeypatch.setattr(settings, "scoring_dispatch_event", "score")
+    captured = {}
+
+    class _Resp:
+        status_code = 204
+        def raise_for_status(self): pass
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured.update(url=url, json=json, headers=headers)
+        return _Resp()
+
+    monkeypatch.setattr(dispatch.httpx, "post", fake_post)
+    assert dispatch.dispatch_scoring_run() is True
+    assert captured["url"].endswith("/dispatches")
+    assert captured["json"] == {"event_type": "score"}
+    assert captured["headers"]["Authorization"] == "Bearer tok"
+
+
+def test_dispatch_swallows_errors(monkeypatch):
+    monkeypatch.setattr(settings, "scoring_dispatch_url", "https://api.github.test/x")
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(dispatch.httpx, "post", boom)
+    assert dispatch.dispatch_scoring_run() is False  # never raises; backstop cron covers it
+
+
+def test_ensure_running_dispatches_when_workers_off(monkeypatch):
+    """Serverless (background workers off): ensure_running enqueues, then fires the
+    dispatch trigger instead of spawning an in-process drain."""
+    assert settings.background_workers_enabled is False  # the test env (conftest)
+    fired = []
+    monkeypatch.setattr(evaluator.dispatch, "dispatch_scoring_run", lambda: fired.append(1) or True)
+    monkeypatch.setattr(evaluator, "ensure_draining", lambda: fired.append("DRAIN"))
+    with session_scope() as db:
+        uid = _seed_user(db)
+    evaluator.ensure_running(uid)
+    assert fired == [1]  # dispatched, did not spawn an in-process drain
+    with session_scope() as db:
+        assert _job(db, uid).state == "pending"
+
+
+# ── consumer endpoint (local-runnable / testable) ─────────────────────────────
+def test_run_scoring_endpoint_requires_cron_secret(monkeypatch):
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    with TestClient(app) as c:
+        assert c.post("/api/cron/run-scoring").status_code == 503  # disabled until set
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    with TestClient(app) as c:
+        assert c.post("/api/cron/run-scoring", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_run_scoring_endpoint_drains_the_queue(monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    monkeypatch.setattr("app.services.llm.clients_for_user", lambda db, u: (GoodClient(), FilterPass()))
+    with session_scope() as db:
+        uid = _seed_user(db)  # one scoreable pair, not yet enqueued
+    with TestClient(app) as c:
+        r = c.post("/api/cron/run-scoring", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["enqueued"] == 1 and body["scored"] == 1 and body["more_pending"] is False
+    with session_scope() as db:
+        assert matcher.count_pending(db, db.get(models.User, uid)) == 0
+
+
+def test_run_scoring_endpoint_redispatches_when_backlog_remains(monkeypatch):
+    """If the budget leaves work pending, the endpoint re-fires the trigger so the
+    queue keeps draining without waiting for the schedule."""
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    # Drain is a no-op, so the reconciled backlog stays pending after the call.
+    monkeypatch.setattr(evaluator, "drain_queue", lambda **k: evaluator.DrainSummary())
+    fired = []
+    monkeypatch.setattr("app.routers.cron.dispatch.dispatch_scoring_run", lambda: fired.append(1) or True)
+    with session_scope() as db:
+        _seed_user(db)
+    with TestClient(app) as c:
+        r = c.post("/api/cron/run-scoring", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200 and r.json()["more_pending"] is True
+    assert fired == [1]  # continuation dispatch fired
+
+
+def test_run_daily_endpoint_publishes_and_dispatches(monkeypatch):
+    """After the scrape, run-daily enqueues users with a backlog and fires the trigger."""
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    monkeypatch.setattr(matcher, "scrape_for_all_users", lambda: {})  # skip real scraping
+    fired = []
+    monkeypatch.setattr("app.routers.cron.dispatch.dispatch_scoring_run", lambda: fired.append(1) or True)
+    with session_scope() as db:
+        _seed_user(db)  # has a backlog → should be enqueued + trigger fired
+    with TestClient(app) as c:
+        r = c.get("/api/cron/run-daily", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200 and r.json()["enqueued"] == 1
+    assert fired == [1]

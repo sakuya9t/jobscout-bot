@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -122,6 +123,11 @@ class RunResult:
     # Set when scoring stopped because the Ollama budget/quota was exhausted. The
     # background drainer checks this to avoid re-arming against a dead quota.
     budget_exhausted: bool = False
+    # Set when scoring stopped because the per-run wall-clock budget elapsed (a big
+    # backlog that didn't fit one run). Unlike budget_exhausted this re-arms normally:
+    # progress is committed per batch and finalize leaves the queue row ``pending`` so
+    # the next run continues. Prevents the drain being killed mid-run and stranded.
+    time_exhausted: bool = False
     # False when score_to_completion couldn't acquire the score lock (another drain
     # is already working this user), so the caller can skip recording a snapshot.
     did_run: bool = True
@@ -664,6 +670,11 @@ def count_pending(db: Session, user: User) -> int:
     return len(described_ids) * len(interest_ids) - filled
 
 
+def _past_deadline(deadline: float | None) -> bool:
+    """True once the run's wall-clock budget (a ``time.monotonic()`` value) is spent."""
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def score_to_completion(
     db: Session,
     user: User,
@@ -671,14 +682,20 @@ def score_to_completion(
     *,
     client: OllamaClient | None = None,
     filter_client: OllamaClient | None = None,
+    deadline: float | None = None,
 ) -> RunResult:
-    """Score the user's entire current evaluation backlog, draining it to completion
-    (no per-run cap). Two-stage batched scoring: a cheap model triages relevance,
-    then the good model scores survivors. Guarded by the non-blocking score lock so
-    only one drain runs per user; if another already holds it, returns immediately
-    with ``res.did_run = False``. Stops early and sets ``res.budget_exhausted`` if
-    the Ollama budget runs out — without writing markers, so the backlog re-scores
-    automatically once quota returns."""
+    """Score the user's current evaluation backlog. Two-stage batched scoring: a cheap
+    model triages relevance, then the good model scores survivors. Guarded by the
+    non-blocking score lock so only one drain runs per user; if another already holds
+    it, returns immediately with ``res.did_run = False``.
+
+    Drains to completion by default. ``deadline`` (a ``time.monotonic()`` value) caps
+    the run: when it's reached the drain stops between batches and sets
+    ``res.time_exhausted`` — committed progress is kept and the backlog finishes on the
+    next run. This is what lets the periodic cron split one huge backlog across runs
+    instead of being killed mid-drain (see services/evaluator.drain_queue). Also stops
+    and sets ``res.budget_exhausted`` if the Ollama quota runs out (no markers written,
+    so it re-scores once quota returns)."""
     res = res or RunResult()
     lock = _lock_for(_SCORE_LOCKS, user.id)
     if not lock.acquire(blocking=False):
@@ -686,7 +703,7 @@ def score_to_completion(
         res.did_run = False
         return res
     try:
-        _score_locked(db, user, res, client=client, filter_client=filter_client)
+        _score_locked(db, user, res, client=client, filter_client=filter_client, deadline=deadline)
     finally:
         lock.release()
     return res
@@ -699,6 +716,7 @@ def _score_locked(
     *,
     client: OllamaClient | None = None,
     filter_client: OllamaClient | None = None,
+    deadline: float | None = None,
 ) -> None:
     # Build the scoring + relevance-filter clients from this user's effective LLM
     # config (their provider/key/models, else the global defaults), unless a caller
@@ -744,6 +762,9 @@ def _score_locked(
     # shrinks and the drain terminates.
     try:
         for interest in interests:
+            if _past_deadline(deadline):
+                res.time_exhausted = True
+                return
             candidates: list[Position] = []
             for pos in described:
                 if (pos.id, interest.id) in already:
@@ -757,6 +778,11 @@ def _score_locked(
 
             idx = 0
             while idx < len(candidates):
+                # Stop cleanly at the run budget — the previous batch is already
+                # committed, so the remaining backlog finishes on the next run.
+                if _past_deadline(deadline):
+                    res.time_exhausted = True
+                    return
                 batch = candidates[idx : idx + batch_size]
                 idx += len(batch)
 
@@ -801,8 +827,9 @@ def _score_locked(
             f"(Ollama said: {exc})"
         )
 
-    # Explain a "0 scored" outcome instead of leaving it silent.
-    if res.scored == 0 and not res.budget_exhausted:
+    # Explain a "0 scored" outcome instead of leaving it silent (but not when we
+    # stopped early on a budget — there's simply more to do next run).
+    if res.scored == 0 and not res.budget_exhausted and not res.time_exhausted:
         if res.filtered:
             res.add_error(
                 f"The relevance filter judged none of the {res.filtered} evaluated "

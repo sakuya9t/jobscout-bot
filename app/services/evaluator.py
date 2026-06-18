@@ -31,7 +31,7 @@ from ..config import settings
 from ..db import session_scope
 from ..logging_config import get_logger
 from ..models import User
-from . import matcher, reporter, scoring_queue
+from . import dispatch, matcher, reporter, scoring_queue
 
 log = get_logger(__name__)
 
@@ -60,11 +60,16 @@ def _get_executor() -> ThreadPoolExecutor:
 
 def ensure_running(user_id: int) -> None:
     """Enqueue ``user_id`` for scoring and kick the drain. Always enqueues (durably,
-    so the cron is a backstop even on serverless); only spawns workers where
-    background threads survive (`ensure_draining`)."""
+    so the scheduled cron is a backstop even on serverless). On a long-lived server we
+    drain in-process (`ensure_draining`); where threads don't survive (serverless) we
+    instead fire the event-driven dispatch so a consumer drains now rather than at the
+    next scheduled run (`dispatch.dispatch_scoring_run`, a no-op when unconfigured)."""
     with session_scope() as db:
         scoring_queue.enqueue(db, user_id)
-    ensure_draining()
+    if settings.background_workers_enabled:
+        ensure_draining()
+    else:
+        dispatch.dispatch_scoring_run()
 
 
 def ensure_draining() -> None:
@@ -209,7 +214,10 @@ def drain_queue(
                 user_id = scoring_queue.claim_one(db)
             if user_id is None:
                 return  # queue drained (or all remaining rows held by peers)
-            _drain_claimed_user(user_id, summary)
+            # Pass the run deadline so one huge user's drain also stops at the budget
+            # (it's only checked between users here) and re-arms instead of running
+            # past the job timeout and being killed mid-drain.
+            _drain_claimed_user(user_id, summary, deadline=deadline)
 
     threads = [
         threading.Thread(target=worker, name=f"scoring-{i}", daemon=True)
@@ -226,16 +234,20 @@ def drain_queue(
     return summary
 
 
-def _drain_claimed_user(user_id: int, summary: DrainSummary | None = None) -> None:
+def _drain_claimed_user(
+    user_id: int, summary: DrainSummary | None = None, *, deadline: float | None = None
+) -> None:
     """Score one already-claimed user's backlog in its own session, then settle its
-    queue row. Never raises — a single user's failure is isolated to that user."""
+    queue row. Never raises — a single user's failure is isolated to that user.
+    ``deadline`` (a ``time.monotonic()`` value) caps the drain so a big backlog stops
+    at the run budget and re-arms ``pending`` rather than overrunning the job timeout."""
     try:
         with session_scope() as db:
             user = db.get(User, user_id)
             if user is None:  # user deleted after being claimed
                 scoring_queue.mark_done(db, user_id)
                 return
-            res = matcher.score_to_completion(db, user)
+            res = matcher.score_to_completion(db, user, deadline=deadline)
             if res.did_run:
                 res.finalize_errors()
                 reporter.record_job_list_snapshot(db, user, res)

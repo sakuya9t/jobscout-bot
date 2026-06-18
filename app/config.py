@@ -159,6 +159,19 @@ class Settings(BaseSettings):
     # reclaimed to "pending" by the next reconcile sweep so its user isn't stranded.
     scoring_stale_minutes: int = 60
 
+    # Event-driven scoring drain (services/dispatch.py). When work becomes pending and
+    # this process can't drain it in-process (serverless), POST a trigger here so a
+    # consumer picks it up — replacing the "wait for the next scheduled run" delay.
+    # In production this is GitHub's repository_dispatch endpoint
+    # (https://api.github.com/repos/<owner>/<repo>/dispatches) with a PAT/App token, so
+    # the `scoring.yml` Actions workflow drains. Locally, point it at this app's own
+    # POST /api/cron/run-scoring (token = CRON_SECRET) to exercise the whole loop on
+    # your machine. Empty (default) = no-op: a long-lived server drains in-process and
+    # the scheduled cron is the backstop, so nothing extra is needed in dev.
+    scoring_dispatch_url: str = ""
+    scoring_dispatch_token: str = ""
+    scoring_dispatch_event: str = "score"  # repository_dispatch event_type
+
     @property
     def resume_dir(self) -> Path:
         return self.data_dir / "resumes"

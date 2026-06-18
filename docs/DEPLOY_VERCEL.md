@@ -28,8 +28,10 @@ serverless functions:
 - `api/index.py` re-exports the FastAPI `app`; `vercel.json` declares an
   `@vercel/python` build and routes every path to it.
 - The in-process scheduler and background worker threads are turned **off** on Vercel
-  (`JOBSCOUT_SCHEDULER_ENABLED=0`, `JOBSCOUT_BACKGROUND_WORKERS=0`) since threads don't
-  survive a function freeze.
+  (`JOBSCOUT_SCHEDULER_ENABLED=0`, `JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0`) since threads
+  don't survive a function freeze. (Note the `_ENABLED` suffix — a misspelled var is
+  silently ignored, leaving workers **on**, which strands scoring-queue rows in
+  `running` when the function freezes.)
 - The **daily scan runs in GitHub Actions**, not on Vercel. A full scrape+score can't
   finish within a Vercel function's time limit (60s on Hobby; a single Ollama request
   alone can take up to `JOBSCOUT_OLLAMA_TIMEOUT`), so `.github/workflows/daily-scan.yml`
@@ -62,15 +64,18 @@ local environment is carried over.
    | `VERCEL_TOKEN` | a Vercel access token |
    | `VERCEL_ORG_ID` | from step 3 |
    | `VERCEL_PROJECT_ID` | from step 3 |
+   | `GH_DISPATCH_TOKEN` | optional — a fine-grained PAT / GitHub App token with `actions: write`, used by the daily-scan and scoring workflows to fire `repository_dispatch` so scoring continues without waiting for the schedule (see "Continuous scoring"). Omit to run schedule-only |
 5. **Set Vercel project env vars** (Project → Settings → Environment Variables, Production):
    | Variable | Value / note |
    | --- | --- |
    | `JOBSCOUT_DATABASE_URL` | same Supabase URL as `SUPABASE_DB_URL` |
    | `JOBSCOUT_SECRET_KEY` | the brand-new key from step 2 — unique to prod, never your local key, and **identical to the GitHub secret of the same name** (it's the at-rest encryption key for the Telegram-token / LLM-key columns) |
    | `JOBSCOUT_DATA_DIR` | `/tmp/jobscout-data` — **required**: Vercel's FS is read-only except `/tmp`, and the app `mkdir`s this dir at import |
-   | `CRON_SECRET` | optional — long random string gating the manual `GET /api/cron/run-daily` trigger. Not required for the daily scan (that runs in GitHub Actions); set it only if you want the HTTP trigger usable |
+   | `CRON_SECRET` | optional — long random string gating the `GET /api/cron/run-daily` and `POST /api/cron/run-scoring` HTTP triggers. Not required for the GitHub Actions crons; set it for the HTTP triggers / local testing |
    | `JOBSCOUT_SCHEDULER_ENABLED` | `0` |
-   | `JOBSCOUT_BACKGROUND_WORKERS_ENABLED` | `0` — threads don't survive a function freeze; scoring is enqueued and drained by the `run-scoring` GitHub Actions cron instead |
+   | `JOBSCOUT_BACKGROUND_WORKERS_ENABLED` | `0` — threads don't survive a function freeze; scoring is enqueued and drained by the `run-scoring` GitHub Actions workflow instead |
+   | `JOBSCOUT_SCORING_DISPATCH_URL` | optional but recommended — `https://api.github.com/repos/<owner>/<repo>/dispatches`. When the dashboard enqueues a scan, the app fires this so the Scoring workflow drains **now** instead of waiting for the schedule (see "Continuous scoring" below). Omit to rely on the schedule only |
+   | `JOBSCOUT_SCORING_DISPATCH_TOKEN` | required iff the URL is set — a fine-grained PAT / GitHub App token with `actions: write` (the default `GITHUB_TOKEN` can't trigger a workflow) |
    | `JOBSCOUT_COOKIE_SECURE` | `1` (served over HTTPS) |
    | `JOBSCOUT_ADMIN_TOKEN` | optional — long random string to enable `/api/admin/*` |
    | `JOBSCOUT_REQUIRE_INVITE` | `1` (recommended for a public deploy) |
@@ -87,10 +92,10 @@ After that, **push to `main`** (or run the workflow manually) to deploy.
   ad-hoc run from the Actions tab → **Run workflow**.
 - **Dashboard "Run scan now" scoring is queued, not inline,** on Vercel — its scrape runs
   synchronously, then it **enqueues** the user to the durable scoring queue (background
-  threads don't survive a function freeze). The `run-scoring` GitHub Actions cron drains
-  the queue reliably; the dashboard shows matches from the DB as they're scored. So a
-  manual refresh's results appear once the next scoring run picks it up rather than within
-  the request.
+  threads don't survive a function freeze) and fires the dispatch trigger (below). The
+  `run-scoring` GitHub Actions workflow drains the queue reliably; the dashboard shows
+  matches from the DB as they're scored. So a manual refresh's results appear once the
+  scoring run picks it up rather than within the request.
 - **Resume original-file preview isn't durable.** Uploaded files land in `/tmp`; the
   dashboard already falls back to the DB-stored extracted text, and matching/scoring
   use that text, so this is cosmetic. Supabase Storage is the real fix later.
@@ -108,6 +113,47 @@ After that, **push to `main`** (or run the workflow manually) to deploy.
 For a deploy where the scheduler, workers, and rate limiter all work as-is, run the
 long-lived server on a VM / container / Fly.io / Render instead (still pointed at
 Supabase), and front it with a CDN/WAF.
+
+### Continuous scoring (event-driven drain)
+
+Without extra config the queue only drains on the scoring schedule (every 4h), so new
+work can sit idle for hours. To make it drain **as soon as work appears and keep going
+until the backlog is empty**, the app fires a lightweight trigger instead of waiting:
+
+```
+producer enqueues  ──►  app fires repository_dispatch ("score")  ──►  Scoring workflow drains
+        ▲                                                                      │
+        └──────────────  re-fires while the per-run budget leaves a backlog  ◄─┘
+```
+
+- **Producers** that publish work: the dashboard "Run scan now" (`/api/run`), and the
+  daily scan (`run-daily` reconciles + fires after scraping).
+- **Consumer**: the `scoring.yml` workflow listens on `repository_dispatch: [score]` and
+  runs `jobscout run-scoring`, which drains the queue within
+  `JOBSCOUT_SCORING_RUN_BUDGET_SECONDS`. A single huge backlog now **stops cleanly at the
+  budget and re-arms** (per-user time budget) instead of being killed by the job timeout
+  and stranding a row in `running`; if work remains it re-fires the trigger, so runs go
+  back-to-back until empty, then idle.
+- **Setup**: set `JOBSCOUT_SCORING_DISPATCH_URL` +
+  `JOBSCOUT_SCORING_DISPATCH_TOKEN` on Vercel, and the `GH_DISPATCH_TOKEN` GitHub secret
+  (so the workflows can re-fire). Leave them unset to fall back to schedule-only.
+
+**Run/test it locally** — no Supabase/GitHub needed. The trigger is plain HTTP, so point
+it at the app's own consumer endpoint:
+
+```bash
+export CRON_SECRET=dev-secret
+export JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0          # simulate serverless (no in-process drain)
+export JOBSCOUT_SCORING_DISPATCH_URL=http://localhost:8000/api/cron/run-scoring
+export JOBSCOUT_SCORING_DISPATCH_TOKEN=$CRON_SECRET
+jobscout serve                                        # in one shell
+# enqueue work (dashboard "Run scan now", or run-daily), then watch it drain:
+curl -X POST -H "Authorization: Bearer $CRON_SECRET" http://localhost:8000/api/cron/run-scoring
+```
+
+On a long-lived server (default `JOBSCOUT_BACKGROUND_WORKERS_ENABLED=1`) you don't need any
+of this — the in-process evaluator drains the queue the moment work is enqueued, and the
+dispatch trigger is a no-op.
 
 ---
 
