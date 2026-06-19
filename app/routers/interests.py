@@ -7,10 +7,14 @@ from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
 from ..db import get_db
+from ..logging_config import get_logger
 from ..models import Interest, MatchResult, User
 from ..schemas import InterestIn, InterestOut, InterestUpdate
+from ..services import evaluator
 
 router = APIRouter(prefix="/api/interests", tags=["interests"])
+
+log = get_logger(__name__)
 
 # Fields that change *what the LLM matches against*; editing any of them must
 # invalidate this interest's existing matches so the next run re-evaluates.
@@ -49,10 +53,11 @@ def update_interest(
     changes = payload.model_dump(exclude_unset=True)
     for field, value in changes.items():
         setattr(interest, field, value)
-    if _SCORING_FIELDS & changes.keys():
+    criteria_changed = bool(_SCORING_FIELDS & changes.keys())
+    if criteria_changed:
         # Matching criteria changed: drop this interest's matches (incl. cheap-filter
-        # rejections) so the next run re-screens every posting against the new
-        # criteria instead of skipping them as "already scored".
+        # rejections) so every posting is re-screened against the new criteria instead
+        # of being skipped as "already scored".
         db.execute(
             delete(MatchResult).where(
                 MatchResult.user_id == user.id, MatchResult.interest_id == interest_id
@@ -60,6 +65,17 @@ def update_interest(
         )
     db.commit()
     db.refresh(interest)
+    if criteria_changed:
+        # Kick the re-evaluation now (don't wait for the next manual scan/cron): the
+        # just-deleted pairs are back in the backlog, so a drain re-screens every
+        # posting against the new filters — newly-eligible roles gain a score and
+        # newly-ineligible ones flip to "not a match". Best-effort: the scheduled
+        # scan is the backstop if this kick can't run (e.g. serverless), so never let
+        # it fail the save.
+        try:
+            evaluator.ensure_running(user.id)
+        except Exception:
+            log.exception("interest update: failed to kick re-evaluation for user %s", user.id)
     return interest
 
 

@@ -1206,32 +1206,42 @@ def test_report_min_results_backfills_below_threshold():
         assert len(backfilled) == 1 and backfilled[0]["below_threshold"] is True
 
 
-def test_editing_interest_clears_its_matches():
-    """Editing matching criteria drops the interest's matches (so the next run
-    re-evaluates); editing a non-scoring field (label) keeps them."""
+def test_editing_interest_clears_matches_and_rekicks_scoring(monkeypatch):
+    """Editing matching criteria drops the interest's matches AND kicks a
+    re-evaluation immediately, so every posting is re-screened against the new
+    filters (newly-eligible roles gain a score, newly-ineligible ones flip to "not a
+    match") without waiting for the next manual scan. Editing a non-scoring field
+    (label) does neither."""
+    kicked: list[int] = []
+    monkeypatch.setattr(
+        "app.routers.interests.evaluator.ensure_running", lambda uid: kicked.append(uid)
+    )
     with TestClient(app) as c:
         h = {"Authorization": f"Bearer {_register(c, 'ie@x.com').json()['access_token']}"}
         iid = c.post("/api/interests", json={"label": "BE", "title_keywords": "backend"},
                      headers=h).json()["id"]
         with session_scope() as db:
             user = db.scalar(matcher.select(models.User).where(models.User.email == "ie@x.com"))
-            company = models.Company(user_id=user.id, name="Acme")
+            uid = user.id
+            company = models.Company(user_id=uid, name="Acme")
             db.add(company)
             db.flush()
             pos = models.Position(company_id=company.id, external_id="1",
                                   title="Backend Engineer", description="x")
             db.add(pos)
             db.flush()
-            db.add(models.MatchResult(user_id=user.id, position_id=pos.id, interest_id=iid,
+            db.add(models.MatchResult(user_id=uid, position_id=pos.id, interest_id=iid,
                                       match_score=80, passed_filter=True, model="m"))
 
         c.patch(f"/api/interests/{iid}", json={"label": "BE renamed"}, headers=h)
         with session_scope() as db:
             assert db.scalar(matcher.select(models.MatchResult)) is not None  # label-only: kept
+        assert kicked == []  # label-only change: no re-evaluation kicked
 
         c.patch(f"/api/interests/{iid}", json={"title_keywords": "platform"}, headers=h)
         with session_scope() as db:
             assert db.scalar(matcher.select(models.MatchResult)) is None  # criteria change: cleared
+        assert kicked == [uid]  # criteria change: re-evaluation kicked for this user
 
 
 def test_reporter_threshold_filters_low_scores():
