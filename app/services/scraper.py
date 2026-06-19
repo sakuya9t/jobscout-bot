@@ -793,6 +793,177 @@ def scrape_apple(max_pages: int) -> list[ScrapedPosition]:
     return _apple_paged(max_pages)[0]
 
 
+# ── XML sitemap of job pages (TLS-fingerprint-walled boards, e.g. Citadel) ────
+# Some careers sites server-render nothing useful over plain HTTP and front their
+# pages with Cloudflare, which blocks plain httpx by TLS/JA3 fingerprint (Citadel
+# returns a "Just a moment…" challenge). But they still publish a standard <urlset>
+# sitemap that lists every open-role detail page, and the detail pages carry a
+# schema.org JobPosting JSON-LD block with the full description. So this adapter:
+#   1. reads the sitemap (``ats_token`` = its URL) for the live set of role URLs, then
+#   2. fetches each detail page with a *browser TLS profile* (curl_cffi, see
+#      ``_fetch_impersonated``) to get past the fingerprint wall, and
+#   3. pulls the real title/description/location/date out of its JSON-LD.
+# The sitemap is the authoritative listing of which roles are open (coverage "full");
+# a detail fetch that fails just leaves that one posting description-less (then the
+# matcher skips it) rather than failing the whole crawl.
+# (Single <urlset> only — a <sitemapindex> of sub-sitemaps isn't followed; no current
+# preset needs it.)
+_SITEMAP_URL_BLOCK = re.compile(r"<url\b[^>]*>(.*?)</url>", re.I | re.S)
+_SITEMAP_LOC = re.compile(r"<loc>\s*(?:<!\[CDATA\[)?\s*(.*?)\s*(?:\]\]>)?\s*</loc>", re.I | re.S)
+_SITEMAP_LASTMOD = re.compile(r"<lastmod>\s*(.*?)\s*</lastmod>", re.I | re.S)
+
+
+def _slug_to_title(url: str) -> str:
+    """Best-effort human title from a job URL's trailing slug (the fallback when a
+    detail page yields no JSON-LD), e.g.
+    ``…/details/global-quantitative-strategies-quantitative-researcher/`` →
+    ``Global Quantitative Strategies Quantitative Researcher``."""
+    slug = urlparse(url).path.strip("/").rsplit("/", 1)[-1]
+    title = slug.replace("-", " ").replace("_", " ").strip()
+    return title.title() if title else "Untitled"
+
+
+class _ImpersonatedTransient(Exception):
+    """A retryable failure from an impersonated GET: a transport error, or a status
+    Cloudflare sometimes returns under a burst (403/429/5xx) that clears on retry."""
+
+
+@retry(
+    retry=retry_if_exception(lambda e: isinstance(e, _ImpersonatedTransient)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=0.5, max=8),
+    reraise=True,
+)
+def _impersonated_get(url: str):
+    """One curl_cffi Chrome-impersonated GET (no redirect follow), retried on transient
+    failures. impersonate sets the full Chrome header/TLS profile — don't override the
+    User-Agent (a mismatch with the TLS fingerprint re-trips Cloudflare)."""
+    from curl_cffi import requests as _creq
+
+    try:
+        resp = _creq.get(url, impersonate="chrome", timeout=30, allow_redirects=False)
+    except Exception as exc:  # curl_cffi transport error
+        raise _ImpersonatedTransient(str(exc)) from exc
+    # 403/429 here is usually Cloudflare rate-limiting a burst, not a hard block (a
+    # single request succeeds); retry it. 5xx is transient too.
+    if resp.status_code in (403, 429) or resp.status_code >= 500:
+        raise _ImpersonatedTransient(f"HTTP {resp.status_code}")
+    return resp
+
+
+def _fetch_impersonated(url: str) -> str:
+    """GET a page that blocks plain httpx via TLS/JA3 fingerprinting, using a real
+    browser TLS profile (curl_cffi Chrome impersonation). SSRF-guarded like ``_send``:
+    every hop's host must resolve to a public IP, redirects are followed manually and
+    re-validated, and the body is size-capped. Raises ``ScrapeError`` on any failure so
+    callers handle one exception type. Used for Cloudflare-fingerprint-gated boards
+    (e.g. Citadel) whose pages return "Just a moment…" under httpx."""
+    max_bytes = settings.scrape_max_response_mb * 1024 * 1024
+    for _ in range(_MAX_REDIRECTS + 1):
+        _validate_url(url)  # scheme + public-host check on every hop
+        try:
+            resp = _impersonated_get(url)
+        except Exception as exc:  # transient retries exhausted, or any other error
+            raise ScrapeError(f"fetch {url}: {exc}") from exc
+        if 300 <= resp.status_code < 400:
+            loc = resp.headers.get("location")
+            if loc:
+                url = urljoin(url, loc)
+                continue
+        if resp.status_code >= 400:
+            raise ScrapeError(f"fetch {url}: HTTP {resp.status_code}")
+        body = resp.content or b""
+        if len(body) > max_bytes:
+            raise ScrapeError(f"response from {url} exceeds {max_bytes} bytes")
+        return body.decode("utf-8", errors="replace")
+    raise ScrapeError(f"too many redirects from {url}")
+
+
+def _jsonld_jobposting(html: str) -> dict | None:
+    """Return the first schema.org JobPosting object from a page's JSON-LD blocks."""
+    for block in _LD_JSON_RE.findall(html):
+        try:
+            data = _json.loads(block)
+        except _json.JSONDecodeError:
+            continue
+        for obj in data if isinstance(data, list) else [data]:
+            if isinstance(obj, dict) and obj.get("@type") == "JobPosting":
+                return obj
+    return None
+
+
+def _jsonld_location(job: dict) -> str | None:
+    """Flatten a JobPosting's ``jobLocation`` (one or many) to "City, Region, Country"."""
+    raw = job.get("jobLocation")
+    items = raw if isinstance(raw, list) else [raw]
+    seen: list[str] = []
+    for it in items:
+        addr = it.get("address") if isinstance(it, dict) else None
+        if not isinstance(addr, dict):
+            continue
+        seg = ", ".join(
+            str(addr[k])
+            for k in ("addressLocality", "addressRegion", "addressCountry")
+            if addr.get(k)
+        )
+        if seg and seg not in seen:
+            seen.append(seg)
+    return "; ".join(seen) or None
+
+
+def _sitemap_position(url: str, lastmod: str | None) -> ScrapedPosition:
+    """Fetch one detail page and build a position from its JSON-LD JobPosting. Best
+    effort: a failed fetch / missing JSON-LD falls back to the URL slug for the title
+    and leaves the description empty (so the matcher skips it) rather than aborting."""
+    title = _slug_to_title(url)[:300]
+    description = location = employment = None
+    posted_at = _parse_ts(lastmod)
+    try:
+        job = _jsonld_jobposting(_fetch_impersonated(url))
+    except ScrapeError:
+        job = None
+    if job:
+        title = (job.get("title") or title)[:300]
+        description = _strip_html(job.get("description"))
+        location = _jsonld_location(job)
+        employment = job.get("employmentType")
+        posted_at = _parse_ts(job.get("datePosted")) or posted_at
+    return ScrapedPosition(
+        external_id=_hash(url),
+        title=title,
+        location=location,
+        employment_type=employment,
+        url=url,
+        description=description,
+        posted_at=posted_at,
+    )
+
+
+def scrape_sitemap(sitemap_url: str) -> list[ScrapedPosition]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    xml = _fetch_impersonated(sitemap_url)
+    entries: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for block in _SITEMAP_URL_BLOCK.findall(xml):
+        m = _SITEMAP_LOC.search(block)
+        if not m:
+            continue
+        url = _http_url(m.group(1).strip())
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        lm = _SITEMAP_LASTMOD.search(block)
+        entries.append((url, lm.group(1).strip() if lm else None))
+    if not entries:
+        return []
+    # Fetch detail pages concurrently (bounded) — reuse the eightfold detail-fetch
+    # worker cap so a big board doesn't fire hundreds of requests at once.
+    workers = max(1, settings.scrape_eightfold_desc_workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda e: _sitemap_position(*e), entries))
+
+
 # ── Generic HTML fallback ────────────────────────────────────────────────────
 _JOB_HINT = re.compile(r"(job|career|position|opening|vacanc|role|gh_jid|/jobs/)", re.I)
 
@@ -925,6 +1096,13 @@ def scrape_company(company) -> ScrapeResult:
         results, coverage = _eightfold_paged(
             company.careers_url, token, settings.scrape_eightfold_max_pages
         )
+    elif ats_type == "sitemap":
+        if not token:
+            raise ScrapeError(f"{company.name}: sitemap scrape needs ats_token (the sitemap URL)")
+        results = scrape_sitemap(token)
+        # The sitemap enumerates every open-role page, so it's a complete listing:
+        # an id's absence means the role was removed (same as the full-board ATSs).
+        coverage = "full"
     elif ats_type == "amazon":
         results, coverage = _amazon_paged(settings.scrape_amazon_max_pages)
     elif ats_type == "apple":

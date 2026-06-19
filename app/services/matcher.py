@@ -54,8 +54,14 @@ FILTER_SYSTEM_PROMPT = (
     "match=true (the detailed scoring step is stricter). Use match=false only for "
     "clearly wrong roles (wrong discipline/seniority, an excluded keyword, or an "
     "impossible location).\n"
+    "For EACH posting also give a short `reason` — one concise phrase (max ~15 words). "
+    "When match=false, name the SPECIFIC reason it was screened out and which "
+    "requirement it misses, e.g. 'Senior role; you want entry-level', 'On-site NYC; "
+    "you want remote', 'Hardware role, outside your software focus'. When match=true, "
+    "give the brief reason it fits. Address the candidate ('you').\n"
     "Respond with ONLY a JSON array — one object per posting, using its number as "
-    '"id": [{"id": 1, "match": true}, {"id": 2, "match": false}]. No prose, no code fences.'
+    '"id": [{"id": 1, "match": true, "reason": "..."}, '
+    '{"id": 2, "match": false, "reason": "..."}]. No prose, no code fences.'
 )
 
 

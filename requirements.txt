@@ -11,6 +11,10 @@ python-multipart>=0.0.9
 bcrypt>=4.1
 PyJWT>=2.8
 httpx>=0.27
+# Browser-TLS-impersonating HTTP client, used to read boards that block plain httpx
+# via TLS/JA3 fingerprinting (e.g. Citadel's Cloudflare-fronted detail pages). Ships
+# manylinux wheels, so it installs on Vercel / GitHub Actions without a browser.
+curl_cffi>=0.7
 tenacity>=8.2
 beautifulsoup4>=4.12
 lxml>=5.2
