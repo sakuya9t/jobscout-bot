@@ -32,7 +32,15 @@ jobs:
         # runs with) so any encrypted-at-rest column this path touches decrypts
         # correctly; scrape-only doesn't score or send Telegram, but keeping the key
         # aligned avoids surprises if the scrape path ever reads a secret column.
+        #
+        # After scraping, run-daily enqueues users with new backlog and fires the
+        # scoring trigger (repository_dispatch -> the Scoring workflow) so fresh
+        # postings start scoring promptly instead of waiting for the scoring schedule.
+        # GH_DISPATCH_TOKEN = PAT / GitHub App token with `actions: write` (the default
+        # GITHUB_TOKEN can't trigger another workflow); omit to fall back to schedule.
         env:
           JOBSCOUT_DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
           JOBSCOUT_SECRET_KEY: ${{ secrets.JOBSCOUT_SECRET_KEY }}
+          JOBSCOUT_SCORING_DISPATCH_URL: https://api.github.com/repos/${{ github.repository }}/dispatches
+          JOBSCOUT_SCORING_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
         run: jobscout run-daily

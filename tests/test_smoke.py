@@ -67,6 +67,9 @@ def test_parse_filter_batch():
 
     v = _parse_filter_batch('[{"id":1,"match":true},{"id":2,"match":false},{"id":3,"match":true}]', pos)
     assert v[10][0] is True and v[20][0] is False and v[30][0] is True
+    # The per-posting `reason` is captured — it's what the "not a match" pill explains.
+    v = _parse_filter_batch('[{"id":1,"match":false,"reason":"Senior role; you want entry-level"}]', pos)
+    assert v[10] == (False, "Senior role; you want entry-level")
     # Wrapped in prose / code fences still parses.
     assert _parse_filter_batch('sure:\n```json\n[{"id":1,"match":false}]\n```', pos)[10][0] is False
     # Line fallback.
@@ -97,6 +100,58 @@ def test_infer_ats():
     assert _infer_ats("https://jobs.nvidia.com/careers") == ("html", None)
     assert _infer_ats("https://example.com/careers") == ("html", None)
     assert _infer_ats(None) == ("html", None)
+
+
+def test_scrape_sitemap_pulls_real_descriptions(monkeypatch):
+    import app.services.scraper as scraper
+
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url>
+        <loc>https://www.citadel.com/careers/details/commodities-analyst/</loc>
+        <lastmod>2026-06-18T23:14:20+00:00</lastmod>
+      </url>
+      <url>
+        <loc>https://www.citadel.com/careers/details/quant-researcher/</loc>
+      </url>
+      <url><loc>https://www.citadel.com/careers/details/commodities-analyst/</loc></url>
+      <url><loc>mailto:jobs@citadel.com</loc></url>
+    </urlset>"""
+    # The first detail page has a JSON-LD JobPosting; the second has none (fallback).
+    detail = """<html><head>
+      <script type="application/ld+json">
+      {"@context":"https://schema.org/","@type":"JobPosting",
+       "title":"Commodities Analyst",
+       "description":"<p>Analyse <b>commodities</b> markets.</p>",
+       "datePosted":"2026-06-01","employmentType":"full_time",
+       "jobLocation":{"@type":"Place","address":{"@type":"PostalAddress",
+         "addressLocality":"New York","addressRegion":"NY","addressCountry":"US"}}}
+      </script></head><body></body></html>"""
+
+    def fake_fetch(url):
+        if url.endswith(".xml"):
+            return xml
+        if "commodities-analyst" in url:
+            return detail
+        return "<html><body>no structured data</body></html>"
+
+    monkeypatch.setattr(scraper, "_fetch_impersonated", fake_fetch)
+
+    out = scraper.scrape_sitemap("https://www.citadel.com/career-sitemap.xml")
+    # The duplicate <loc> is deduped and the non-http <loc> dropped.
+    assert len(out) == 2
+    first = out[0]
+    assert first.url == "https://www.citadel.com/careers/details/commodities-analyst/"
+    # Real fields come from the JSON-LD (title/description/location/date), not the slug.
+    assert first.title == "Commodities Analyst"
+    assert first.description == "Analyse commodities markets."  # HTML stripped
+    assert first.location == "New York, NY, US"
+    assert first.employment_type == "full_time"
+    assert first.posted_at is not None and first.posted_at.year == 2026
+    # No JSON-LD on the second page: fall back to the slug title, no description (the
+    # matcher will skip it) — never a crash.
+    assert out[1].title == "Quant Researcher" and out[1].description is None
+    assert all(p.external_id for p in out)
 
 
 def test_eightfold_domain_derivation():
@@ -140,7 +195,7 @@ def test_eightfold_parses_and_builds_absolute_urls(monkeypatch):
     import app.services.scraper as scraper
 
     monkeypatch.setattr(
-        scraper, "_fetch_json",
+        scraper, "_eightfold_json",
         lambda url: _eightfold_page([(111, 1)]) if "start=0" in url else _eightfold_page([]),
     )
     out = scraper.scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 60)
@@ -173,7 +228,7 @@ def test_eightfold_paginates_and_stops_past_age_cutoff(monkeypatch):
                 return payload
         return _eightfold_page([])
 
-    monkeypatch.setattr(scraper, "_fetch_json", fake_fetch)
+    monkeypatch.setattr(scraper, "_eightfold_json", fake_fetch)
     out = scraper.scrape_eightfold("https://jobs.nvidia.com/careers", "nvidia.com", 60)
     ids = {p.external_id for p in out}
     # Both pages are pulled (the stale page is trimmed later by _within_max_age),
@@ -193,20 +248,20 @@ def test_eightfold_coverage_signals(monkeypatch):
     monkeypatch.setattr(settings, "scrape_max_age_days", 30)
 
     # Reaches an empty page → whole board seen → "full".
-    monkeypatch.setattr(scraper, "_fetch_json",
+    monkeypatch.setattr(scraper, "_eightfold_json",
         lambda url: _eightfold_page([(111, 1)]) if "start=0" in url else _eightfold_page([]))
     _, cov_full = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 60)
     assert cov_full == "full"
 
     # A whole page predates the 30-day cutoff → covered down to the cutoff → datetime.
     pages = {"start=0": _eightfold_page([(1, 2)]), "start=10": _eightfold_page([(2, 90)])}
-    monkeypatch.setattr(scraper, "_fetch_json",
+    monkeypatch.setattr(scraper, "_eightfold_json",
         lambda url: next((p for k, p in pages.items() if k in url), _eightfold_page([])))
     _, cov_floor = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 60)
     assert isinstance(cov_floor, datetime)
 
     # Hits max_pages before the end or the cutoff → partial → None.
-    monkeypatch.setattr(scraper, "_fetch_json", lambda url: _eightfold_page([(1, 2)]))
+    monkeypatch.setattr(scraper, "_eightfold_json", lambda url: _eightfold_page([(1, 2)]))
     _, cov_partial = scraper._eightfold_paged("https://jobs.nvidia.com/careers", "nvidia.com", 1)
     assert cov_partial is None
 

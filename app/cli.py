@@ -8,6 +8,8 @@ Commands:
   run-scoring      Drain every user's matching backlog via the scoring queue, with a
                    bounded worker pool so concurrent DB connections stay capped. Runs
                    on its own schedule (scoring.yml), separate from the daily scrape.
+  queue-log        Tail the scoring-queue trace (scoring_events) for debugging a flaky
+                   drain: e.g. `jobscout queue-log --user 1` or `--event error`.
   init-db          Create database tables.
   encrypt-secrets  Encrypt the telegram-token / LLM-key columns at rest (one-time,
                    idempotent migration; widens the columns on Postgres first).
@@ -54,14 +56,23 @@ def cmd_mcp(_: argparse.Namespace) -> int:
 
 
 def cmd_run_daily(_: argparse.Namespace) -> int:
-    from .db import init_db
-    from .services import matcher
+    from .db import init_db, session_scope
+    from .services import dispatch, matcher, scoring_queue
 
     init_db()
     summaries = matcher.scrape_for_all_users()
     new = sum(s.new_positions for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
-    print(f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)}")
+    # Publish the scraped work: enqueue users with a backlog and fire the scoring
+    # trigger (no-op when JOBSCOUT_SCORING_DISPATCH_URL is unset). Scrape and scoring
+    # remain separate jobs — this only marks work ready and kicks the consumer.
+    with session_scope() as db:
+        enqueued = scoring_queue.reconcile(db)
+    fired = dispatch.dispatch_scoring_run() if enqueued else False
+    print(
+        f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)} | "
+        f"enqueued: {enqueued} | dispatched: {fired}"
+    )
     for e in errors:
         print(f"  - {e}")
     return 0
@@ -74,7 +85,7 @@ def cmd_run_scoring(_: argparse.Namespace) -> int:
     from ``run-daily`` (scrape-only) on purpose; safe to run on its own schedule."""
     from .config import settings
     from .db import init_db, session_scope
-    from .services import evaluator, scoring_queue
+    from .services import dispatch, evaluator, scoring_queue
 
     init_db()
     with session_scope() as db:
@@ -85,13 +96,70 @@ def cmd_run_scoring(_: argparse.Namespace) -> int:
     )
     with session_scope() as db:
         states = scoring_queue.counts_by_state(db)
+        more = scoring_queue.has_pending(db)
+    # The per-run budget may stop a big backlog mid-drain (rows re-armed to pending);
+    # re-fire the trigger so the next run continues instead of waiting for the schedule.
+    fired = dispatch.dispatch_scoring_run() if more else False
     print(
         f"Enqueued: {enqueued} | users drained: {summary.users} | "
         f"scored: {summary.scored} | failed: {summary.failed}"
     )
     print(f"Queue: {states or '{}'}")  # e.g. {'done': 3, 'error': 1, 'pending': 2}
+    if more:
+        print(f"Backlog remains -> re-dispatched follow-up run: {fired}")
     for e in summary.errors:
         print(f"  - {e}")
+    return 0
+
+
+def cmd_retry_failed(args: argparse.Namespace) -> int:
+    """Clear failed-scoring markers (incl. ones that hit the retry limit and went
+    terminal) so those (posting, interest) pairs re-enter the backlog and re-score on
+    the next run. Optionally scoped to one user."""
+    from .db import init_db, session_scope
+    from .services import matcher
+
+    init_db()
+    with session_scope() as db:
+        cleared = matcher.clear_failed_markers(db, args.user)
+    scope = f"user {args.user}" if args.user else "all users"
+    print(f"Cleared {cleared} failed-scoring marker(s) for {scope}; "
+          "they re-score on the next scoring run.")
+    return 0
+
+
+def cmd_queue_log(args: argparse.Namespace) -> int:
+    """Tail the scoring-queue trace (the scoring_events table). Shows the ordered
+    lifecycle trail — enqueue/claim/finalize/drain/error/reconcile/worker — so a flaky
+    drain is reconstructable: `jobscout queue-log --user 1` to follow one user, or
+    `--event error` to see only failures. Newest rows last (chronological)."""
+    from sqlalchemy import select
+
+    from .db import init_db, session_scope
+    from .models import ScoringEvent
+
+    init_db()
+    with session_scope() as db:
+        q = select(ScoringEvent)
+        if args.user is not None:
+            q = q.where(ScoringEvent.user_id == args.user)
+        if args.event:
+            q = q.where(ScoringEvent.event == args.event)
+        # Take the most recent N, then show oldest-first so the trail reads top-to-bottom.
+        rows = list(db.scalars(
+            q.order_by(ScoringEvent.created_at.desc(), ScoringEvent.id.desc()).limit(args.limit)
+        ))[::-1]
+        if not rows:
+            print("No scoring events recorded yet.")
+            return 0
+        print(f"{'time':<19}  {'user':>4}  {'event':<9}  {'transition':<18}  {'att':>3}  {'worker':<16}  detail")
+        for r in rows:
+            ts = r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "?"
+            trans = f"{r.state_from or '-'}->{r.state_to or '-'}"
+            att = "" if r.attempts is None else str(r.attempts)
+            user = "" if r.user_id is None else str(r.user_id)
+            print(f"{ts:<19}  {user:>4}  {r.event:<9}  {trans:<18}  {att:>3}  "
+                  f"{(r.worker or ''):<16}  {r.detail or ''}")
     return 0
 
 
@@ -407,6 +475,23 @@ def main() -> None:
         help="Encrypt telegram_bot_token + llm api_key at rest (idempotent one-time migration)",
     ).set_defaults(func=cmd_encrypt_secrets)
     sub.add_parser("health", help="Check DB + Ollama").set_defaults(func=cmd_health)
+
+    p = sub.add_parser(
+        "retry-failed",
+        help="Clear failed-scoring markers so those postings re-score on the next run",
+    )
+    p.add_argument("--user", type=int, default=None, help="Limit to one user id (default: all)")
+    p.set_defaults(func=cmd_retry_failed)
+
+    p = sub.add_parser(
+        "queue-log",
+        help="Tail the scoring-queue trace (enqueue/claim/finalize/error/...) for debugging",
+    )
+    p.add_argument("--user", type=int, default=None, help="Limit to one user id (default: all)")
+    p.add_argument("--event", default=None,
+                   help="Limit to one event type (enqueue|claim|finalize|drain|error|done|reconcile|worker)")
+    p.add_argument("--limit", type=int, default=50, help="How many recent events to show")
+    p.set_defaults(func=cmd_queue_log)
 
     p = sub.add_parser("backfill-descriptions",
                        help="Fetch missing descriptions for eightfold boards (e.g. NVIDIA)")

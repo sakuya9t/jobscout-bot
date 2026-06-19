@@ -311,6 +311,11 @@ class MatchResult(Base):
     strengths: Mapped[str | None] = mapped_column(Text)  # JSON-encoded list
     gaps: Mapped[str | None] = mapped_column(Text)  # JSON-encoded list
     model: Mapped[str | None] = mapped_column(String(128))
+    # Retry counter for a failed (position, interest) pair: how many times scoring has
+    # been tried and failed (only set on error-markers, model == matcher.ERROR_MODEL).
+    # The pair is re-scored while attempts < settings.score_max_attempts, then the
+    # marker is terminal. 0 for real results / filter-rejects.
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     user: Mapped[User] = relationship(back_populates="matches")
@@ -596,3 +601,36 @@ class ScoringJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     user: Mapped[User] = relationship(back_populates="scoring_job")
+
+
+class ScoringEvent(Base):
+    """One scoring-queue / worker lifecycle event, persisted for tracing instead of
+    dumped to stdout (which buried the signal in per-batch noise). Every state change a
+    ``ScoringJob`` goes through — enqueue, claim, finalize, drain summary, error, and the
+    reconcile self-heal actions (reclaim/park/requeue) — plus worker-pool spawn/exit,
+    writes a row here. That makes a flaky drain reconstructable after the fact: filter by
+    ``user_id`` and read the ordered ``event``/``state_from``->``state_to`` trail to see
+    exactly where scoring stopped and why.
+
+    Written off the hot path by a background writer (``services/scoring_log.py``) so
+    tracing never blocks a claim/drain or contends with the matcher's open write
+    transaction — same design as ``LlmLog``. Not FK'd to users: it's a low-level audit
+    log that should survive a user deletion and never fail a write on a race; prune by
+    age/volume rather than cascade."""
+
+    __tablename__ = "scoring_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    # The user whose job this event concerns (None for pool-wide events like a worker
+    # spawn/exit). Plain int, not a FK — see the class docstring.
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    # enqueue | claim | finalize | drain | error | done | reconcile | worker
+    event: Mapped[str] = mapped_column(String(24), index=True)
+    state_from: Mapped[str | None] = mapped_column(String(16))
+    state_to: Mapped[str | None] = mapped_column(String(16))
+    attempts: Mapped[int | None] = mapped_column(Integer)
+    # The thread that emitted it (evaluator*/scoring-*/MainThread) — lets you follow one
+    # worker's claim -> drain -> finalize trail through interleaved concurrent drains.
+    worker: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)

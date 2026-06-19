@@ -212,6 +212,52 @@ def test_register_login_roundtrip():
                       json={"email": "a@b.com", "password": "wrongpass"}).status_code == 401
 
 
+def test_register_enforces_password_complexity():
+    """Registration requires >= 8 chars with a letter and a number; too-short,
+    all-letter, and all-digit passwords are rejected with a 422. Login is left on
+    the laxer rule (the wrong-password roundtrip above asserts it stays a 401)."""
+    with TestClient(app) as c:
+        for weak in ("short1", "allletters", "12345678"):
+            r = c.post("/api/auth/register", json={"email": "weak@x.com", "password": weak})
+            assert r.status_code == 422, weak
+        # A compliant password registers fine.
+        assert _register(c, "strong@x.com", "secret123").status_code == 200
+
+
+def test_change_password():
+    """A logged-in user can rotate their password: the wrong current password and a
+    same/weak new password are rejected, and after a valid change the old password no
+    longer logs in while the new one does."""
+    with TestClient(app) as c:
+        h = {"Authorization": f"Bearer {_register(c, 'cp@x.com').json()['access_token']}"}
+        # Wrong current password -> 400 (not a re-auth 401; the session is valid).
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "nope", "new_password": "brandnew1"}
+                      ).status_code == 400
+        # New password must meet complexity (this one has no digit) -> 422.
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "secret123", "new_password": "allletters"}
+                      ).status_code == 422
+        # Reusing the current password is rejected.
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "secret123", "new_password": "secret123"}
+                      ).status_code == 400
+        # Valid change succeeds.
+        assert c.post("/api/auth/change-password", headers=h,
+                      json={"current_password": "secret123", "new_password": "brandnew1"}
+                      ).status_code == 200
+        # Old password no longer works; the new one does.
+        assert c.post("/api/auth/login",
+                      json={"email": "cp@x.com", "password": "secret123"}).status_code == 401
+        assert c.post("/api/auth/login",
+                      json={"email": "cp@x.com", "password": "brandnew1"}).status_code == 200
+    # The endpoint requires authentication (fresh client carries no session cookie).
+    with TestClient(app) as c2:
+        assert c2.post("/api/auth/change-password",
+                       json={"current_password": "brandnew1", "new_password": "another12"}
+                       ).status_code == 401
+
+
 def test_email_normalized_case_insensitive():
     """A@b.com and a@b.com are the same account; login is case-insensitive."""
     with TestClient(app) as c:
@@ -339,7 +385,11 @@ def test_scoring_and_dedup_on_rerun():
     assert res2.scored == 0
 
 
-def test_failure_persists_marker_and_is_not_rebilled():
+def test_failure_persists_marker_and_is_not_rebilled(monkeypatch):
+    # score_max_attempts=1 → a failure is terminal immediately (no retry), so this
+    # exercises the terminal-marker path; bounded-retry behaviour is covered in
+    # tests/test_scoring_queue.py.
+    monkeypatch.setattr(matcher.settings, "score_max_attempts", 1)
     with session_scope() as db:
         uid = _seed_user(db)
     with session_scope() as db:
@@ -348,8 +398,9 @@ def test_failure_persists_marker_and_is_not_rebilled():
     with session_scope() as db:
         markers = list(db.scalars(
             matcher.select(models.MatchResult).where(models.MatchResult.model == matcher.ERROR_MODEL)))
-        assert len(markers) == 1
-    # Re-run must not call either model again (marker in the `already` set).
+        assert len(markers) == 1 and markers[0].attempts == 1
+    # A terminal marker (attempts == limit) settles the pair: re-run must not call
+    # either model again (it's in the `already` set).
     with session_scope() as db:
         matcher.run_for_user(db, db.get(models.User, uid), client=BoomClient(), filter_client=BoomClient())
     # --retry-failed clears markers so they re-score.
@@ -516,6 +567,130 @@ def test_fetch_eightfold_descriptions_caps_and_dedups(monkeypatch):
     assert set(seen) == {"u1", "u2", "u3none"}
     assert out == {"u1": "desc u1", "u2": "desc u2"}  # u3none contributes nothing
     assert scraper.fetch_eightfold_descriptions(urls, cap=0) == {}  # disabled
+
+
+def test_eightfold_falls_back_to_smartapply_on_pcsx_403(monkeypatch):
+    """Eightfold tenants serve PCSX *or* SmartApply and 403 the other. PCSX is tried
+    first; on a 403 the adapter switches to SmartApply (Netflix) and maps its differing
+    field names (canonicalPositionUrl, t_create/t_update)."""
+    import time
+    from app.services import scraper
+
+    recent = int(time.time()) - 3600  # within the age cutoff so paging continues
+    calls: list[str] = []
+
+    def fake_json(url: str) -> dict:
+        calls.append(url)
+        if "pcsx" in url:
+            raise scraper._EightfoldFlavourUnavailable()
+        if "start=0" in url:
+            return {"positions": [{
+                "id": 790, "name": "AI Engineer",
+                "locations": ["USA - Remote"], "department": "Data",
+                "work_location_option": "remote",
+                "canonicalPositionUrl": "https://explore.jobs.netflix.net/careers/job/790",
+                "t_create": recent,
+            }]}
+        return {"positions": []}  # next page empty -> whole board seen
+
+    monkeypatch.setattr(scraper, "_eightfold_json", fake_json)
+    out, coverage = scraper._eightfold_paged(
+        "https://explore.jobs.netflix.net/careers", "netflix.com", max_pages=3)
+
+    assert any("pcsx" in u for u in calls) and any("apply/v2/jobs" in u for u in calls)
+    assert coverage == "full"  # reached an empty page within the cap
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "790" and p.title == "AI Engineer"
+    assert p.location == "USA - Remote" and p.department == "Data"
+    assert p.url == "https://explore.jobs.netflix.net/careers/job/790"
+    assert p.posted_at is not None  # t_create parsed (epoch seconds)
+
+
+def test_amazon_scrape_parses_json_and_pages_newest_first(monkeypatch):
+    """amazon.jobs has no third-party ATS; the adapter pages /en/search.json by offset,
+    keys on the stable id_icims, and folds the inline description + qualifications in."""
+    from app.services import scraper
+
+    def fake_json(url: str) -> dict:
+        if "offset=0" in url:
+            return {"jobs": [{
+                "id_icims": "111", "id": "uuid-churns", "title": " SDE II ",
+                "location": "Seattle, WA", "job_category": "Software Development",
+                "job_schedule_type": "Full-Time", "job_path": "/en/jobs/111/sde-ii",
+                "description": "<p>Build <b>things</b></p>",
+                "basic_qualifications": "<p>CS degree</p>",
+                "posted_date": "June 18, 2026",
+            }]}
+        return {"jobs": []}  # next page empty -> stop
+
+    monkeypatch.setattr(scraper, "_fetch_json", fake_json)
+    out = scraper.scrape_amazon(max_pages=5)
+
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "111"  # id_icims, not the churning UUID
+    assert p.title == "SDE II"
+    assert p.url == "https://www.amazon.jobs/en/jobs/111/sde-ii"
+    assert p.department == "Software Development"
+    assert p.description and "things" in p.description and "CS degree" in p.description
+    assert p.posted_at and p.posted_at.year == 2026 and p.posted_at.month == 6
+
+
+def test_apple_scrape_uses_csrf_then_pages(monkeypatch):
+    """Apple's search needs a CSRF token (fetched once) then pages the POST search,
+    parsing the inline jobSummary as the description and building the details URL."""
+    from app.services import scraper
+
+    monkeypatch.setattr(scraper, "_apple_csrf_token", lambda client: "tok")
+
+    def fake_page(client, token, page):
+        assert token == "tok"
+        if page == 0:
+            return {"searchResults": [{
+                "positionId": "200", "postingTitle": "Machine Learning Engineer",
+                "transformedPostingTitle": "machine-learning-engineer",
+                "locations": [{"name": "Cupertino"}, {"city": "Austin"}],
+                "team": {"teamName": "Hardware"},
+                "jobSummary": "Do <b>great</b> work",
+                "postDateInGMT": "2026-06-18T04:51:53.395483689Z",
+            }]}
+        return {"searchResults": []}  # next page empty -> stop
+
+    monkeypatch.setattr(scraper, "_apple_search_page", fake_page)
+    out = scraper.scrape_apple(max_pages=3)
+
+    assert len(out) == 1
+    p = out[0]
+    assert p.external_id == "200"
+    assert p.title == "Machine Learning Engineer"
+    assert p.url == "https://jobs.apple.com/en-us/details/200/machine-learning-engineer"
+    assert p.location == "Cupertino; Austin"
+    assert p.department == "Hardware"
+    assert p.description == "Do great work"
+    assert p.posted_at and p.posted_at.year == 2026  # nanosecond ISO parses on 3.11
+
+
+def test_new_company_presets_registered_and_dispatchable():
+    """The five new presets use ats_types the scraper actually dispatches on, and the
+    account gating matches each board (Amazon's portal needs a sign-in; Apple's does
+    not gate browsing)."""
+    from app.company_presets import PRESETS_BY_KEY
+
+    supported = {"greenhouse", "lever", "ashby", "eightfold", "google",
+                 "amazon", "apple", "html", "auto"}
+    expected = {
+        "airbnb": "greenhouse", "databricks": "greenhouse",
+        "netflix": "eightfold", "amazon": "amazon", "apple": "apple",
+    }
+    for key, ats in expected.items():
+        p = PRESETS_BY_KEY[key]
+        assert p.ats_type == ats and p.ats_type in supported
+    assert PRESETS_BY_KEY["airbnb"].ats_token == "airbnb"
+    assert PRESETS_BY_KEY["databricks"].ats_token == "databricks"
+    assert PRESETS_BY_KEY["netflix"].ats_token == "netflix.com"
+    assert PRESETS_BY_KEY["amazon"].requires_account is True
+    assert PRESETS_BY_KEY["apple"].requires_account is False
 
 
 def test_eightfold_upsert_enriches_new_and_backfills_existing(monkeypatch):
@@ -1031,32 +1206,42 @@ def test_report_min_results_backfills_below_threshold():
         assert len(backfilled) == 1 and backfilled[0]["below_threshold"] is True
 
 
-def test_editing_interest_clears_its_matches():
-    """Editing matching criteria drops the interest's matches (so the next run
-    re-evaluates); editing a non-scoring field (label) keeps them."""
+def test_editing_interest_clears_matches_and_rekicks_scoring(monkeypatch):
+    """Editing matching criteria drops the interest's matches AND kicks a
+    re-evaluation immediately, so every posting is re-screened against the new
+    filters (newly-eligible roles gain a score, newly-ineligible ones flip to "not a
+    match") without waiting for the next manual scan. Editing a non-scoring field
+    (label) does neither."""
+    kicked: list[int] = []
+    monkeypatch.setattr(
+        "app.routers.interests.evaluator.ensure_running", lambda uid: kicked.append(uid)
+    )
     with TestClient(app) as c:
         h = {"Authorization": f"Bearer {_register(c, 'ie@x.com').json()['access_token']}"}
         iid = c.post("/api/interests", json={"label": "BE", "title_keywords": "backend"},
                      headers=h).json()["id"]
         with session_scope() as db:
             user = db.scalar(matcher.select(models.User).where(models.User.email == "ie@x.com"))
-            company = models.Company(user_id=user.id, name="Acme")
+            uid = user.id
+            company = models.Company(user_id=uid, name="Acme")
             db.add(company)
             db.flush()
             pos = models.Position(company_id=company.id, external_id="1",
                                   title="Backend Engineer", description="x")
             db.add(pos)
             db.flush()
-            db.add(models.MatchResult(user_id=user.id, position_id=pos.id, interest_id=iid,
+            db.add(models.MatchResult(user_id=uid, position_id=pos.id, interest_id=iid,
                                       match_score=80, passed_filter=True, model="m"))
 
         c.patch(f"/api/interests/{iid}", json={"label": "BE renamed"}, headers=h)
         with session_scope() as db:
             assert db.scalar(matcher.select(models.MatchResult)) is not None  # label-only: kept
+        assert kicked == []  # label-only change: no re-evaluation kicked
 
         c.patch(f"/api/interests/{iid}", json={"title_keywords": "platform"}, headers=h)
         with session_scope() as db:
             assert db.scalar(matcher.select(models.MatchResult)) is None  # criteria change: cleared
+        assert kicked == [uid]  # criteria change: re-evaluation kicked for this user
 
 
 def test_reporter_threshold_filters_low_scores():
@@ -1481,6 +1666,95 @@ def test_build_job_list_filters_by_company():
         assert none_total == 0
 
 
+def _seed_preset_subscription_match(db, uid, *, key="nvidia", name="NVIDIA"):
+    """Add a global preset company, subscribe the user, and score one passing match
+    against its shared position. Returns (company_id, position_id)."""
+    interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+    rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+    company = models.Company(preset_key=key, user_id=None, name=name,
+                             ats_type="eightfold", ats_token=f"{key}.com")
+    db.add(company); db.flush()
+    db.add(models.Subscription(user_id=uid, company_id=company.id))
+    pos = models.Position(company_id=company.id, external_id="nv1", title="GPU Engineer",
+                          description="CUDA")
+    db.add(pos); db.flush()
+    db.add(models.MatchResult(
+        user_id=uid, position_id=pos.id, resume_id=rid, interest_id=interest.id,
+        passed_filter=True, match_score=90, win_probability=85, reasoning="r", model="good"))
+    db.flush()
+    return company.id, pos.id
+
+
+def test_unfollowing_preset_drops_its_jobs_from_lists():
+    """Unfollowing a preset deletes only the Subscription; its shared positions and the
+    user's MatchResults persist (other followers still use them). The job list, report,
+    and detail/visibility gates must stop surfacing them — regression: NVIDIA jobs kept
+    showing after unfollow."""
+    with session_scope() as db:
+        uid = _seed_user(db)  # also seeds a custom "Acme" company + a position
+        interest = db.scalar(matcher.select(models.Interest).where(models.Interest.user_id == uid))
+        rid = db.scalar(matcher.select(models.Resume.id).where(models.Resume.user_id == uid))
+        acme_pos = db.scalar(matcher.select(models.Position))  # the custom company's position
+        acme_pid = acme_pos.id
+        db.add(models.MatchResult(
+            user_id=uid, position_id=acme_pid, resume_id=rid, interest_id=interest.id,
+            passed_filter=True, match_score=88, win_probability=80, reasoning="r", model="good"))
+        nv_cid, nv_pid = _seed_preset_subscription_match(db, uid)
+
+    with session_scope() as db:  # while subscribed: both companies show
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 2 and {m["company"] for m in items} == {"Acme", "NVIDIA"}
+        assert reporter.position_visible(db, user, nv_pid) is True
+
+    with session_scope() as db:  # unfollow NVIDIA (API path: delete the subscription)
+        sub = db.scalar(matcher.select(models.Subscription).where(
+            models.Subscription.user_id == uid, models.Subscription.company_id == nv_cid))
+        db.delete(sub)
+
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 1 and {m["company"] for m in items} == {"Acme"}  # NVIDIA gone
+        assert "NVIDIA" not in {m["company"] for m in reporter.build_report(db, user, min_results=10)}
+        assert reporter.position_visible(db, user, nv_pid) is False
+        assert reporter.build_position_detail(db, user, nv_pid) is None
+        # The user's own custom-company match is untouched.
+        assert reporter.position_visible(db, user, acme_pid) is True
+
+
+def test_applied_job_survives_unfollow():
+    """A job the user already applied to stays on the list after they unfollow its
+    company (mirrors the removed-but-applied exception) so the application isn't lost."""
+    with session_scope() as db:
+        uid = _seed_user(db)
+        nv_cid, nv_pid = _seed_preset_subscription_match(db, uid)
+        db.add(models.Application(user_id=uid, position_id=nv_pid))
+    with session_scope() as db:
+        sub = db.scalar(matcher.select(models.Subscription).where(
+            models.Subscription.user_id == uid, models.Subscription.company_id == nv_cid))
+        db.delete(sub)
+    with session_scope() as db:
+        user = db.get(models.User, uid)
+        items, total = reporter.build_job_list(db, user, category="matching", limit=50)
+        assert total == 1 and items[0]["company"] == "NVIDIA" and items[0]["applied"] is True
+        assert reporter.position_visible(db, user, nv_pid) is True
+
+
+def test_incomplete_batch_warning_is_not_a_provider_failure():
+    """An incomplete/invalid-batch warning (a content issue, retried per-pair) must NOT
+    raise the red 'check your provider key' banner; real provider failures still do."""
+    assert reporter.is_llm_failure(
+        "Scoring failed for 9 posting(s): model returned an incomplete batch result") is False
+    assert reporter.is_llm_failure(
+        "Scoring failed: model returned an invalid batch result") is False
+    assert reporter.llm_failed(
+        ["Scoring failed for 2 posting(s): model returned an incomplete batch result"]) is False
+    # Genuine provider/auth/quota failures still trip the banner.
+    assert reporter.is_llm_failure("Scoring failed: Could not reach Ollama at https://x") is True
+    assert reporter.is_llm_failure("Ollama budget/quota appears to be exhausted") is True
+
+
 def test_job_list_endpoint_filters_by_company(monkeypatch):
     from app.auth import create_access_token
     from app.services import evaluator
@@ -1625,10 +1899,12 @@ def test_applied_status_is_per_user(monkeypatch):
     monkeypatch.setattr(evaluator, "ensure_running", lambda uid: None)
     with session_scope() as db:
         uid_a = _seed_user(db, email="a@x.com")
-        _seed_match_mix(db, uid_a)
-        pid = _first_matched_position_id(db, uid_a)
         uid_b = _seed_user(db, email="b@x.com")
-        _add_match(db, uid_b, pid)  # B is matched on the SAME position
+        # Two users legitimately share a position only via a preset they both follow
+        # (custom companies are per-user). Subscribe both and match both on it.
+        cid, pid = _seed_preset_subscription_match(db, uid_a)
+        db.add(models.Subscription(user_id=uid_b, company_id=cid))
+        _add_match(db, uid_b, pid)  # B is matched on the SAME shared position
     ha = {"Authorization": f"Bearer {create_access_token(uid_a)}"}
     hb = {"Authorization": f"Bearer {create_access_token(uid_b)}"}
     with TestClient(app) as c:

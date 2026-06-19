@@ -19,8 +19,10 @@ import secrets
 
 from fastapi import APIRouter, Header, HTTPException, status
 
+from ..config import settings
+from ..db import session_scope
 from ..logging_config import get_logger
-from ..services import matcher
+from ..services import dispatch, evaluator, matcher, scoring_queue
 
 router = APIRouter(prefix="/api/cron", tags=["cron"])
 
@@ -53,13 +55,58 @@ def run_daily(authorization: str | None = Header(default=None)) -> dict:
     summaries = matcher.scrape_for_all_users()
     new = sum(s.new_positions for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
+    # Publish the freshly-scraped work: enqueue every user with a backlog, then kick a
+    # scoring drain. Scrape and scoring stay separate jobs — this only marks work ready
+    # and fires the trigger; the consumer does the expensive matching.
+    with session_scope() as db:
+        enqueued = scoring_queue.reconcile(db)
+    if enqueued:
+        dispatch.dispatch_scoring_run()
     log.info(
-        "cron run-daily done: %d users, %d new positions, %d warnings",
-        len(summaries), new, len(errors),
+        "cron run-daily done: %d users, %d new positions, %d warnings, %d enqueued",
+        len(summaries), new, len(errors), enqueued,
     )
     return {
         "status": "ok",
         "users": len(summaries),
         "new_positions": new,
+        "enqueued": enqueued,
         "warnings": errors,
+    }
+
+
+@router.post("/run-scoring")
+def run_scoring(authorization: str | None = Header(default=None)) -> dict:
+    """Drain the scoring queue: reconcile (enqueue users with a backlog, reclaim stale
+    rows), then run the bounded worker pool to the per-run budget. This is the consumer
+    the dispatch trigger calls — in production the trigger goes to GitHub Actions
+    (``jobscout run-scoring``) because a big drain exceeds a serverless time limit, but
+    this endpoint makes the loop runnable/testable locally: point
+    ``JOBSCOUT_SCORING_DISPATCH_URL`` at it (token = ``CRON_SECRET``). If the budget
+    leaves work behind, it re-fires the trigger so the queue keeps draining."""
+    _require_cron(authorization)
+    log.info("cron run-scoring starting")
+    with session_scope() as db:
+        enqueued = scoring_queue.reconcile(db)
+    summary = evaluator.drain_queue(
+        max_workers=settings.scoring_max_concurrency,
+        budget_seconds=settings.scoring_run_budget_seconds,
+    )
+    with session_scope() as db:
+        states = scoring_queue.counts_by_state(db)
+        more = scoring_queue.has_pending(db)
+    if more:
+        dispatch.dispatch_scoring_run()  # budget left work behind — continue the drain
+    log.info(
+        "cron run-scoring done: enqueued %d, drained %d user(s), scored %d, more=%s",
+        enqueued, summary.users, summary.scored, more,
+    )
+    return {
+        "status": "ok",
+        "enqueued": enqueued,
+        "users": summary.users,
+        "scored": summary.scored,
+        "failed": summary.failed,
+        "queue": states,
+        "more_pending": more,
     }

@@ -3,58 +3,106 @@
 {% block body %}
 <style>
   :root {
-    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
-    --muted:#68746e; --line:#d8e0dc; --sidebar:#10221d; --sidebar-ink:#f6fbf8;
-    --accent:#0f766e; --accent-ink:#f5fffd; --amber:#b76b00; --danger:#b42318;
-    --good:#157347;
+    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1;
+    --surface-raised:#fbfdfc; --ink:#17211d; --muted:#68746e;
+    --line:#d8e0dc; --line-strong:#b9c8c1; --sidebar:#10221d;
+    --sidebar-ink:#f6fbf8; --accent:#0f766e; --accent-ink:#f5fffd;
+    --action:#0f766e; --action-ink:#f5fffd; --amber:#b76b00;
+    --danger:#b42318; --good:#147343;
+    --shadow:0 14px 34px rgba(16, 34, 29, .08);
   }
   body { background:var(--page); color:var(--ink); }
   a { color:var(--accent); }
   header { display:none; }
-  button { background:var(--accent); color:var(--accent-ink); border-radius:8px; }
+  button {
+    background:var(--action); color:var(--action-ink); border-radius:8px;
+    min-height:38px; padding:8px 14px;
+  }
   button:disabled { opacity:.55; cursor:not-allowed; }
   button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button.ghost:hover:not(:disabled) { border-color:var(--line-strong); background:#f5f7f6; }
   input, textarea, select {
     background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
+  }
+  input:focus, textarea:focus, select:focus, button:focus-visible {
+    outline:2px solid rgba(15, 118, 110, .28); outline-offset:2px;
   }
   label { color:var(--muted); }
   main.dashboard {
     max-width:none; min-height:100vh; margin:0; padding:0;
-    display:grid; grid-template-columns:280px minmax(0, 1fr);
+    display:grid; grid-template-columns:264px minmax(0, 1fr);
   }
   .sidebar {
     background:var(--sidebar); color:var(--sidebar-ink);
+    border-right:1px solid #18342d;
     height:100vh; position:sticky; top:0; align-self:start; overflow-y:auto;
-    padding:22px 18px; display:flex; flex-direction:column; gap:22px;
+    padding:22px 16px; display:flex; flex-direction:column; gap:22px;
   }
-  .sidebar-top { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
-  .brand-mark { font-size:22px; font-weight:800; letter-spacing:.01em; }
+  .sidebar-top {
+    display:flex; align-items:flex-start; justify-content:space-between; gap:14px;
+    padding:0 4px 18px; border-bottom:1px solid #24443c;
+  }
+  .brand-mark { font-size:22px; font-weight:800; letter-spacing:0; }
   .account { color:#b9c8c1; font-size:13px; word-break:break-word; }
-  .nav-stack { display:grid; gap:6px; }
+  .nav-stack { display:grid; gap:18px; }
+  .nav-section { display:grid; gap:6px; }
+  .nav-section-title {
+    color:#8fb0a4; font-size:11px; font-weight:750; text-transform:uppercase;
+    letter-spacing:.08em; padding:0 10px 2px;
+  }
+  .nav-section-toggle {
+    width:100%; min-height:28px; padding:0 10px 2px; border:0; border-radius:6px;
+    background:transparent; color:#8fb0a4; display:flex; align-items:center;
+    justify-content:space-between; font-size:11px; font-weight:750;
+    text-transform:uppercase; letter-spacing:.08em;
+  }
+  .nav-section-toggle:hover { background:#18342d; color:#cde0d8; }
+  .nav-section-toggle::after {
+    content:""; width:7px; height:7px; border-right:2px solid currentColor;
+    border-bottom:2px solid currentColor; transform:rotate(45deg); margin-left:8px;
+    transition:transform .15s ease;
+  }
+  .nav-section.collapsed .nav-section-toggle::after { transform:rotate(-45deg); }
+  .nav-section-body { display:grid; gap:6px; }
+  .nav-section.collapsed .nav-section-body { display:none; }
   .nav-button {
-    width:100%; text-align:left; background:transparent; color:#dce8e3;
-    border:1px solid transparent; padding:10px 11px; font-weight:650;
+    position:relative; width:100%; text-align:left; background:transparent;
+    color:#dce8e3; border:1px solid transparent;
+    padding:9px 10px 9px 14px; font-weight:650; min-height:38px;
   }
   .nav-button:hover, .nav-button[aria-current="page"] {
     background:#1d3932; border-color:#2a5148; color:#ffffff;
   }
-  button.logout { margin-top:auto; color:#f7fbf9; border-color:#31554d; }
-  .workspace { padding:26px clamp(18px, 3vw, 42px); min-width:0; }
-  .view-header {
-    display:flex; align-items:flex-start; justify-content:space-between; gap:18px;
-    border-bottom:1px solid var(--line); padding-bottom:18px; margin-bottom:18px;
+  .nav-button[aria-current="page"]::before {
+    content:""; position:absolute; left:5px; top:9px; bottom:9px; width:3px;
+    border-radius:999px; background:var(--accent);
   }
-  h1 { margin:0; font-size:24px; line-height:1.2; }
-  h2 { margin:0 0 12px; font-size:17px; }
+  button.logout {
+    margin-top:auto; color:#f7fbf9; border-color:#31554d; width:100%;
+  }
+  .sidebar button.ghost:hover:not(:disabled) { background:#1d3932; border-color:#2a5148; }
+  .workspace { padding:28px clamp(18px, 3vw, 42px); min-width:0; }
+  .view-header {
+    max-width:1180px; margin:0 auto 20px;
+    display:flex; align-items:flex-start; justify-content:space-between; gap:18px;
+    border-bottom:1px solid var(--line); padding-bottom:18px;
+  }
+  h1 { margin:0; font-size:27px; line-height:1.18; letter-spacing:0; }
+  h2 { margin:0 0 12px; font-size:17px; line-height:1.3; letter-spacing:0; }
   .muted { color:var(--muted); font-size:13px; }
-  .panel { display:none; }
+  .panel { display:none; max-width:1180px; margin:0 auto; }
   .panel.active { display:block; }
   .surface {
     background:var(--surface); border:1px solid var(--line); border-radius:8px;
-    padding:18px; margin-bottom:16px;
+    padding:18px; margin-bottom:16px; box-shadow:var(--shadow);
   }
   .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
   .toolbar .grow { flex:1 1 220px; }
+  /* Keep the run button pinned to the top-right; let its long status line ("…
+     evaluating N in the background…") stack underneath instead of widening the
+     row and pushing the button leftward. */
+  #primaryActions { flex-direction:column; flex-wrap:nowrap; align-items:flex-end; gap:6px; }
+  #runStatus { text-align:right; }
   /* Inline "label + select" group, so toolbar/filter/pager controls share one
      baseline instead of stacking unevenly. */
   .control { display:flex; align-items:center; gap:8px; }
@@ -91,6 +139,10 @@
   .segmented .seg:hover:not(.active) { color:var(--accent); }
   .segmented .seg.active { background:var(--accent); color:var(--accent-ink); cursor:default; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .inline-editor {
+    background:var(--surface-raised); border:1px solid var(--line);
+    border-radius:8px; padding:12px; margin-bottom:12px;
+  }
   .list-item, .job-row {
     border-top:1px solid var(--line); padding:14px 0;
   }
@@ -116,6 +168,9 @@
   .pill {
     display:inline-flex; align-items:center; min-height:22px; padding:2px 8px;
     border-radius:999px; font-size:12px; background:#eef7f5; color:var(--accent);
+    /* A chip is a single label — never let a long job title/location next to it in
+       .job-head squeeze it into wrapping (e.g. "not a match" over two lines). */
+    white-space:nowrap; flex-shrink:0;
   }
   .pill.warn { background:#fff4df; color:var(--amber); }
   /* Always-visible info badge (e.g. next to a section heading); hover/focus for
@@ -129,7 +184,7 @@
   .info-dot:focus { outline:2px solid var(--accent); outline-offset:2px; }
   .empty {
     border:1px dashed var(--line); border-radius:8px; padding:20px; color:var(--muted);
-    background:#fbfdfc;
+    background:var(--surface-raised);
   }
   .warning-box {
     border:1px solid #f0cf9b; background:#fff8eb; color:#6b4300;
@@ -147,14 +202,18 @@
   @media (max-width: 860px) {
     main.dashboard { grid-template-columns:1fr; }
     .sidebar { height:auto; min-height:auto; position:static; }
-    .nav-stack { grid-template-columns:1fr 1fr; }
+    .nav-section { grid-template-columns:1fr 1fr; }
+    .nav-section-title { grid-column:1 / -1; padding-top:4px; }
+    .nav-section-toggle, .nav-section-body { grid-column:1 / -1; }
     button.logout { margin-top:0; }
     .view-header, .job-head { display:grid; }
     .row { grid-template-columns:1fr; }
   }
   @media (max-width: 520px) {
-    .nav-stack { grid-template-columns:1fr; }
+    .nav-section { grid-template-columns:1fr; }
     .workspace { padding:18px 14px; }
+    .segmented { width:100%; }
+    .segmented .seg { flex:1; padding-inline:8px; }
   }
 </style>
 
@@ -167,13 +226,29 @@
       </div>
     </div>
     <nav class="nav-stack" aria-label="Dashboard">
-      <button class="nav-button" data-view="jobs" onclick="showView('jobs')">Job lists</button>
-      <button class="nav-button" data-view="resume" onclick="showView('resume')">Check/update resume</button>
-      <button class="nav-button" data-view="profile" onclick="showView('profile')">Application profile</button>
-      <button class="nav-button" data-view="companies" onclick="showView('companies')">Company watchlist management</button>
-      <button class="nav-button" data-view="interests" onclick="showView('interests')">Interest management</button>
-      <button class="nav-button" data-view="llm" onclick="showView('llm')">LLM provider</button>
-      <button class="nav-button" data-view="telegram" onclick="showView('telegram')">Telegram settings</button>
+      <div class="nav-section">
+        <div class="nav-section-title">Workspace</div>
+        <button class="nav-button" data-view="jobs" onclick="showView('jobs')">Job lists</button>
+      </div>
+      <div class="nav-section collapsed" data-nav-section="application">
+        <button class="nav-section-toggle" type="button" aria-expanded="false"
+                onclick="toggleNavSection('application')">Application settings</button>
+        <div class="nav-section-body">
+          <button class="nav-button" data-view="resume" onclick="showView('resume')">Resume</button>
+          <button class="nav-button" data-view="profile" onclick="showView('profile')">Profile</button>
+          <button class="nav-button" data-view="companies" onclick="showView('companies')">Companies</button>
+          <button class="nav-button" data-view="interests" onclick="showView('interests')">Interests</button>
+        </div>
+      </div>
+      <div class="nav-section collapsed" data-nav-section="system">
+        <button class="nav-section-toggle" type="button" aria-expanded="false"
+                onclick="toggleNavSection('system')">System settings</button>
+        <div class="nav-section-body">
+          <button class="nav-button" data-view="llm" onclick="showView('llm')">LLM provider</button>
+          <button class="nav-button" data-view="telegram" onclick="showView('telegram')">Telegram</button>
+          <button class="nav-button" data-view="account" onclick="showView('account')">Account</button>
+        </div>
+      </div>
     </nav>
     <button class="ghost logout" onclick="logout()">Log out</button>
   </aside>
@@ -464,7 +539,7 @@
 
     <section id="view-companies" class="panel">
       <div class="surface">
-        <h2>Company watchlist management
+        <h2>Companies
           <span class="info-dot" tabindex="0" role="img" aria-label="company not in preset list doesn't support auto apply"
                 title="company not in preset list doesn't support auto apply">i</span></h2>
         <div class="row">
@@ -502,7 +577,7 @@
 
     <section id="view-interests" class="panel">
       <div class="surface">
-        <h2>Interest management</h2>
+        <h2>Interests</h2>
         <div class="row">
           <div><label for="iLabel">Label</label><input id="iLabel" placeholder="Senior Backend (EU remote)" /></div>
           <div><label for="iMin">Minimum score</label><input id="iMin" type="number" value="70" /></div>
@@ -565,7 +640,7 @@
 
     <section id="view-telegram" class="panel">
       <div class="surface">
-        <h2>Telegram settings</h2>
+        <h2>Telegram</h2>
         <p class="muted">Get your daily ranked report in Telegram. Create a bot with
           <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>,
           paste its token below and Save, then DM your bot to link the chat reports go to.</p>
@@ -583,6 +658,30 @@
         </div>
       </div>
     </section>
+
+    <section id="view-account" class="panel">
+      <div class="surface">
+        <h2>Account</h2>
+        <p class="muted">Change the password you use to log in. Use at least 8 characters,
+          including a letter and a number.</p>
+        <div>
+          <label for="curPass">Current password</label>
+          <input id="curPass" type="password" autocomplete="current-password" />
+        </div>
+        <div>
+          <label for="newPass">New password</label>
+          <input id="newPass" type="password" autocomplete="new-password" />
+        </div>
+        <div>
+          <label for="newPass2">Confirm new password</label>
+          <input id="newPass2" type="password" autocomplete="new-password" />
+        </div>
+        <div class="toolbar" style="margin-top:12px;">
+          <button onclick="changePassword()">Change password</button>
+          <span id="pwStatus" class="muted"></span>
+        </div>
+      </div>
+    </section>
   </section>
 </main>
 
@@ -590,14 +689,18 @@
 const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts});
 const esc = s => (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const val = id => document.getElementById(id).value.trim();
+// FastAPI sends `detail` as a string for raised HTTPExceptions but an array of
+// {loc, msg, ...} for 422 validation errors — flatten both for a clean message.
+const detailText = d => Array.isArray(d) ? d.map(e => e.msg).filter(Boolean).join("; ") : (d || "");
 const viewCopy = {
   jobs: ["Job lists", "Latest ranked positions from your scans"],
-  resume: ["Check/update resume", "Current resume used for matching"],
-  profile: ["Application profile", "Key info reused to autofill job applications"],
-  companies: ["Company watchlist management", "Career sites included in each scan"],
-  interests: ["Interest management", "Role preferences and scoring thresholds"],
+  resume: ["Resume", "Current resume used for matching"],
+  profile: ["Profile", "Reusable application details"],
+  companies: ["Companies", "Career sites included in each scan"],
+  interests: ["Interests", "Role preferences and scoring thresholds"],
   llm: ["LLM provider", "Model provider, API key, and models used for scoring"],
-  telegram: ["Telegram settings", "Daily report delivery"]
+  telegram: ["Telegram", "Daily report delivery"],
+  account: ["Account", "Change your login password"]
 };
 // Job-list view: a segmented switch between top 5 matching / all matching / all
 // jobs (incl. non-matching), with server-side pagination for the two "all" modes.
@@ -618,8 +721,27 @@ let watchedNames = new Set();
 let interestsById = {};
 let editingInterestId = null;
 
+function toggleNavSection(name, forceOpen=false){
+  const section = document.querySelector(`[data-nav-section="${name}"]`);
+  if(!section){ return; }
+  const collapsed = forceOpen ? false : !section.classList.contains("collapsed");
+  section.classList.toggle("collapsed", collapsed);
+  const toggle = section.querySelector(".nav-section-toggle");
+  if(toggle){ toggle.setAttribute("aria-expanded", collapsed ? "false" : "true"); }
+}
+
+function ensureNavSectionForView(view){
+  if(["resume", "profile", "companies", "interests"].includes(view)){
+    toggleNavSection("application", true);
+  }
+  if(["llm", "telegram", "account"].includes(view)){
+    toggleNavSection("system", true);
+  }
+}
+
 function showView(view){
   const active = viewCopy[view] ? view : "jobs";
+  ensureNavSectionForView(active);
   document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
   document.getElementById(`view-${active}`).classList.add("active");
   document.querySelectorAll(".nav-button").forEach(b => {
@@ -650,6 +772,27 @@ function fmtListed(value){
 }
 
 async function logout(){ await api("/api/auth/logout",{method:"POST"}); window.location="/login"; }
+
+// ── Account (change password) ──
+async function changePassword(){
+  const s = document.getElementById("pwStatus");
+  const cur = document.getElementById("curPass").value;
+  const np = document.getElementById("newPass").value;
+  const np2 = document.getElementById("newPass2").value;
+  if(!cur || !np){ s.textContent = "Fill in your current and new password."; return; }
+  if(np !== np2){ s.textContent = "New passwords don't match."; return; }
+  s.textContent = "Saving…";
+  const r = await api("/api/auth/change-password", {
+    method:"POST", body: JSON.stringify({current_password: cur, new_password: np}),
+  });
+  if(!r.ok){
+    const d = await r.json().catch(()=>({}));
+    s.textContent = detailText(d.detail) || "Could not change password";
+    return;
+  }
+  s.textContent = "Password changed.";
+  ["curPass","newPass","newPass2"].forEach(id => { document.getElementById(id).value = ""; });
+}
 
 // ── Telegram settings (per-user bot token + linked chat) ──
 async function loadTelegramConfig(){
@@ -822,10 +965,11 @@ function updateScanGate(hasResume){
 }
 
 // The daily cron only scrapes; scoring happens here. So once the user already has
-// a saved (scored) list, the button is really "score again", not a first scan.
+// a saved (scored) list, the button is really "score again" — "Recalculate" reads
+// clearer than "Refresh" (esp. when the list is blank after a watch-list change).
 function updateRunButtonLabel(hasSavedList){
   document.getElementById("runBtn").textContent =
-    hasSavedList ? "Refresh matching scores" : "Run scan now";
+    hasSavedList ? "Recalculate matching scores" : "Run scan now";
 }
 
 async function delResume(id){
@@ -1176,6 +1320,18 @@ function renderPager(total){
   document.getElementById("nextPage").disabled = current >= totalPages;
 }
 
+// What to show when the list is empty — a bare "nothing here" is confusing right
+// after a watch-list change (the live list only shows *scored* matches, and a newly
+// added company has none yet). Point the user at the button instead.
+function jobListEmptyMessage(){
+  if(selectedSnapshotId !== null){ return "This saved list has no positions."; }
+  if(minScore > 0 || minWin > 0 || postedWithin > 0 || companyFilter){
+    return "No jobs match the current filters — try relaxing them.";
+  }
+  const action = document.getElementById("runBtn").textContent.trim();
+  return `No scored matches yet — click “${action}” to score your current watch-list.`;
+}
+
 function renderJobList(data){
   renderPager(data.total || 0);
   const countLabel = jobViewMode === "all" ? "jobs listed" : "matches listed";
@@ -1225,7 +1381,7 @@ function renderJobList(data){
         ${kitIcon(m.kit_status)}
       </div>
     </article>`;
-  }).join("") || '<div class="empty">No positions in this list yet.</div>';
+  }).join("") || `<div class="empty">${esc(jobListEmptyMessage())}</div>`;
   maybePollKits(data.items);
 }
 
@@ -1311,7 +1467,7 @@ function dateField(label, base, value, disabled){
 
 function eduRowHtml(e){
   e = e || {};
-  return `<div class="edu-row surface" style="padding:12px; margin-bottom:12px;">
+  return `<div class="edu-row inline-editor">
     <div class="row">${fieldRow("School", "school", e.school)}${fieldRow("Degree", "degree", e.degree)}</div>
     <div class="row">${fieldRow("Field of study", "field_of_study", e.field_of_study)}${fieldRow("GPA", "gpa", e.gpa)}</div>
     <div class="row">${dateField("Start", "start", e.start_date)}${dateField("End", "end", e.end_date)}</div>
@@ -1323,7 +1479,7 @@ function eduRowHtml(e){
 
 function expRowHtml(x){
   x = x || {};
-  return `<div class="exp-row surface" style="padding:12px; margin-bottom:12px;">
+  return `<div class="exp-row inline-editor">
     <div class="row">${fieldRow("Company", "company", x.company)}${fieldRow("Title", "title", x.title)}</div>
     <div class="row">${fieldRow("Location", "location", x.location)}
       <div><label>&nbsp;</label><label class="flex" style="color:var(--ink);">

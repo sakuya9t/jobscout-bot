@@ -14,6 +14,9 @@ dependencies = [
     "bcrypt>=4.1",
     "PyJWT>=2.8",
     "httpx>=0.27",
+    # TLS-impersonating HTTP client for boards that block plain httpx via TLS/JA3
+    # fingerprinting (e.g. Citadel's Cloudflare-fronted detail pages). See scraper.py.
+    "curl_cffi>=0.7",
     "tenacity>=8.2",
     "beautifulsoup4>=4.12",
     "lxml>=5.2",

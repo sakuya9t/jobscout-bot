@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -53,8 +54,14 @@ FILTER_SYSTEM_PROMPT = (
     "match=true (the detailed scoring step is stricter). Use match=false only for "
     "clearly wrong roles (wrong discipline/seniority, an excluded keyword, or an "
     "impossible location).\n"
+    "For EACH posting also give a short `reason` — one concise phrase (max ~15 words). "
+    "When match=false, name the SPECIFIC reason it was screened out and which "
+    "requirement it misses, e.g. 'Senior role; you want entry-level', 'On-site NYC; "
+    "you want remote', 'Hardware role, outside your software focus'. When match=true, "
+    "give the brief reason it fits. Address the candidate ('you').\n"
     "Respond with ONLY a JSON array — one object per posting, using its number as "
-    '"id": [{"id": 1, "match": true}, {"id": 2, "match": false}]. No prose, no code fences.'
+    '"id": [{"id": 1, "match": true, "reason": "..."}, '
+    '{"id": 2, "match": false, "reason": "..."}]. No prose, no code fences.'
 )
 
 
@@ -122,6 +129,11 @@ class RunResult:
     # Set when scoring stopped because the Ollama budget/quota was exhausted. The
     # background drainer checks this to avoid re-arming against a dead quota.
     budget_exhausted: bool = False
+    # Set when scoring stopped because the per-run wall-clock budget elapsed (a big
+    # backlog that didn't fit one run). Unlike budget_exhausted this re-arms normally:
+    # progress is committed per batch and finalize leaves the queue row ``pending`` so
+    # the next run continues. Prevents the drain being killed mid-run and stranded.
+    time_exhausted: bool = False
     # False when score_to_completion couldn't acquire the score lock (another drain
     # is already working this user), so the caller can skip recording a snapshot.
     did_run: bool = True
@@ -297,30 +309,72 @@ def _flush_match(db: Session, result: MatchResult) -> bool:
         return False
 
 
+def _settled_clause():
+    """WHERE clause: a MatchResult 'settles' its (position, interest) pair — removing
+    it from the backlog — UNLESS it's a still-retryable error-marker. Retryable markers
+    (model == ERROR_MODEL and attempts < score_max_attempts) stay in the backlog so the
+    pair is re-scored on the next run, up to the limit; then the marker is terminal."""
+    return ~(
+        (MatchResult.model == ERROR_MODEL)
+        & (MatchResult.attempts < settings.score_max_attempts)
+    )
+
+
+def _existing_match(db: Session, user, resume, interest, pos) -> MatchResult | None:
+    return db.scalar(select(MatchResult).where(
+        MatchResult.user_id == user.id, MatchResult.position_id == pos.id,
+        MatchResult.resume_id == resume.id, MatchResult.interest_id == interest.id,
+    ))
+
+
+def _upsert_match(db: Session, user, resume, interest, pos, **fields) -> int | None:
+    """Insert a MatchResult for the (user, position, resume, interest) pair, or update
+    the existing row in place — the in-place update is what lets a retry convert an
+    error-marker into a real result (or reject). Returns the row id, or None if a
+    concurrent drain holds the pair on insert (see ``_flush_match``)."""
+    existing = _existing_match(db, user, resume, interest, pos)
+    if existing is not None:
+        for key, value in fields.items():
+            setattr(existing, key, value)
+        db.flush()
+        return existing.id
+    row = MatchResult(
+        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+        **fields,
+    )
+    return row.id if _flush_match(db, row) else None
+
+
 def _persist_error_marker(
     db: Session, user: User, resume: Resume, interest: Interest, pos: Position, message: str
 ) -> None:
-    """Mark a (position, interest) pair as terminally failed so it isn't re-billed
-    until ``clear_failed_markers`` clears it."""
-    _flush_match(db, MatchResult(
-        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+    """Record (or re-record) a failed (position, interest) pair, bumping its retry
+    counter. While ``attempts < settings.score_max_attempts`` the marker is retryable
+    (the pair stays in the backlog and is re-scored next run); at the limit it's
+    terminal and skipped until ``clear_failed_markers`` clears it. This bounds
+    re-billing without permanently dropping a transient first-try failure."""
+    existing = _existing_match(db, user, resume, interest, pos)
+    prior = existing.attempts if (existing is not None and existing.model == ERROR_MODEL) else 0
+    _upsert_match(
+        db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
-        reasoning=message[:1000], model=ERROR_MODEL,
-    ))
+        reasoning=message[:1000], strengths=None, gaps=None,
+        model=ERROR_MODEL, attempts=prior + 1,
+    )
 
 
 def _persist_filter_reject(
     db: Session, user: User, resume: Resume, interest: Interest, pos: Position,
     reason: str, filter_model: str,
 ) -> None:
-    """Record a cheap-filter 'not a match' so it ranks out of the report and the
-    pair lands in the ``already`` set (not re-screened next run)."""
-    _flush_match(db, MatchResult(
-        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+    """Record a cheap-filter 'not a match' so it ranks out of the report and the pair
+    settles (not re-screened next run). Upserts so it can overwrite a retry marker."""
+    _upsert_match(
+        db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=(reason or "Screened out as not a match.")[:1000],
-        strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model,
-    ))
+        strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model, attempts=0,
+    )
 
 
 def _persist_exclude_reject(
@@ -328,12 +382,12 @@ def _persist_exclude_reject(
 ) -> None:
     """Record a keyword-exclusion 'not a match' so the pair leaves the backlog and
     ranks out of the report (passed_filter=False), without spending an LLM call."""
-    _flush_match(db, MatchResult(
-        user_id=user.id, position_id=pos.id, resume_id=resume.id, interest_id=interest.id,
+    _upsert_match(
+        db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning="Dropped by an interest exclude keyword.",
-        strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL,
-    ))
+        strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL, attempts=0,
+    )
 
 
 def _persist_score_result(
@@ -345,24 +399,19 @@ def _persist_score_result(
     verdict: MatchVerdict,
     model: str,
 ) -> int | None:
-    """Persist one scored verdict; returns the new row id, or None if a concurrent
-    drain already scored this pair (see ``_flush_match``)."""
-    result = MatchResult(
-        user_id=user.id,
-        position_id=pos.id,
-        resume_id=resume.id,
-        interest_id=interest.id,
+    """Persist one scored verdict; returns the row id, or None if a concurrent drain
+    already scored this pair. Upserts, so a successful retry converts the pair's error
+    marker into this real result (and resets its retry counter)."""
+    return _upsert_match(
+        db, user, resume, interest, pos,
         passed_filter=verdict.matches_requirements,
         match_score=verdict.match_score,
         win_probability=verdict.win_probability,
         reasoning=verdict.reasoning,
         strengths=json.dumps(verdict.strengths),
         gaps=json.dumps(verdict.gaps),
-        model=model,
+        model=model, attempts=0,
     )
-    if not _flush_match(db, result):
-        return None
-    return result.id
 
 
 def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], list[str]]:
@@ -546,12 +595,18 @@ def _score_batch(
     return match_ids, None
 
 
-def clear_failed_markers(db: Session, user_id: int | None = None) -> int:
+def clear_failed_markers(
+    db: Session, user_id: int | None = None, older_than: datetime | None = None
+) -> int:
     """Delete error-marker MatchResults so failed (position, interest) pairs are
-    re-scored on the next run. Returns the number cleared."""
+    re-scored on the next run. Returns the number cleared. ``user_id`` scopes to one
+    user; ``older_than`` keeps only stale markers (the auto-resolve TTL sweep — see
+    ``scoring_queue.reconcile``), leaving fresh/still-retrying ones in place."""
     stmt = delete(MatchResult).where(MatchResult.model == ERROR_MODEL)
     if user_id is not None:
         stmt = stmt.where(MatchResult.user_id == user_id)
+    if older_than is not None:
+        stmt = stmt.where(MatchResult.created_at < older_than)
     return db.execute(stmt).rowcount or 0
 
 
@@ -650,6 +705,8 @@ def count_pending(db: Session, user: User) -> int:
     if not described_ids:
         return 0
     interest_ids = [i.id for i in interests]
+    # Count only *settled* pairs as filled; a still-retryable error-marker stays in the
+    # backlog (it'll be re-scored), so it must NOT be counted here.
     filled = sum(
         1
         for pid, iid in db.execute(
@@ -657,11 +714,16 @@ def count_pending(db: Session, user: User) -> int:
                 MatchResult.user_id == user.id,
                 MatchResult.resume_id == resume.id,
                 MatchResult.interest_id.in_(interest_ids),
-            )
+            ).where(_settled_clause())
         )
         if pid in described_ids
     )
     return len(described_ids) * len(interest_ids) - filled
+
+
+def _past_deadline(deadline: float | None) -> bool:
+    """True once the run's wall-clock budget (a ``time.monotonic()`` value) is spent."""
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def score_to_completion(
@@ -671,14 +733,20 @@ def score_to_completion(
     *,
     client: OllamaClient | None = None,
     filter_client: OllamaClient | None = None,
+    deadline: float | None = None,
 ) -> RunResult:
-    """Score the user's entire current evaluation backlog, draining it to completion
-    (no per-run cap). Two-stage batched scoring: a cheap model triages relevance,
-    then the good model scores survivors. Guarded by the non-blocking score lock so
-    only one drain runs per user; if another already holds it, returns immediately
-    with ``res.did_run = False``. Stops early and sets ``res.budget_exhausted`` if
-    the Ollama budget runs out — without writing markers, so the backlog re-scores
-    automatically once quota returns."""
+    """Score the user's current evaluation backlog. Two-stage batched scoring: a cheap
+    model triages relevance, then the good model scores survivors. Guarded by the
+    non-blocking score lock so only one drain runs per user; if another already holds
+    it, returns immediately with ``res.did_run = False``.
+
+    Drains to completion by default. ``deadline`` (a ``time.monotonic()`` value) caps
+    the run: when it's reached the drain stops between batches and sets
+    ``res.time_exhausted`` — committed progress is kept and the backlog finishes on the
+    next run. This is what lets the periodic cron split one huge backlog across runs
+    instead of being killed mid-drain (see services/evaluator.drain_queue). Also stops
+    and sets ``res.budget_exhausted`` if the Ollama quota runs out (no markers written,
+    so it re-scores once quota returns)."""
     res = res or RunResult()
     lock = _lock_for(_SCORE_LOCKS, user.id)
     if not lock.acquire(blocking=False):
@@ -686,7 +754,7 @@ def score_to_completion(
         res.did_run = False
         return res
     try:
-        _score_locked(db, user, res, client=client, filter_client=filter_client)
+        _score_locked(db, user, res, client=client, filter_client=filter_client, deadline=deadline)
     finally:
         lock.release()
     return res
@@ -699,6 +767,7 @@ def _score_locked(
     *,
     client: OllamaClient | None = None,
     filter_client: OllamaClient | None = None,
+    deadline: float | None = None,
 ) -> None:
     # Build the scoring + relevance-filter clients from this user's effective LLM
     # config (their provider/key/models, else the global defaults), unless a caller
@@ -724,12 +793,14 @@ def _score_locked(
             )
         ))
     )
+    # Pairs already settled for this resume — skip them. A still-retryable error-marker
+    # is NOT settled, so its pair re-enters the candidate set and is re-scored.
     already = {
         (m.position_id, m.interest_id)
         for m in db.scalars(
             select(MatchResult).where(
                 MatchResult.user_id == user.id, MatchResult.resume_id == resume.id
-            )
+            ).where(_settled_clause())
         )
     }
 
@@ -744,6 +815,9 @@ def _score_locked(
     # shrinks and the drain terminates.
     try:
         for interest in interests:
+            if _past_deadline(deadline):
+                res.time_exhausted = True
+                return
             candidates: list[Position] = []
             for pos in described:
                 if (pos.id, interest.id) in already:
@@ -757,6 +831,11 @@ def _score_locked(
 
             idx = 0
             while idx < len(candidates):
+                # Stop cleanly at the run budget — the previous batch is already
+                # committed, so the remaining backlog finishes on the next run.
+                if _past_deadline(deadline):
+                    res.time_exhausted = True
+                    return
                 batch = candidates[idx : idx + batch_size]
                 idx += len(batch)
 
@@ -801,8 +880,9 @@ def _score_locked(
             f"(Ollama said: {exc})"
         )
 
-    # Explain a "0 scored" outcome instead of leaving it silent.
-    if res.scored == 0 and not res.budget_exhausted:
+    # Explain a "0 scored" outcome instead of leaving it silent (but not when we
+    # stopped early on a budget — there's simply more to do next run).
+    if res.scored == 0 and not res.budget_exhausted and not res.time_exhausted:
         if res.filtered:
             res.add_error(
                 f"The relevance filter judged none of the {res.filtered} evaluated "

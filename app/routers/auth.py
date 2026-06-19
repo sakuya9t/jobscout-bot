@@ -17,7 +17,13 @@ from ..auth import (
 from ..config import settings
 from ..db import get_db
 from ..models import User
-from ..schemas import Credentials, RegisterCredentials, Token, UserOut
+from ..schemas import (
+    Credentials,
+    PasswordChange,
+    RegisterCredentials,
+    Token,
+    UserOut,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -36,6 +42,15 @@ def _rl_register(request: Request) -> None:
     """Throttle signups per IP — also caps invite-code guessing on this route."""
     ratelimit.enforce(
         request, scope="register", limit=settings.rate_limit_register_per_hour, window_s=3600
+    )
+
+
+def _rl_change_password(request: Request) -> None:
+    """Throttle change-password per IP to blunt brute-forcing the current password
+    (an attacker on a stolen session trying to take over the account). Its own scope,
+    so it never eats into a legitimate user's login budget."""
+    ratelimit.enforce(
+        request, scope="change_password", limit=settings.rate_limit_auth_per_minute, window_s=60
     )
 
 
@@ -89,6 +104,27 @@ def login(creds: Credentials, response: Response, db: Session = Depends(get_db))
     token = create_access_token(user.id)
     _set_cookie(response, token)
     return Token(access_token=token)
+
+
+@router.post("/change-password", dependencies=[Depends(_rl_change_password)])
+def change_password(
+    payload: PasswordChange,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Change the logged-in user's password. The current password must be re-supplied
+    and verified (so a stolen-but-idle session can't silently rotate the password),
+    and the new one must differ and meet the registration complexity rule. The session
+    cookie/JWT stays valid — it carries no password, so nothing to re-issue."""
+    if not verify_password(payload.current_password, user.hashed_password):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Current password is incorrect")
+    if verify_password(payload.new_password, user.hashed_password):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "New password must be different from the current one"
+        )
+    user.hashed_password = hash_password(payload.new_password)
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/logout")
