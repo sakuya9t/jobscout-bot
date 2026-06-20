@@ -178,6 +178,17 @@ def resume_pending_on_startup() -> None:
         log.exception("evaluator startup resume failed")
 
 
+def enqueue_pending_and_drain() -> int:
+    """Producer entry point for batch-created backlog (the daily scrape): enqueue every
+    user with a non-empty scoring backlog, then wake the in-process consumer to drain
+    it. Returns the number of users enqueued. Scoring happens in the worker pool, not
+    here — the scrape stays separate from the drain, joined only through the queue."""
+    with session_scope() as db:
+        enqueued = scoring_queue.reconcile(db)
+    ensure_draining()
+    return enqueued
+
+
 def shutdown() -> None:
     """Stop accepting new drains and let in-flight ones finish (called on app
     shutdown)."""

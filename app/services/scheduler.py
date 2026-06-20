@@ -22,8 +22,13 @@ def daily_job() -> None:
     log.info("daily scrape starting")
     summaries = matcher.scrape_for_all_users()
     total_new = sum(s.new_positions for s in summaries.values())
-    log.info("daily scrape done: %d users, %d new positions "
-             "(scoring deferred to on-demand scans)", len(summaries), total_new)
+    log.info("daily scrape done: %d users, %d new positions", len(summaries), total_new)
+    # The scrape is a once-a-day producer: hand any new backlog to the scoring queue and
+    # wake its consumer. We never score here — the queue drains in its own worker pool,
+    # in small per-user batches, separate from this cron (joined only through the queue).
+    from . import evaluator  # lazy import keeps the scrape/scheduler free of evaluator at import time
+    enqueued = evaluator.enqueue_pending_and_drain()
+    log.info("daily scrape: enqueued %d user(s) for scoring", enqueued)
 
 
 def start() -> None:
