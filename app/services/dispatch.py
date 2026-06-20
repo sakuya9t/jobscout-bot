@@ -9,13 +9,13 @@ fires a one-shot HTTP trigger so a consumer drains *now*:
   producer enqueues -> dispatch_scoring_run() -> POST -> consumer drains the queue
 
 Transport is plain HTTP so it works the same everywhere and is testable locally:
-  * Production: ``JOBSCOUT_SCORING_DISPATCH_URL`` = GitHub's repository_dispatch API
-    (``https://api.github.com/repos/<owner>/<repo>/dispatches``) + a PAT/App token in
-    ``JOBSCOUT_SCORING_DISPATCH_TOKEN``; the ``scoring.yml`` workflow (which listens on
-    ``repository_dispatch``) runs ``jobscout run-scoring`` to drain.
-  * Local: point the URL at this app's own ``POST /api/cron/run-scoring`` (token =
-    ``CRON_SECRET``) and the loop runs entirely on your machine — no Supabase/GitHub.
-  * Unset (default): no-op — in-process draining + the scheduled cron cover dev.
+  * ``JOBSCOUT_SCORING_DISPATCH_URL`` points at any consumer of ``jobscout run-scoring``
+    (e.g. this app's own ``POST /api/cron/run-scoring`` with token = ``CRON_SECRET``, or
+    historically a GitHub ``repository_dispatch`` endpoint + ``..._TOKEN``).
+  * Unset (default): no-op. This is the case on DigitalOcean — the in-process worker
+    pool drains the moment work is enqueued, so no HTTP kick is needed. (The original
+    production consumer, the ``scoring.yml`` GitHub Actions workflow, has been retired
+    with the move off serverless; this module is now an optional local/dev convenience.)
 
 Fire-and-forget: a failed kick is logged, never raised — the scheduled run remains the
 backstop, so a flaky trigger can't break the producer or leave work unscored.

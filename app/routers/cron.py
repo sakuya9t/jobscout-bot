@@ -1,16 +1,14 @@
 """Optional HTTP trigger for the daily scrape.
 
 This is the same scrape-only run as ``jobscout run-daily`` (``app/cli.py``) behind
-an authenticated HTTP call. The daily scan runs in a GitHub Actions cron
-(``.github/workflows/daily-scan.yml``) in production; this endpoint remains handy
-for a manual kick or for a long-lived-server deploy. It only scrapes and saves new
-positions — scoring is deferred to an on-demand scan from the job-list view (web
-``/api/run``), so this stays cheap and fast even with many users.
+an authenticated HTTP call. In production the daily scan runs via the in-process
+scheduler (``services/scheduler.py``); this endpoint remains handy for a manual kick
+or an external scheduler. It only scrapes and saves new positions — scoring is
+deferred to an on-demand scan from the job-list view (web ``/api/run``), so this stays
+cheap and fast even with many users.
 
 Auth: send ``Authorization: Bearer <CRON_SECRET>`` (the value of the ``CRON_SECRET``
 env var, read straight from the environment, bypassing the ``JOBSCOUT_`` prefix).
-This is also the header Vercel Cron would send automatically if you ever schedule
-it there.
 """
 from __future__ import annotations
 
