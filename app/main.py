@@ -42,11 +42,11 @@ async def lifespan(app: FastAPI):
         )
     init_db()
     scheduler.start()
-    # Background worker threads don't survive a serverless function freeze, so they're
-    # gated off (JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0) on Vercel — there scoring is
-    # enqueued durably and drained by the run-scoring cron (.github/workflows/scoring.yml),
-    # not by in-process workers. On a long-lived server they drain backlogs off the
-    # request path.
+    # On the long-lived server (DigitalOcean App Platform) the bounded worker pool drains
+    # scoring backlogs in-process, off the request path — this is the default
+    # (JOBSCOUT_BACKGROUND_WORKERS_ENABLED=1). It can be gated off for a serverless host
+    # whose threads don't survive a function freeze; there scoring is only enqueued
+    # durably and an out-of-process drain (CLI/cron) consumes the queue instead.
     if settings.background_workers_enabled:
         # Resume any evaluation backlog left unfinished by a prior process.
         evaluator.resume_pending_on_startup()

@@ -6,8 +6,8 @@ Commands:
   run-daily        Scrape all users' companies and save new positions (cron-friendly;
                    no scoring — matching runs on-demand from the job-list view).
   run-scoring      Drain every user's matching backlog via the scoring queue, with a
-                   bounded worker pool so concurrent DB connections stay capped. Runs
-                   on its own schedule (scoring.yml), separate from the daily scrape.
+                   bounded worker pool so concurrent DB connections stay capped. A
+                   one-shot out-of-process drain (the long-lived server drains in-process).
   queue-log        Tail the scoring-queue trace (scoring_events) for debugging a flaky
                    drain: e.g. `jobscout queue-log --user 1` or `--event error`.
   init-db          Create database tables.
@@ -79,10 +79,10 @@ def cmd_run_daily(_: argparse.Namespace) -> int:
 
 
 def cmd_run_scoring(_: argparse.Namespace) -> int:
-    """Periodic scoring drain (the scoring.yml cron). Enqueue every user with a
-    non-empty matching backlog, then drain the queue with a bounded worker pool —
-    capping concurrent DB connections regardless of how many users have work. Separate
-    from ``run-daily`` (scrape-only) on purpose; safe to run on its own schedule."""
+    """One-shot scoring drain (out-of-process; the long-lived server drains in-process).
+    Enqueue every user with a non-empty matching backlog, then drain the queue with a
+    bounded worker pool — capping concurrent DB connections regardless of how many users
+    have work. Separate from ``run-daily`` (scrape-only) on purpose."""
     from .config import settings
     from .db import init_db, session_scope
     from .services import dispatch, evaluator, scoring_queue

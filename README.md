@@ -23,10 +23,11 @@ LLM filter, score, and report) are the expensive per-user work and all run throu
 (`JOBSCOUT_SCORING_MAX_CONCURRENCY`) — so the number of users scored at once, and thus
 concurrent DB connections, stays capped no matter how many users have work. Two things
 feed that queue: clicking *Run scan now* / *Refresh matching scores* enqueues you
-on-demand, and a few-hourly cron (`jobscout run-scoring`, in
-`.github/workflows/scoring.yml`) enqueues everyone with a non-empty backlog so matches
-stay fresh without a manual click. A peak of users all hitting *Run scan* therefore
-just enqueues cheap rows; it can never spin up more than N concurrent scorers.
+on-demand, and the daily in-process scrape enqueues everyone with a non-empty backlog
+so matches stay fresh without a manual click. The bounded worker pool drains the queue
+in-process on the long-lived server (`JOBSCOUT_BACKGROUND_WORKERS_ENABLED=1`, the
+default), so a peak of users all hitting *Run scan* just enqueues cheap rows; it can
+never spin up more than N concurrent scorers.
 
 1. **Scrape** — ATS-API-first: **Greenhouse / Lever / Ashby** JSON (robust, stable
    IDs), plus dedicated adapters for **Google Careers** and **Eightfold** (e.g.
@@ -113,8 +114,8 @@ jobscout invite revoke <id|code>
 ```
 Set `JOBSCOUT_REQUIRE_INVITE=0` for open registration (local dev). The app also applies
 in-process per-IP **rate limits** (a global blanket plus stricter caps on login/register)
-to blunt brute-force and DoS — see [docs/DEPLOY_VERCEL.md](docs/DEPLOY_VERCEL.md) for the
-knobs and how this interacts with Vercel's edge DDoS/WAF protection.
+to blunt brute-force and DoS. On DigitalOcean App Platform there's no edge WAF in front,
+so these in-process limits are the protection — keep them enabled in production.
 
 ### Telegram (optional, per-user)
 Each user brings their own bot. Create one with @BotFather, paste its token on the

@@ -1,8 +1,9 @@
-"""Postgres-backed claim queue for the periodic scoring drain.
+"""Postgres-backed claim queue for the scoring drain.
 
-The expensive per-user matching step is deferred off the daily scrape and run on
-its own schedule by the `jobscout run-scoring` cron (see
-.github/workflows/scoring.yml). This module is the queue that cron drains.
+The expensive per-user matching step is deferred off the daily scrape and drained
+in-process by the bounded worker pool (services/evaluator.py) on the long-lived
+server — and by the `jobscout run-scoring` CLI for a one-shot out-of-process drain.
+This module is the queue both consumers claim from.
 
 Why a DB queue instead of a broker: the durable backlog already exists as DB state
 (``matcher.count_pending`` — the missing-MatchResult set), and the deploy has no

@@ -720,6 +720,11 @@ let ALL_PRESETS = [];
 let watchedNames = new Set();
 let interestsById = {};
 let editingInterestId = null;
+let currentView = null;        // view showView last switched to (drives leave-detection)
+let pendingRescore = false;    // a watch-list/interest edit is waiting to re-score on leave
+// Settings views whose edits change what gets scraped/scored. Leaving this set (e.g.
+// to Job lists) flushes a pending re-score; switching between the two keeps editing.
+const RESCORE_VIEWS = ["companies", "interests"];
 
 function toggleNavSection(name, forceOpen=false){
   const section = document.querySelector(`[data-nav-section="${name}"]`);
@@ -741,6 +746,13 @@ function ensureNavSectionForView(view){
 
 function showView(view){
   const active = viewCopy[view] ? view : "jobs";
+  // Leaving the Companies/Interests settings after a change auto-runs a re-score, so
+  // the job list reflects the new watch-list/criteria without a manual "Recalculate".
+  // Only when actually leaving the settings area — switching between Companies and
+  // Interests means the user is still editing, so the re-score waits.
+  if(RESCORE_VIEWS.includes(currentView) && !RESCORE_VIEWS.includes(active)){
+    flushRescore();
+  }
   ensureNavSectionForView(active);
   document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
   document.getElementById(`view-${active}`).classList.add("active");
@@ -751,6 +763,7 @@ function showView(view){
   document.getElementById("viewSubtitle").textContent = viewCopy[active][1];
   document.getElementById("primaryActions").style.display = active === "jobs" ? "" : "none";
   if(location.hash !== `#${active}`){ history.replaceState(null, "", `#${active}`); }
+  currentView = active;
 }
 
 function fmtDate(value){
@@ -1013,6 +1026,7 @@ async function addCompany(){
   document.getElementById("cAts").value = "auto";
   document.getElementById("cPreset").value = "";
   await loadCompanies();
+  markRescorePending();
 }
 
 // Account tag for a watch-list row: only preset companies that require a portal
@@ -1039,7 +1053,11 @@ async function loadCompanies(){
   loadJobCompanyOptions();  // keep the job-list company filter in sync with the list
 }
 
-async function delCompany(id){ await api(`/api/companies/${id}`,{method:"DELETE"}); await loadCompanies(); }
+async function delCompany(id){
+  await api(`/api/companies/${id}`,{method:"DELETE"});
+  await loadCompanies();
+  markRescorePending();
+}
 
 function interestBody(){
   return {label:val("iLabel"), title_keywords:val("iTitles"), locations:val("iLocs"),
@@ -1056,6 +1074,7 @@ async function saveInterest(){
   if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); return; }
   resetInterestForm();
   await loadInterests();
+  markRescorePending();
 }
 
 function editInterest(id){
@@ -1099,6 +1118,22 @@ async function delInterest(id){
   await api(`/api/interests/${id}`,{method:"DELETE"});
   if(editingInterestId === id){ resetInterestForm(); }
   await loadInterests();
+  markRescorePending();
+}
+
+// Editing the watch-list or interests changes what gets scraped/scored. Rather than
+// re-scoring on every individual add/remove, we mark the change pending and fire one
+// scan when the user leaves the settings area (showView) or the page (pagehide) — the
+// same scrape + background re-score the "Recalculate" button runs.
+function markRescorePending(){ pendingRescore = true; }
+
+function flushRescore(){
+  if(!pendingRescore){ return; }
+  // Scoring needs a resume, and we don't stack onto an in-flight run. If gated out,
+  // keep the flag so the next leave/unload retries rather than dropping the change.
+  if(!hasActiveResume || runInProgress){ return; }
+  pendingRescore = false;
+  run();
 }
 
 async function run(){
@@ -1617,6 +1652,16 @@ async function importFromResume(){
   s.textContent = (overwrite ? "Imported (overwrote filled fields)" : "Imported into empty fields")
     + " — review the fields, then Save profile.";
 }
+
+// Closing the tab or a full navigation away with a change still pending: fetch is
+// unreliable during unload, so beacon the scan (delivered best-effort, and it carries
+// the auth cookie). showView covers the in-app case of switching to another view.
+window.addEventListener("pagehide", () => {
+  if(pendingRescore && hasActiveResume){
+    pendingRescore = false;
+    navigator.sendBeacon("/api/run");
+  }
+});
 
 const initialView = (location.hash || "#jobs").replace("#", "");
 showView(initialView);

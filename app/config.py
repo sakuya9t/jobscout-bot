@@ -160,9 +160,9 @@ class Settings(BaseSettings):
     # how many users drain concurrently. Internal — not a user-facing knob.
     eval_max_workers: int = 2
 
-    # Periodic scoring queue (services/scoring_queue.py + the `jobscout run-scoring`
-    # cron in .github/workflows/scoring.yml). This drains every user's matching
-    # backlog on its own schedule, separate from the daily scrape.
+    # Scoring queue (services/scoring_queue.py), drained in-process by the bounded
+    # worker pool (and by the `jobscout run-scoring` CLI for an out-of-process drain).
+    # This drains every user's matching backlog separately from the daily scrape.
     # scoring_max_concurrency is THE database-connection throttle: at most this many
     # users drain at once, so concurrent Supabase connections stay constant in the
     # number of users (each held connection = one pooler client; the cap is ~15 and
@@ -183,15 +183,12 @@ class Settings(BaseSettings):
     # long — so a parked job never sits failed forever (auto-resolve).
     scoring_job_retry_cooldown_minutes: int = 60
 
-    # Event-driven scoring drain (services/dispatch.py). When work becomes pending and
-    # this process can't drain it in-process (serverless), POST a trigger here so a
-    # consumer picks it up — replacing the "wait for the next scheduled run" delay.
-    # In production this is GitHub's repository_dispatch endpoint
-    # (https://api.github.com/repos/<owner>/<repo>/dispatches) with a PAT/App token, so
-    # the `scoring.yml` Actions workflow drains. Locally, point it at this app's own
-    # POST /api/cron/run-scoring (token = CRON_SECRET) to exercise the whole loop on
-    # your machine. Empty (default) = no-op: a long-lived server drains in-process and
-    # the scheduled cron is the backstop, so nothing extra is needed in dev.
+    # Optional event-driven scoring kick (services/dispatch.py). When work becomes
+    # pending and this process can't drain it in-process (serverless), POST a trigger to
+    # this URL so a consumer picks it up. Point it at any `jobscout run-scoring` consumer
+    # — e.g. this app's own POST /api/cron/run-scoring (token = CRON_SECRET). Empty
+    # (default, incl. DigitalOcean) = no-op: the long-lived server drains in-process the
+    # moment work is enqueued, so nothing extra is needed.
     scoring_dispatch_url: str = ""
     scoring_dispatch_token: str = ""
     scoring_dispatch_event: str = "score"  # repository_dispatch event_type
