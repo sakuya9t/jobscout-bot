@@ -66,8 +66,8 @@ def crawl_presets() -> dict:
                     summary["new_positions"] += len(new_positions)
                     summary["errors"].extend(errs)
             except Exception as exc:
-                # A DB-level failure (e.g. Supabase throttling/banning requests at the
-                # egress cap) raises here rather than coming back as a scrape-error
+                # A DB-level failure (e.g. the managed-Postgres connection pool refusing
+                # clients, or the DB unreachable) raises here rather than coming back as a scrape-error
                 # string. Isolate it per company so one outage doesn't abort the rest of
                 # the crawl, and record it loudly — this path was previously silent and
                 # would propagate out, skipping every remaining company.

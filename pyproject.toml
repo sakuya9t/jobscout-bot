@@ -26,7 +26,7 @@ dependencies = [
     "jinja2>=3.1",
     "mcp>=1.2",
     # Postgres driver — used when JOBSCOUT_DATABASE_URL points at Postgres
-    # (e.g. Supabase) rather than the default SQLite. SQLite needs no driver.
+    # (e.g. DigitalOcean Managed Postgres) rather than the default SQLite. SQLite needs no driver.
     "psycopg2-binary>=2.9",
 ]
 

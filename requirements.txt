@@ -1,5 +1,6 @@
-# Runtime dependencies for Vercel's Python runtime (installs from requirements.txt,
-# not pyproject.toml). Keep in sync with [project].dependencies in pyproject.toml.
+# Runtime dependencies for DigitalOcean App Platform's Python buildpack (installs from
+# requirements.txt, not pyproject.toml). Keep in sync with [project].dependencies in
+# pyproject.toml.
 # The `browser` (playwright) and `dev` (pytest) extras are intentionally excluded.
 fastapi>=0.110
 uvicorn[standard]>=0.29
@@ -23,5 +24,5 @@ python-docx>=1.1
 apscheduler>=3.10
 jinja2>=3.1
 mcp>=1.2
-# Postgres driver — JOBSCOUT_DATABASE_URL points at Supabase Postgres in prod.
+# Postgres driver — JOBSCOUT_DATABASE_URL points at DigitalOcean Managed Postgres in prod.
 psycopg2-binary>=2.9

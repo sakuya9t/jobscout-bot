@@ -25,8 +25,8 @@ def daily_job() -> None:
     except Exception:
         # APScheduler runs this in its own worker thread; an unhandled exception would
         # only reach APScheduler's executor logger and is easy to miss. The likely cause
-        # is the DB being unreachable (Supabase throttling/banning requests at the egress
-        # cap), so log it under our logger and stop — there's nothing to enqueue if the
+        # is the DB being unreachable (the managed-Postgres connection pool refusing
+        # clients, or a maintenance restart), so log it under our logger and stop — there's nothing to enqueue if the
         # scrape couldn't run. (Per-company / per-user failures are isolated and logged
         # inside scrape_for_all_users; this catches a top-level failure of the whole run.)
         log.exception("daily scrape failed")

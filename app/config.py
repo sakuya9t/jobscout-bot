@@ -164,9 +164,9 @@ class Settings(BaseSettings):
     # worker pool (and by the `jobscout run-scoring` CLI for an out-of-process drain).
     # This drains every user's matching backlog separately from the daily scrape.
     # scoring_max_concurrency is THE database-connection throttle: at most this many
-    # users drain at once, so concurrent Supabase connections stay constant in the
-    # number of users (each held connection = one pooler client; the cap is ~15 and
-    # shared with the web app, so keep this well under it).
+    # users drain at once, so concurrent DB connections stay constant in the number of
+    # users (each held connection = one PgBouncer client on DigitalOcean Managed
+    # Postgres; the pool's size is shared with the web app, so keep this well under it).
     scoring_max_concurrency: int = 3
     # Wall-clock cap for one cron run (under the workflow's 60-min timeout), so a huge
     # backlog spans several runs instead of being killed mid-drain. 0 = no cap.

@@ -20,8 +20,8 @@ Commands:
   backfill-descriptions
                    Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
                    whose search API returns none, so older postings become scoreable.
-  migrate-db       Copy schema + data to another database (e.g. SQLite -> Supabase
-                   Postgres) to publish the app on a hosted DB.
+  migrate-db       Copy schema + data to another database (e.g. SQLite -> DigitalOcean
+                   Managed Postgres) to publish the app on a hosted DB.
 """
 from __future__ import annotations
 
@@ -300,7 +300,7 @@ def _redact_url(url: str) -> str:
 
 def cmd_migrate_db(args: argparse.Namespace) -> int:
     """Copy schema + all rows from the current database (``settings.database_url``,
-    e.g. the local SQLite file) into a target database (e.g. Supabase Postgres).
+    e.g. the local SQLite file) into a target database (e.g. DigitalOcean Managed Postgres).
 
     Creates the schema on the target from the ORM models, copies every table in
     FK-safe dependency order, then fixes Postgres autoincrement sequences so future
@@ -501,7 +501,7 @@ def main() -> None:
     p.set_defaults(func=cmd_backfill_descriptions)
 
     p = sub.add_parser("migrate-db",
-                       help="Copy schema + data to another DB (e.g. SQLite -> Supabase Postgres)")
+                       help="Copy schema + data to another DB (e.g. SQLite -> DigitalOcean Managed Postgres)")
     p.add_argument("--target", help="Target SQLAlchemy URL (or set JOBSCOUT_TARGET_DATABASE_URL)")
     p.add_argument("--drop", action="store_true", help="Recreate the target schema first")
     p.add_argument("--batch", type=int, default=1000, help="Rows per insert batch")

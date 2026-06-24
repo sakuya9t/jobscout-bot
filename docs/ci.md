@@ -53,6 +53,5 @@ guards (`main`), and the "DigitalOcean build parity" job guarantees the deps DO 
 are the deps the tests passed against.
 
 > Note: `deploy.yml` is the legacy **Vercel** production pipeline (it has its own
-> pre-deploy `test` stage). Once the move to DO (see
-> `ai-working-docs/worker-migration-guidance.md`) is complete, that workflow can be
+> pre-deploy `test` stage). Once the move to DO is complete, that workflow can be
 > retired; `ci.yml` is the host-independent test gate that stays.

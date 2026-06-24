@@ -7,7 +7,7 @@ detached per-request thread: instead a bounded pool of at most
 `scoring_max_concurrency` worker threads claim users off the queue and drain them.
 That bound is the database-connection throttle — a peak of users all hitting
 *Run scan* enqueues cheap rows but can never push more than N drains (and thus N
-Supabase connections) at once. The same `scoring_queue` is drained by the
+DB connections) at once. The same `scoring_queue` is drained by the
 `jobscout run-scoring` cron via `drain_queue` (one-shot, run-to-completion).
 
 Concurrency model (web path):

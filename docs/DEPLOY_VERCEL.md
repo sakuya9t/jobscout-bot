@@ -4,10 +4,9 @@
 > Platform** (single `jobscout serve` process: web + in-process scoring drain + kit
 > worker + daily scheduler). The Vercel deploy workflow (`deploy.yml`), the GitHub
 > Actions cron (`daily-scan.yml` / `scoring.yml`), and the `api/index.py` + `vercel.json`
-> entrypoint have been removed. See
-> [ai-working-docs/worker-migration-guidance.md](../ai-working-docs/worker-migration-guidance.md)
-> for the current topology and the migration steps, and [docs/ci.md](ci.md) for the
-> test gate. The Vercel-specific details below no longer reflect how the app is deployed.
+> entrypoint have been removed. See the project README for the current topology, and
+> [docs/ci.md](ci.md) for the test gate. The Vercel-specific details below no longer
+> reflect how the app is deployed.
 
 ## Automated CI/CD: GitHub Actions → Supabase + Vercel
 

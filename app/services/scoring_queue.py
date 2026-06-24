@@ -10,8 +10,8 @@ Why a DB queue instead of a broker: the durable backlog already exists as DB sta
 host for RabbitMQ/Redis. A ``scoring_jobs`` row per user, claimed with ``SELECT …
 FOR UPDATE SKIP LOCKED``, gives an atomic, cross-process-safe claim with zero new
 infra. The point of the queue is throttling: a bounded worker pool claims a few
-users at a time, so concurrent Supabase connections stay constant in the number of
-users (which otherwise exhausts the pooler — see app/db.py:NullPool).
+users at a time, so concurrent DB connections stay constant in the number of
+users (which otherwise exhausts the connection pool — see app/db.py:NullPool).
 
 Lifecycle of a row: ``pending`` (work to do) -> ``running`` (claimed) -> ``done``
 (drained) / ``error`` (failed) / back to ``pending`` (re-armed because more work
