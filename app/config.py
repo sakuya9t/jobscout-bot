@@ -183,16 +183,6 @@ class Settings(BaseSettings):
     # long — so a parked job never sits failed forever (auto-resolve).
     scoring_job_retry_cooldown_minutes: int = 60
 
-    # Optional event-driven scoring kick (services/dispatch.py). When work becomes
-    # pending and this process can't drain it in-process (serverless), POST a trigger to
-    # this URL so a consumer picks it up. Point it at any `jobscout run-scoring` consumer
-    # — e.g. this app's own POST /api/cron/run-scoring (token = CRON_SECRET). Empty
-    # (default, incl. DigitalOcean) = no-op: the long-lived server drains in-process the
-    # moment work is enqueued, so nothing extra is needed.
-    scoring_dispatch_url: str = ""
-    scoring_dispatch_token: str = ""
-    scoring_dispatch_event: str = "score"  # repository_dispatch event_type
-
     @property
     def resume_dir(self) -> Path:
         return self.data_dir / "resumes"

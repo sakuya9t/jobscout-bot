@@ -57,21 +57,20 @@ def cmd_mcp(_: argparse.Namespace) -> int:
 
 def cmd_run_daily(_: argparse.Namespace) -> int:
     from .db import init_db, session_scope
-    from .services import dispatch, matcher, scoring_queue
+    from .services import matcher, scoring_queue
 
     init_db()
     summaries = matcher.scrape_for_all_users()
     new = sum(s.new_positions for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
-    # Publish the scraped work: enqueue users with a backlog and fire the scoring
-    # trigger (no-op when JOBSCOUT_SCORING_DISPATCH_URL is unset). Scrape and scoring
-    # remain separate jobs — this only marks work ready and kicks the consumer.
+    # Publish the scraped work: enqueue every user with a backlog. Scrape and scoring
+    # remain separate jobs — this only marks work ready; the `jobscout run-scoring`
+    # drain (or the long-lived server's in-process workers) does the matching.
     with session_scope() as db:
         enqueued = scoring_queue.reconcile(db)
-    fired = dispatch.dispatch_scoring_run() if enqueued else False
     print(
         f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)} | "
-        f"enqueued: {enqueued} | dispatched: {fired}"
+        f"enqueued: {enqueued}"
     )
     for e in errors:
         print(f"  - {e}")
@@ -85,7 +84,7 @@ def cmd_run_scoring(_: argparse.Namespace) -> int:
     have work. Separate from ``run-daily`` (scrape-only) on purpose."""
     from .config import settings
     from .db import init_db, session_scope
-    from .services import dispatch, evaluator, scoring_queue
+    from .services import evaluator, scoring_queue
 
     init_db()
     with session_scope() as db:
@@ -97,16 +96,15 @@ def cmd_run_scoring(_: argparse.Namespace) -> int:
     with session_scope() as db:
         states = scoring_queue.counts_by_state(db)
         more = scoring_queue.has_pending(db)
-    # The per-run budget may stop a big backlog mid-drain (rows re-armed to pending);
-    # re-fire the trigger so the next run continues instead of waiting for the schedule.
-    fired = dispatch.dispatch_scoring_run() if more else False
     print(
         f"Enqueued: {enqueued} | users drained: {summary.users} | "
         f"scored: {summary.scored} | failed: {summary.failed}"
     )
     print(f"Queue: {states or '{}'}")  # e.g. {'done': 3, 'error': 1, 'pending': 2}
     if more:
-        print(f"Backlog remains -> re-dispatched follow-up run: {fired}")
+        # The per-run budget stopped a big backlog mid-drain (rows re-armed to pending);
+        # the next scheduled run continues it.
+        print("Backlog remains -> will continue on the next run")
     for e in summary.errors:
         print(f"  - {e}")
     return 0
