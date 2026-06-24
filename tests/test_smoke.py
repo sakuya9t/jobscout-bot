@@ -154,6 +154,50 @@ def test_scrape_sitemap_pulls_real_descriptions(monkeypatch):
     assert all(p.external_id for p in out)
 
 
+def test_scrape_sitemap_url_filter_and_entity_encoded_jsonld(monkeypatch):
+    """A mixed sitemap (job pages + blog/marketing URLs) is filtered to job-detail
+    pages via ``url_filter`` (Pinterest/Phenom), and JSON-LD whose script type
+    entity-encodes the ``+`` (``application/ld&#x2B;json``) is still parsed."""
+    import app.services.scraper as scraper
+
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://www.pinterestcareers.com/</loc></url>
+      <url><loc>https://www.pinterestcareers.com/jobs/7682040/programmatic-ads-sales-lead/</loc></url>
+      <url><loc>https://www.pinterestcareers.com/life-at-pinterest-blog/a-day-in-the-life/</loc></url>
+      <url><loc>https://www.pinterestcareers.com/departments/engineering/</loc></url>
+    </urlset>"""
+    # Phenom HTML-entity-encodes the '+' in the script type attribute.
+    detail = """<html><head>
+      <script type="application/ld&#x2B;json">
+      {"@context":"https://schema.org","@type":"JobPosting",
+       "title":"Programmatic Ads Sales Lead",
+       "description":"<p>Sell <b>great</b> ads</p>","datePosted":"2026-06-04",
+       "jobLocation":{"@type":"Place","name":"New York, NY","address":{"@type":"PostalAddress",
+         "addressLocality":"New York","addressRegion":"NY","addressCountry":"US"}}}
+      </script></head><body></body></html>"""
+
+    fetched: list[str] = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        return xml if url.endswith(".xml") else detail
+
+    monkeypatch.setattr(scraper, "_fetch_impersonated", fake_fetch)
+
+    out = scraper.scrape_sitemap("https://www.pinterestcareers.com/sitemap.xml", r"/jobs/\d")
+
+    # Only the one /jobs/<id>/ entry is fetched; the root/blog/department URLs are skipped.
+    assert [u for u in fetched if not u.endswith(".xml")] == [
+        "https://www.pinterestcareers.com/jobs/7682040/programmatic-ads-sales-lead/"
+    ]
+    assert len(out) == 1
+    # The entity-encoded JSON-LD parsed: real title/description/location, not the slug.
+    assert out[0].title == "Programmatic Ads Sales Lead"
+    assert out[0].description == "Sell great ads"
+    assert out[0].location == "New York, NY"  # Place ``name`` preferred over address
+
+
 def test_eightfold_domain_derivation():
     from app.services.scraper import _eightfold_domain
 

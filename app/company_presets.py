@@ -32,6 +32,10 @@ class CompanyPreset:
     careers_url: str
     ats_type: str = "auto"
     ats_token: str | None = None
+    # Optional regex applied to ``sitemap`` boards: when the sitemap mixes job-detail
+    # pages with marketing/blog URLs (e.g. Pinterest's Phenom board), only matching
+    # URLs are fetched as jobs. None = fetch every sitemap entry (jobs-only sitemaps).
+    job_url_filter: str | None = None
     location_hint: str | None = None
     # Whether submitting an application to this company requires registering an
     # account on its application portal (vs. a one-shot form). Drives the company
@@ -97,6 +101,19 @@ PRESETS: list[CompanyPreset] = [
         account_portal_url="https://accounts.google.com/",
     ),
     CompanyPreset(
+        # deepmind.google/careers links out to two boards: Google's careers board
+        # filtered to ``company=DeepMind`` (the full ~81-role listing, but Google
+        # sign-in to apply) and a self-hosted Greenhouse board (job-boards.greenhouse.io/
+        # deepmind). We use the Greenhouse board: it's a curated subset (~18 roles) but a
+        # clean structured-API fetch with full descriptions and a no-account Greenhouse
+        # apply form. Scrape it directly via its token.
+        key="deepmind",
+        name="Google DeepMind",
+        careers_url="https://job-boards.greenhouse.io/deepmind",
+        ats_type="greenhouse",
+        ats_token="deepmind",
+    ),
+    CompanyPreset(
         # Airbnb runs a Greenhouse board (careers.airbnb.com embeds it); scrape the
         # board API directly via its token.
         key="airbnb",
@@ -152,6 +169,62 @@ PRESETS: list[CompanyPreset] = [
         careers_url="https://job-boards.greenhouse.io/janestreet",
         ats_type="greenhouse",
         ats_token="janestreet",
+    ),
+    CompanyPreset(
+        # Waymo's careers site (careers.withwaymo.com) is a Greenhouse-rendered board
+        # (~391 live roles); scrape the board API directly via its token. Applications
+        # are submitted on Greenhouse itself, so no separate candidate account.
+        key="waymo",
+        name="Waymo",
+        careers_url="https://careers.withwaymo.com/jobs/search",
+        ats_type="greenhouse",
+        ats_token="waymo",
+    ),
+    CompanyPreset(
+        # Robinhood's careers site (careers.robinhood.com) is a Greenhouse-rendered
+        # board (~136 live roles); scrape the board API directly via its token.
+        # Applications are submitted on Greenhouse itself, so no separate account.
+        key="robinhood",
+        name="Robinhood",
+        careers_url="https://careers.robinhood.com/",
+        ats_type="greenhouse",
+        ats_token="robinhood",
+    ),
+    CompanyPreset(
+        # Pinterest's careers site (pinterestcareers.com) is a Phenom People SPA,
+        # Cloudflare-walled (plain httpx 403s; the sitemap adapter's browser-TLS fetch
+        # gets through) with no usable JSON API. But it publishes a sitemap and each job
+        # detail page carries a schema.org JobPosting JSON-LD, so the "sitemap" adapter
+        # reads it the same way as Citadel/Meta. The sitemap is *mixed* (job pages plus
+        # ~205 blog/department URLs), so job_url_filter keeps only /jobs/<id>/ entries
+        # (~188 roles). Phenom's JSON-LD entity-encodes the script type, which
+        # _LD_JSON_RE now tolerates. Applying funnels into Phenom's candidate portal.
+        key="pinterest",
+        name="Pinterest",
+        careers_url="https://www.pinterestcareers.com/jobs/",
+        ats_type="sitemap",
+        ats_token="https://www.pinterestcareers.com/sitemap.xml",
+        job_url_filter=r"/jobs/\d",
+        requires_account=True,
+        account_portal_url="https://www.pinterestcareers.com/",
+    ),
+    CompanyPreset(
+        # Meta runs its own careers site (metacareers.com): a Comet/Relay GraphQL SPA
+        # with no embedded job JSON and no third-party ATS, so neither the "html" nor an
+        # ATS adapter can read it. But it publishes a jobsearch sitemap (ats_token) that
+        # enumerates every open role's detail page, and each detail page carries a
+        # schema.org JobPosting JSON-LD — so the "sitemap" adapter (same path as Citadel)
+        # fetches each page and pulls the real title/description/location/date. Heavy:
+        # ~586 detail fetches per crawl. Meta's JSON-LD ``address`` is unreliable (every
+        # role claims "Menlo Park"); the real location is each Place's ``name``, which
+        # _jsonld_location now prefers. Applying needs a candidate account on the portal.
+        key="meta",
+        name="Meta",
+        careers_url="https://www.metacareers.com/jobsearch/",
+        ats_type="sitemap",
+        ats_token="https://www.metacareers.com/jobsearch/sitemap.xml",
+        requires_account=True,
+        account_portal_url="https://www.metacareers.com/",
     ),
     CompanyPreset(
         # Citadel's careers pages (citadel.com/careers) are Cloudflare-fronted and

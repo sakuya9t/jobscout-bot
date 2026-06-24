@@ -260,7 +260,8 @@ def seed_presets(db: Session) -> None:
             continue
         db.add(Company(
             preset_key=p.key, user_id=None, name=p.name, careers_url=p.careers_url,
-            ats_type=p.ats_type, ats_token=p.ats_token, location_hint=p.location_hint,
+            ats_type=p.ats_type, ats_token=p.ats_token, job_url_filter=p.job_url_filter,
+            location_hint=p.location_hint,
         ))
     db.flush()
 

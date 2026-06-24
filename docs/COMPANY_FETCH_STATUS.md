@@ -30,11 +30,16 @@ _Last reviewed: 2026-06-18._
 | Airbnb | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
 | Databricks | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
 | **Jane Street** | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. (209 live roles.) |
+| **Waymo** | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. (391 live roles.) |
+| **Robinhood** | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. (136 live roles.) |
 | Apple | `apple` | ✅ | age-floor | ✅ | ✅ | no¹ | Medium — custom portal; Apple ID likely needed at submit. |
 | Amazon | `amazon` | ✅ | age-floor | ✅ | ✅ | yes | Hard — amazon.jobs candidate portal/account. |
 | Google | `google` | ✅ | full² | ✅ | — | yes | Hard — Google sign-in + custom application flow. |
+| **Google DeepMind** | `greenhouse` | ✅ | subset⁵ | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
 | NVIDIA | `eightfold` | ✅ | age-floor | ✅³ | ✅ | yes | Hard — funnels into Workday (account required). |
 | Netflix | `eightfold` | ✅ | age-floor | ✅³ | ✅ | no¹ | Medium — Eightfold SmartApply flow. |
+| **Pinterest** | `sitemap` | ✅ | full⁴ | ✅³ | ✅ | yes | Hard — Phenom portal; mixed sitemap, job_url_filter (see below). |
+| **Meta** | `sitemap` | ✅ | full⁴ | ✅³ | ✅ | yes | Hard — custom portal; ~586 detail fetches/crawl (see below). |
 | **Citadel** | `sitemap` | ✅ | full⁴ | ✅³ | ✅ | yes | Hard — custom candidate portal; **needs verification** (see below). |
 | **Two Sigma** | _none_ | ⛔ | — | — | — | yes? | Blocked on fetch first (see below). |
 
@@ -44,8 +49,59 @@ submit step may still need an account — confirm during phase-2 build.
 ³ No description in the listing/sitemap; it's pulled from each job's detail page
 (eightfold: JSON-LD over httpx; Citadel: JSON-LD via a browser-TLS fetch — see below).
 ⁴ The sitemap enumerates every open-role page, so it's treated as a complete listing.
+⁵ DeepMind's self-hosted Greenhouse board carries only a curated subset (~18 roles) of
+the full DeepMind listing. The complete ~81-role set is on Google's careers board under
+`company=DeepMind` (`ats_type="google"`), but that funnels into a Google sign-in to
+apply; we chose the Greenhouse board for the clean structured fetch + no-account apply.
 
 ## Notes on the tricky ones
+
+### Pinterest — `sitemap`
+- `pinterestcareers.com` is a **Phenom People** SPA (the `/phb/` script path), **fronted
+  by Cloudflare** that 403s plain `httpx` — the `sitemap` adapter's browser-TLS fetch
+  (`_fetch_impersonated`) gets through. Phenom builds its job-search API endpoint in JS,
+  so there's no clean JSON feed to call.
+- **How we fetch it:**
+  1. `sitemap.xml` (`ats_token`) is a flat, **mixed** urlset — 188 job-detail pages
+     (`/jobs/<id>/<slug>/`) plus ~205 marketing/blog/department URLs. The preset's
+     **`job_url_filter`** (`/jobs/\d`) keeps only the job-detail entries, so we don't
+     fetch — and surface as description-less "jobs" — the non-job pages.
+  2. Each job page carries a schema.org `JobPosting` JSON-LD, read like Citadel/Meta.
+- **Two reusable fixes came out of this** (both benefit any future board):
+  - `job_url_filter` is a new optional field on `CompanyPreset`/`Company` (snapshotted
+    via the schema-reconcile) threaded into `scrape_sitemap` — for any mixed sitemap.
+  - `_LD_JSON_RE` now tolerates an HTML-entity-encoded `+` in the script type
+    (`application/ld&#x2B;json`), which Phenom emits.
+- `requires_account=True`: applying funnels into Phenom's candidate portal (assumption).
+
+### Meta — `sitemap`
+- `metacareers.com` is Meta's own careers site: a **Comet/Relay GraphQL SPA** with no
+  third-party ATS. The initial HTML carries no job JSON, and the GraphQL endpoint is a
+  persisted-query system (rotating `doc_id` + `fb_dtsg` tokens) — too fragile to drive,
+  so there's no clean API adapter.
+- **How we fetch it:**
+  1. The jobsearch sitemap (`ats_token = https://www.metacareers.com/jobsearch/sitemap.xml`)
+     enumerates every open role's detail page (`/profile/job_details/<id>/`, ~586).
+  2. Each detail page carries a schema.org `JobPosting` JSON-LD, so the shared `sitemap`
+     adapter (`scraper.scrape_sitemap`) pulls the real title/description/employment
+     type/date the same way as Citadel.
+- **Two gotchas:**
+  - **Location**: Meta's JSON-LD `address` breakdown is broken — every role repeats
+    `addressLocality: "Menlo Park"` and `addressCountry` is a nested `{"@type":"Country",
+    "name":[...]}` object. The *correct* location is each `Place`'s top-level `name`
+    ("New York, NY", "Remote, US", …), so `_jsonld_location` now **prefers `name`** and
+    only joins string-valued address fields (Citadel, which has no `name`, is unchanged).
+  - **Volume**: `scrape_sitemap` has no cap, so a Meta crawl fetches **all ~586 detail
+    pages** (~330 KB each) — far heavier than Citadel's ~35. Watch for rate-limiting; if
+    it bites, the fix is a per-board fetch cap on `scrape_sitemap`.
+- `requires_account=True`: applying funnels into Meta's candidate portal (sign-in).
+- **No lighter feed exists** (checked Jun 2026): Meta is on **no third-party ATS** —
+  Greenhouse / Lever / Ashby / SmartRecruiters / Workday / Eightfold all return no Meta
+  board. Meta's own GraphQL (`CareersJobSearchResultsDataQuery`) would be one call
+  instead of ~586 fetches, but it needs session cookies + `fb_dtsg`/`lsd` + a `doc_id`
+  that **rotates with every JS-bundle ship** — too fragile to depend on. The sitemap +
+  JSON-LD path is the most stable option because it rides SEO web standards. So if
+  volume becomes a problem, cap `scrape_sitemap` rather than switching feeds.
 
 ### Citadel — `sitemap`
 - Careers pages (`citadel.com/careers/...`) are fronted by **Cloudflare**, which
@@ -80,6 +136,10 @@ submit step may still need an account — confirm during phase-2 build.
   scout bot — so it's deferred.
 - Upgrade path: a Phenom adapter (reverse-engineer the `qtvc` handshake) **or** the
   headless-browser path. Tracked here so it isn't forgotten.
+- **Note:** Pinterest (also Phenom) was integrated via the `sitemap` route — but only
+  because *its* sitemap enumerates real job-detail pages. Two Sigma's sitemap lists SPA
+  route names, not jobs, so the same trick doesn't apply here. Worth re-checking whether
+  Two Sigma ever publishes a job-detail sitemap.
 
 ## Maintenance
 

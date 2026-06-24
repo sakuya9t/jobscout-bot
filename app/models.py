@@ -148,6 +148,10 @@ class Company(Base):
     ats_type: Mapped[str] = mapped_column(String(32), default="auto")
     # Board token / org slug for the ATS API (e.g. greenhouse board token).
     ats_token: Mapped[str | None] = mapped_column(String(255))
+    # Optional regex: for ats_type="sitemap" boards whose sitemap mixes job-detail
+    # pages with marketing/blog URLs (e.g. Pinterest), only entries matching this are
+    # fetched as jobs. NULL means fetch every sitemap URL (jobs-only sitemaps).
+    job_url_filter: Mapped[str | None] = mapped_column(String(255))
     location_hint: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
