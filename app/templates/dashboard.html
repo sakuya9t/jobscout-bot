@@ -24,6 +24,9 @@
   input, textarea, select {
     background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
   }
+  input:disabled, textarea:disabled, select:disabled {
+    background:#eef1f0; color:var(--muted); cursor:not-allowed; opacity:.7;
+  }
   input:focus, textarea:focus, select:focus, button:focus-visible {
     outline:2px solid rgba(15, 118, 110, .28); outline-offset:2px;
   }
@@ -128,6 +131,11 @@
   /* One compact, consistent size for every job-control select, so the toolbar
      row lines up. */
   .control select, .filters select, .pager select { width:auto; padding:8px 10px; font-size:13px; }
+  /* The company filter must keep a constant width: with width:auto it grows to fit
+     the selected company name (e.g. "Google DeepMind"), widening the toolbar enough
+     to wrap the control onto a second row for long names but not short ones. Pin it
+     so the row layout never depends on which company is picked (long names ellipsize). */
+  #jobCompany { width:170px; max-width:170px; text-overflow:ellipsis; }
   /* Job-list view switcher: a 3-way segmented control whose highlighted segment
      always names the list currently shown (top 5 / all matches / all jobs). */
   .segmented { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
@@ -570,6 +578,9 @@
           </div>
           <div><label for="cToken">ATS token</label><input id="cToken" placeholder="board token / org slug" /></div>
         </div>
+        <div id="cPresetHint" class="muted" style="display:none; margin-top:8px; font-size:13px;">
+          Preset companies are shared and managed centrally — their settings can't be edited here.
+          Clear the preset to add a custom company.</div>
         <div class="toolbar" style="margin-top:12px;"><button onclick="addCompany()">Add company</button></div>
       </div>
       <div class="surface"><div id="companies"></div></div>
@@ -1006,13 +1017,29 @@ function renderPresetOptions(){
   if(available.some(p => p.key === keep)){ sel.value = keep; }
 }
 
+// The company config fields (name/URL/ATS/token) are user-editable only for custom
+// companies. For a preset they describe a shared, centrally-managed company, and the
+// backend ignores any submitted values (it subscribes via preset_key), so we lock them.
+const COMPANY_FIELDS = ["cName", "cUrl", "cAts", "cToken"];
+function setCompanyFieldsLocked(locked){
+  COMPANY_FIELDS.forEach(id => { document.getElementById(id).disabled = locked; });
+  document.getElementById("cPresetHint").style.display = locked ? "block" : "none";
+}
+
 function applyPreset(){
   const p = ALL_PRESETS.find(x => x.key === document.getElementById("cPreset").value);
-  if(!p){ return; }
+  if(!p){
+    // Preset cleared back to "Choose a preset": re-enable for custom entry and reset.
+    setCompanyFieldsLocked(false);
+    COMPANY_FIELDS.forEach(id => document.getElementById(id).value = "");
+    document.getElementById("cAts").value = "auto";
+    return;
+  }
   document.getElementById("cName").value = p.name;
   document.getElementById("cUrl").value = p.careers_url;
   document.getElementById("cAts").value = p.ats_type;
   document.getElementById("cToken").value = p.ats_token || "";
+  setCompanyFieldsLocked(true);  // preset settings are fixed
 }
 
 async function addCompany(){
@@ -1025,6 +1052,7 @@ async function addCompany(){
   ["cName","cUrl","cToken"].forEach(i=>document.getElementById(i).value="");
   document.getElementById("cAts").value = "auto";
   document.getElementById("cPreset").value = "";
+  setCompanyFieldsLocked(false);  // back to editable custom-entry state
   await loadCompanies();
   markRescorePending();
 }
