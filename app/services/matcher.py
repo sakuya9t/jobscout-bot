@@ -921,7 +921,13 @@ def scrape_for_all_users() -> dict[int, RunResult]:
     until the user runs a scan, which scores the whole backlog."""
     from . import crawler
 
-    crawler.crawl_presets()  # shared, once — not per user
+    try:
+        crawler.crawl_presets()  # shared, once — not per user
+    except Exception:
+        # Isolate a preset-crawl failure (e.g. the DB is unreachable) so it doesn't skip
+        # every user's custom-company scrape below; crawl_presets already logs its own
+        # per-company failures, this catches a failure of the crawl as a whole.
+        log.exception("daily scrape: preset crawl failed")
 
     summaries: dict[int, RunResult] = {}
     with session_scope() as db:
@@ -933,6 +939,11 @@ def scrape_for_all_users() -> dict[int, RunResult]:
                 res = scrape_only(db, user)
                 res.finalize_errors()
                 summaries[uid] = res
+            # Surface per-user warnings (e.g. a scrape/DB problem on one company) — they
+            # were previously returned but never logged, so a partial failure was silent.
+            if res.errors:
+                log.warning("daily scrape: user %s had %d warning(s): %s",
+                            uid, res.error_count, "; ".join(res.errors))
         except Exception as exc:  # isolate per-user failures
             log.exception("daily scrape failed for user %s", uid)
             r = RunResult()

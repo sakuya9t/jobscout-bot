@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -30,6 +31,38 @@ else:
         settings.database_url, poolclass=NullPool, pool_pre_ping=True, future=True
     )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+@event.listens_for(engine, "handle_error")
+def _log_db_error(context):  # pragma: no cover - exercised against a live/failing DB
+    """Log every DBAPI-level error at the engine, so a database outage is visible in
+    the logs even when a caller catches and swallows the exception.
+
+    The motivating failure: Supabase throttles/*bans* requests once the project's
+    egress cap is hit, which surfaces as a connection/operational error deep inside the
+    daily scrape or a scoring drain. Several call sites legitimately catch broad
+    exceptions for per-company / per-user isolation (e.g. crawler.crawl_presets,
+    matcher.scrape_for_all_users), so without logging *here* a whole day's writes can
+    fail with nothing in the logs — exactly what we hit. ``handle_error`` fires for
+    statement-execution errors AND failed connects/pre-pings, so this single hook sees
+    them all regardless of who catches the exception downstream.
+
+    ``IntegrityError`` is excluded: it's the *expected* concurrent-drain race on
+    ``uq_match_unique`` that ``matcher._flush_match`` recovers via SAVEPOINT — logging
+    it here would cry wolf on a normal, handled condition. The hook only reads context
+    and never re-raises, so it does not alter exception propagation."""
+    exc = context.original_exception
+    if isinstance(exc, IntegrityError):
+        return
+    statement = " ".join((context.statement or "").split())
+    if len(statement) > 200:
+        statement = statement[:200] + "…"
+    log.error(
+        "database error%s: %s%s",
+        " (connection lost)" if context.is_disconnect else "",
+        exc,
+        f" | while executing: {statement}" if statement else "",
+    )
 
 
 if _is_sqlite:
