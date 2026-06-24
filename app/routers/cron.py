@@ -28,7 +28,7 @@ log = get_logger(__name__)
 
 
 def _require_cron(authorization: str | None) -> None:
-    """Authenticate a Vercel Cron call. ``CRON_SECRET`` unset => 503 (never an open
+    """Authenticate a cron HTTP call. ``CRON_SECRET`` unset => 503 (never an open
     trigger); a missing or mismatched bearer token => 401 (constant-time compare)."""
     expected = os.environ.get("CRON_SECRET")
     if not expected:

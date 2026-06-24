@@ -51,7 +51,3 @@ merge blocked until green → only tested code lands on the deploy branch → DO
 builds code the suite passed.** Point the DO app at the same branch the protection rule
 guards (`main`), and the "DigitalOcean build parity" job guarantees the deps DO installs
 are the deps the tests passed against.
-
-> Note: `deploy.yml` is the legacy **Vercel** production pipeline (it has its own
-> pre-deploy `test` stage). Once the move to DO is complete, that workflow can be
-> retired; `ci.yml` is the host-independent test gate that stays.
