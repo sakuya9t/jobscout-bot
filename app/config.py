@@ -137,6 +137,17 @@ class Settings(BaseSettings):
     # generous without leaving stale postings around.
     scrape_max_age_days: int = 90
 
+    # Preset crawl pacing. The shared preset catalog is crawled once per run, but as
+    # the preset list grows, firing every board back-to-back hammers a dozen-plus
+    # career sites in the same few seconds. Instead the crawl spreads the companies
+    # across this many minutes: the first board is crawled immediately, then a gap is
+    # waited between each subsequent company so the requests trickle out over the
+    # window. 0 = no spacing (back-to-back — tests and a one-off catch-up crawl).
+    scrape_preset_spread_minutes: int = 30
+    # Random +/- fraction applied to each inter-company gap so boards aren't hit on a
+    # perfectly fixed cadence (0.0 = exact even spacing; 0.3 = each gap varies +/-30%).
+    scrape_preset_spread_jitter: float = 0.3
+
     # Scoring
     # Stage-1 relevance filtering is batched: one cheap call screens this many
     # postings at once (returns a verdict per posting), cutting filter calls ~Nx.

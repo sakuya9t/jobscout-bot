@@ -1,6 +1,7 @@
 """FastAPI application entrypoint."""
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -33,6 +34,25 @@ configure_logging()
 log = get_logger(__name__)
 
 
+def _resume_backlogs_on_startup() -> None:
+    """Resume work interrupted by a restart, OFF the boot critical path (see lifespan).
+
+    The scoring resume runs ``scoring_queue.reconcile`` — a sweep over every user's
+    backlog that self-heals the queue. Running it inline in lifespan made every deploy
+    block on a full reconcile, coupling deploy time and health to the queue's size;
+    that's why it now runs on a background thread instead. Each helper already guards
+    its own exceptions; the wrappers here are belt-and-suspenders so a failure can't
+    kill the thread silently."""
+    try:
+        evaluator.resume_pending_on_startup()
+    except Exception:
+        log.exception("startup scoring resume failed")
+    try:
+        kit_worker.resume_pending_on_startup()
+    except Exception:
+        log.exception("startup kit resume failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.secret_is_default:
@@ -48,10 +68,12 @@ async def lifespan(app: FastAPI):
     # whose threads don't survive a function freeze; there scoring is only enqueued
     # durably and an out-of-process drain (CLI/cron) consumes the queue instead.
     if settings.background_workers_enabled:
-        # Resume any evaluation backlog left unfinished by a prior process.
-        evaluator.resume_pending_on_startup()
-        # Finish any application kit left mid-generation by a prior process.
-        kit_worker.resume_pending_on_startup()
+        # Resume interrupted backlogs (scoring reconcile + mid-generation kits) on a
+        # background thread so the app reaches "ready" immediately. Deploy and reconcile
+        # are now independent: a push no longer waits on a full queue reconcile to boot.
+        threading.Thread(
+            target=_resume_backlogs_on_startup, name="startup-resume", daemon=True
+        ).start()
     yield
     scheduler.shutdown()
     evaluator.shutdown()

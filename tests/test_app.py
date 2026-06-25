@@ -2331,6 +2331,49 @@ def test_crawl_presets_populates_shared_positions(monkeypatch):
         assert all(db.get(models.Company, p.company_id).is_preset for p in positions)
 
 
+def test_crawl_presets_spreads_companies_over_window(monkeypatch):
+    """The crawl paces companies across scrape_preset_spread_minutes instead of firing
+    every board at once: the first crawls immediately, then an even gap between each."""
+    from app.company_presets import PRESETS
+    from app.config import settings
+    from app.db import seed_presets
+    from app.services import crawler
+
+    n = len(PRESETS)
+    monkeypatch.setattr(settings, "scrape_preset_spread_minutes", n - 1)  # 60s/gap
+    monkeypatch.setattr(settings, "scrape_preset_spread_jitter", 0.0)     # exact spacing
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: [])
+    gaps: list[float] = []
+    monkeypatch.setattr(crawler._stop, "wait", lambda t: gaps.append(t) or False)
+    with session_scope() as db:
+        seed_presets(db)
+
+    crawler.crawl_presets()
+
+    # One gap between each consecutive pair (first immediate, last unpaced), all even.
+    assert len(gaps) == n - 1
+    assert all(abs(g - 60.0) < 1e-6 for g in gaps)
+
+
+def test_crawl_presets_stops_pacing_on_shutdown(monkeypatch):
+    """A set _stop (shutdown) breaks the inter-company wait so the crawl ends promptly
+    instead of sleeping out the rest of the window."""
+    from app.config import settings
+    from app.db import seed_presets
+    from app.services import crawler
+
+    monkeypatch.setattr(settings, "scrape_preset_spread_minutes", 30)
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: [])
+    monkeypatch.setattr(crawler._stop, "wait", lambda t: True)  # shutdown signalled
+    with session_scope() as db:
+        seed_presets(db)
+
+    summary = crawler.crawl_presets()
+
+    # Broke out after the first company's gap; the rest were skipped.
+    assert summary["interrupted"] is True and summary["companies"] == 1
+
+
 def test_user_scan_does_not_crawl_presets(monkeypatch):
     from app.db import seed_presets
 

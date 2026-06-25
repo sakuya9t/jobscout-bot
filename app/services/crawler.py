@@ -8,12 +8,14 @@ store the same company's jobs once per user.
 """
 from __future__ import annotations
 
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 from sqlalchemy import select
 
+from ..config import settings
 from ..db import session_scope
 from ..logging_config import get_logger
 from ..models import Company
@@ -29,6 +31,30 @@ _MAX_LOGGED_ERRORS = 10
 _crawl_lock = threading.Lock()
 _executor: ThreadPoolExecutor | None = None
 _guard = threading.Lock()
+# Set on shutdown to break a spread-out crawl's inter-company wait promptly instead of
+# holding the worker until the next gap elapses. Cleared at the start of each crawl.
+_stop = threading.Event()
+
+
+def _inter_company_gap(total_companies: int) -> float:
+    """Seconds to wait between consecutive preset crawls so the run spreads across
+    ``scrape_preset_spread_minutes`` instead of firing every board at once. The first
+    company crawls immediately and the last has no follower to pace, so the window is
+    divided across the ``total_companies - 1`` gaps. 0 when spacing is disabled or
+    there's at most one company to crawl."""
+    spread = max(0, settings.scrape_preset_spread_minutes) * 60
+    if spread <= 0 or total_companies <= 1:
+        return 0.0
+    return spread / (total_companies - 1)
+
+
+def _jittered(gap: float) -> float:
+    """Apply ``scrape_preset_spread_jitter`` to a gap so boards aren't hit on a fixed
+    cadence. Clamped at 0 (a large jitter can't produce a negative sleep)."""
+    jitter = max(0.0, settings.scrape_preset_spread_jitter)
+    if gap <= 0 or jitter <= 0:
+        return gap
+    return max(0.0, gap * (1 + random.uniform(-jitter, jitter)))
 
 
 def _active_preset_ids(db) -> list[int]:
@@ -45,7 +71,7 @@ def crawl_presets() -> dict:
     concurrent call is a no-op. Returns a small summary dict."""
     from .matcher import _upsert_positions  # reuse the per-(company, external_id) dedup upsert
 
-    summary = {"skipped": False, "companies": 0, "new_positions": 0, "errors": []}
+    summary = {"skipped": False, "interrupted": False, "companies": 0, "new_positions": 0, "errors": []}
     if not _crawl_lock.acquire(blocking=False):
         log.info("preset crawl already running — skipping this trigger")
         summary["skipped"] = True
@@ -53,9 +79,15 @@ def crawl_presets() -> dict:
     try:
         with session_scope() as db:
             preset_ids = _active_preset_ids(db)
+        # Spread the crawl across scrape_preset_spread_minutes so a growing preset list
+        # doesn't hammer every board at once (load balancing). The first company crawls
+        # immediately; each subsequent one waits a jittered gap.
+        _stop.clear()
+        base_gap = _inter_company_gap(len(preset_ids))
+        last = len(preset_ids) - 1
         # Per-company session + commit: release the write lock between companies and
         # never let one company's failure discard another's positions.
-        for company_id in preset_ids:
+        for idx, company_id in enumerate(preset_ids):
             try:
                 with session_scope() as db:
                     company = db.get(Company, company_id)
@@ -73,6 +105,13 @@ def crawl_presets() -> dict:
                 # would propagate out, skipping every remaining company.
                 log.exception("preset crawl failed for company %s", company_id)
                 summary["errors"].append(f"company {company_id}: {exc}")
+            # Pace the next company so requests trickle out over the spread window. A set
+            # _stop (shutdown) breaks the wait so the crawl ends promptly on exit.
+            if base_gap and idx < last and _stop.wait(_jittered(base_gap)):
+                log.info("preset crawl interrupted by shutdown after %d of %d companies",
+                         idx + 1, len(preset_ids))
+                summary["interrupted"] = True
+                break
         log.info(
             "preset crawl done: %d companies, %d new positions, %d error(s)",
             summary["companies"], summary["new_positions"], len(summary["errors"]),
@@ -123,6 +162,7 @@ def presets_are_stale(max_age_hours: int = 20) -> bool:
 def shutdown() -> None:
     """Stop the background crawler executor (called on app shutdown)."""
     global _executor
+    _stop.set()  # break any in-progress spread-out crawl's inter-company wait
     with _guard:
         ex = _executor
         _executor = None

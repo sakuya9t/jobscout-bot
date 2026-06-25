@@ -2,6 +2,14 @@
 
 Project-level infrastructure history, newest first. Concise by design — see git for detail.
 
+## 2026-06 — Decouple deploy from reconcile; load-balance the preset crawl
+- Startup scoring resume (`scoring_queue.reconcile`) now runs on a background thread
+  instead of inline in the app lifespan, so a push no longer blocks readiness on a full
+  queue reconcile — deploy and reconcile are independent.
+- The shared preset crawl is spread across `JOBSCOUT_SCRAPE_PRESET_SPREAD_MINUTES`
+  (default 30) with `_JITTER` (default 0.3) rather than hitting every board back-to-back;
+  the burst stays bounded as the preset list grows.
+
 ## 2026-06 — Database: Supabase → DigitalOcean Managed Postgres
 - Production DB moved to DigitalOcean Managed Postgres, attached to the App Platform app
   (`JOBSCOUT_DATABASE_URL=${db.DATABASE_URL}`). App is DB-agnostic (SQLAlchemy/psycopg2),

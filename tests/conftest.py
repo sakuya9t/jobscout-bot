@@ -17,6 +17,9 @@ os.environ.setdefault("JOBSCOUT_BACKGROUND_WORKERS_ENABLED", "0")
 # tests (test_invite_ratelimit.py) flip these on explicitly per case.
 os.environ.setdefault("JOBSCOUT_REQUIRE_INVITE", "0")
 os.environ.setdefault("JOBSCOUT_RATE_LIMIT_ENABLED", "0")
+# Crawl the preset catalog back-to-back in tests — the production crawl spreads
+# companies over scrape_preset_spread_minutes, which would make the crawl tests sleep.
+os.environ.setdefault("JOBSCOUT_SCRAPE_PRESET_SPREAD_MINUTES", "0")
 
 import pytest  # noqa: E402
 
