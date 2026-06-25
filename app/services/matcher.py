@@ -470,6 +470,21 @@ def _apply_regex_salary(pos: Position) -> None:
     pos.salary_source = "regex"
 
 
+# Max lengths of the bounded string columns on Position (see models.py). A scraped
+# value longer than its column makes the batched insert fail and aborts the WHOLE
+# company's crawl (Meta's multi-office location strings hit this), so we clamp at the
+# single point where every scraper's data becomes a row. ``description`` is Text
+# (unbounded) and intentionally absent.
+_POSITION_FIELD_LIMITS = {
+    "external_id": 255, "title": 512, "location": 512,
+    "department": 255, "employment_type": 128, "url": 1024,
+}
+
+
+def _clip(value: str | None, maxlen: int) -> str | None:
+    return value[:maxlen] if isinstance(value, str) and len(value) > maxlen else value
+
+
 def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], list[str]]:
     """Scrape one company and upsert. Returns (new_positions, errors)."""
     errors: list[str] = []
@@ -507,12 +522,12 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
             continue
         pos = Position(
             company_id=company.id,
-            external_id=sp.external_id,
-            title=sp.title,
-            location=sp.location,
-            department=sp.department,
-            employment_type=sp.employment_type,
-            url=sp.url,
+            external_id=_clip(sp.external_id, _POSITION_FIELD_LIMITS["external_id"]),
+            title=_clip(sp.title, _POSITION_FIELD_LIMITS["title"]),
+            location=_clip(sp.location, _POSITION_FIELD_LIMITS["location"]),
+            department=_clip(sp.department, _POSITION_FIELD_LIMITS["department"]),
+            employment_type=_clip(sp.employment_type, _POSITION_FIELD_LIMITS["employment_type"]),
+            url=_clip(sp.url, _POSITION_FIELD_LIMITS["url"]),
             description=sp.description,
             posted_at=sp.posted_at,
         )

@@ -925,7 +925,22 @@ def _jsonld_location(job: dict) -> str | None:
             )
         if seg and seg not in seen:
             seen.append(seg)
-    return "; ".join(seen) or None
+    if not seen:
+        return None
+    # A role open in many offices (Meta lists dozens) can blow past the location
+    # column (varchar(512)). Keep the offices that fit a budget and summarize the rest
+    # as "+N more" — both readable and safely within the column, instead of a hard
+    # mid-string truncation (or a batch-aborting overflow).
+    kept: list[str] = []
+    used = 0
+    for seg in seen:
+        extra = len(seg) + (2 if kept else 0)  # "; " separator
+        if kept and used + extra > 460:  # leave headroom for the " +N more" tail
+            break
+        kept.append(seg)
+        used += extra
+    more = len(seen) - len(kept)
+    return "; ".join(kept) + (f" +{more} more" if more else "")
 
 
 def _sitemap_position(url: str, lastmod: str | None) -> ScrapedPosition:
