@@ -95,6 +95,7 @@ def get_latest_job_list(
     min_win: int = 0,
     posted_within_days: int | None = None,
     company_id: int | None = None,
+    sort: str = "match",
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -104,14 +105,15 @@ def get_latest_job_list(
     matching-only or all (incl. non-matching) jobs; ``min_score``/``min_win`` keep
     only matches at or above those thresholds; ``posted_within_days`` keeps only
     recently-listed jobs (None = all); ``company_id`` narrows to one watch-list
-    company (None = all); ``limit``/``offset`` paginate. Run stats and warnings come
-    from the most recent saved snapshot (the last completed drain); frozen versions
-    are served by ``/job-lists/{id}``."""
+    company (None = all); ``sort`` orders by best-match (default) or salary
+    (``salary_desc``/``salary_asc``); ``limit``/``offset`` paginate. Run stats and
+    warnings come from the most recent saved snapshot (the last completed drain);
+    frozen versions are served by ``/job-lists/{id}``."""
     items, total = reporter.build_job_list(
         db, user, category=_category(category),
         min_score=max(0, min_score), min_win=max(0, min_win),
         posted_within_days=posted_within_days, company_id=company_id,
-        limit=_safe_limit(limit), offset=max(0, offset),
+        sort=_sort(sort), limit=_safe_limit(limit), offset=max(0, offset),
     )
     snapshot = db.scalar(
         select(JobListSnapshot)
@@ -144,13 +146,14 @@ def get_job_list(
     min_win: int = 0,
     posted_within_days: int | None = None,
     company_id: int | None = None,
+    sort: str = "match",
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """A frozen saved version. Snapshots only store matching jobs, so the
     'all'/non-matching category has nothing extra to show here — pagination just
     pages over the stored matches, after the score/win, post-date and company
-    filters are applied."""
+    filters are applied. ``sort`` re-orders the stored rows (best-match or salary)."""
     snapshot = db.get(JobListSnapshot, snapshot_id)
     if not snapshot or snapshot.user_id != user.id:
         raise HTTPException(status_code=404, detail="Job list not found")
@@ -172,6 +175,7 @@ def get_job_list(
     reporter.tag_applied(db, user, all_items)
     reporter.tag_removed(db, user, all_items)
     all_items = [m for m in all_items if not m.get("removed") or m.get("applied")]
+    all_items = reporter.sort_items_by_salary(all_items, _sort(sort))
     start = max(0, offset)
     page = all_items[start : start + _safe_limit(limit)]
     reporter.tag_kit_status(db, user, page)
@@ -204,3 +208,11 @@ def _safe_limit(limit: int) -> int:
 def _category(value: str) -> str:
     """Clamp the requested job-list category to a known one (default matching)."""
     return value if value in reporter.JOB_CATEGORIES else "matching"
+
+
+_SORTS = {"match", "salary_desc", "salary_asc"}
+
+
+def _sort(value: str) -> str:
+    """Clamp the requested job-list sort to a known one (default best-match)."""
+    return value if value in _SORTS else "match"

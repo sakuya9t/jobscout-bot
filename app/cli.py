@@ -291,6 +291,48 @@ def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_salaries(args: argparse.Namespace) -> int:
+    """Populate Position.salary_* for already-stored postings with the deterministic
+    regex extractor (services.salary) — free, no LLM, idempotent. Skips rows whose
+    salary came from the LLM scoring pass (salary_source == 'llm') so it never
+    downgrades a richer value, and clears a stale regex value that no longer parses.
+    Re-running only touches rows whose parse changed."""
+    from sqlalchemy import select
+
+    from .db import init_db, session_scope
+    from .models import Position
+    from .services.salary import extract_salary
+
+    init_db()  # ensures the salary_* columns exist (additive schema reconcile)
+    scanned = filled = cleared = 0
+    with session_scope() as db:
+        positions = db.scalars(select(Position)).all()
+        for i, p in enumerate(positions, 1):
+            if p.salary_source == "llm":
+                continue  # the scoring model's value wins; don't overwrite it
+            scanned += 1
+            sal = extract_salary(p.description)
+            current = (p.salary_min, p.salary_max, p.salary_currency, p.salary_period)
+            if sal is None:
+                if p.salary_source == "regex" and any(current):
+                    p.salary_min = p.salary_max = p.salary_currency = p.salary_period = None
+                    p.salary_source = None
+                    cleared += 1
+                continue
+            new = sal.as_fields()
+            if current != (new["salary_min"], new["salary_max"],
+                           new["salary_currency"], new["salary_period"]):
+                for key, value in new.items():
+                    setattr(p, key, value)
+                p.salary_source = "regex"
+                filled += 1
+            if i % 1000 == 0:
+                db.commit()  # release the write lock periodically over a big table
+        db.commit()
+    print(f"Scanned {scanned} posting(s): set/updated {filled}, cleared {cleared} stale.")
+    return 0
+
+
 def _redact_url(url: str) -> str:
     """Mask the password in a DB URL for safe printing."""
     return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", url)
@@ -497,6 +539,10 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0,
                    help="Max postings to fetch per company (0 = all description-less rows)")
     p.set_defaults(func=cmd_backfill_descriptions)
+
+    sub.add_parser("backfill-salaries",
+                   help="Parse pay ranges from stored descriptions into Position.salary_* "
+                        "(regex, free, idempotent)").set_defaults(func=cmd_backfill_salaries)
 
     p = sub.add_parser("migrate-db",
                        help="Copy schema + data to another DB (e.g. SQLite -> DigitalOcean Managed Postgres)")

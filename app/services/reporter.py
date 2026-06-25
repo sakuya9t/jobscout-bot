@@ -5,7 +5,7 @@ import html
 import json
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -20,6 +20,7 @@ from ..models import (
     User,
 )
 from ..timeutil import utcnow
+from . import salary
 from .matcher import ERROR_MODEL
 
 
@@ -93,6 +94,15 @@ def _match_row(match: MatchResult, pos: Position, company: Company, *,
         "removed": pos.removed_at is not None,
         "scored_at": match.created_at.isoformat() if match.created_at else None,
         "listed_at": listed.isoformat() if listed else None,
+        # Preformatted pay range parsed from the posting (None when none stated). The
+        # raw max + period ride along so the job list can sort by salary (annualized).
+        "salary_display": salary.format_range(
+            pos.salary_min, pos.salary_max, pos.salary_currency, pos.salary_period
+        ),
+        "salary_min": pos.salary_min,
+        "salary_max": pos.salary_max,
+        "salary_currency": pos.salary_currency,
+        "salary_period": pos.salary_period,
         "applied": False,  # overlaid per-user by tag_applied (live, not stored)
         # Application-kit status overlaid by tag_kit_status (live, not stored):
         # None (no kit yet) | "generating" | "ok" | "error".
@@ -222,6 +232,45 @@ def build_report(
     return report
 
 
+def _salary_annual_usd_sql():
+    """Position.salary_max scaled to an annual *USD* figure in SQL — mirroring
+    salary.ANNUAL_FACTOR + salary.USD_RATES — so a mixed-currency, mixed-period list
+    sorts on one footing. NULL stays NULL (sorted last by the caller)."""
+    annual = case(
+        (Position.salary_period == "hour", Position.salary_max * 2080),
+        (Position.salary_period == "month", Position.salary_max * 12),
+        (Position.salary_period == "week", Position.salary_max * 52),
+        else_=Position.salary_max,
+    )
+    rate = case(
+        *[(Position.salary_currency == cur, factor)
+          for cur, factor in salary.USD_RATES.items() if cur != "USD"],
+        else_=1.0,
+    )
+    return annual * rate
+
+
+def _job_list_order(sort: str) -> list:
+    """ORDER BY for the live job list. ``salary_desc``/``salary_asc`` rank by the
+    annualized pay ceiling with postings that disclose no pay always last (``is_(None)``
+    sorts False<True on both SQLite and Postgres, so no DB-specific NULLS LAST needed),
+    tie-broken by match quality. Anything else is the default best-match ordering."""
+    if sort in ("salary_desc", "salary_asc"):
+        sal = _salary_annual_usd_sql()
+        return [
+            sal.is_(None),
+            sal.asc() if sort == "salary_asc" else sal.desc(),
+            MatchResult.match_score.desc(),
+            MatchResult.created_at.desc(),
+        ]
+    return [
+        MatchResult.passed_filter.desc(),
+        MatchResult.match_score.desc(),
+        MatchResult.win_probability.desc(),
+        MatchResult.created_at.desc(),
+    ]
+
+
 def build_job_list(
     db: Session,
     user: User,
@@ -231,6 +280,7 @@ def build_job_list(
     min_win: int = 0,
     posted_within_days: int | None = None,
     company_id: int | None = None,
+    sort: str = "match",
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
@@ -287,12 +337,7 @@ def build_job_list(
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
 
     rows = db.execute(
-        base.order_by(
-            MatchResult.passed_filter.desc(),
-            MatchResult.match_score.desc(),
-            MatchResult.win_probability.desc(),
-            MatchResult.created_at.desc(),
-        )
+        base.order_by(*_job_list_order(sort))
         .offset(max(0, offset))
         .limit(limit)
     ).all()
@@ -364,6 +409,13 @@ def build_position_detail(db: Session, user: User, position_id: int) -> dict | N
         "non_matching": not match.passed_filter,
         "removed": pos.removed_at is not None,
         "applied": False,
+        "salary_min": pos.salary_min,
+        "salary_max": pos.salary_max,
+        "salary_currency": pos.salary_currency,
+        "salary_period": pos.salary_period,
+        "salary_display": salary.format_range(
+            pos.salary_min, pos.salary_max, pos.salary_currency, pos.salary_period
+        ),
     }
     tag_applied(db, user, [detail])
     return detail
@@ -373,7 +425,9 @@ def _match_out_payload(match: dict) -> dict:
     keep = {
         "position_id", "company", "title", "location", "url", "match_score",
         "win_probability", "reasoning", "strengths", "gaps", "below_threshold",
-        "non_matching", "removed", "listed_at",
+        "non_matching", "removed", "listed_at", "salary_display",
+        # Stored so a frozen snapshot can still be re-sorted by salary on read.
+        "salary_min", "salary_max", "salary_currency", "salary_period",
     }
     return {k: v for k, v in match.items() if k in keep}
 
@@ -405,6 +459,20 @@ def job_list_items(snapshot: JobListSnapshot) -> list[dict]:
     except json.JSONDecodeError:
         return []
     return data if isinstance(data, list) else []
+
+
+def sort_items_by_salary(items: list[dict], sort: str) -> list[dict]:
+    """Re-order stored snapshot rows by annualized pay for ``salary_desc``/``salary_asc``
+    (no-op otherwise). Postings without a parsed range — including older snapshots saved
+    before salary fields existed — always sort last, regardless of direction."""
+    if sort not in ("salary_desc", "salary_asc"):
+        return items
+    keyed = [(salary.annual_usd(m.get("salary_max"), m.get("salary_period"),
+                                m.get("salary_currency")), m) for m in items]
+    present = sorted((kv for kv in keyed if kv[0] is not None),
+                     key=lambda kv: kv[0], reverse=(sort == "salary_desc"))
+    absent = [m for k, m in keyed if k is None]
+    return [m for _, m in present] + absent
 
 
 def filter_items_posted_within(items: list[dict], posted_within_days: int | None) -> list[dict]:
