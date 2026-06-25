@@ -25,6 +25,7 @@ from ..schemas import MatchVerdict
 from ..timeutil import utcnow
 from . import llm, scraper
 from .ollama_client import OllamaBudgetError, OllamaClient, OllamaError
+from .salary import extract_salary
 
 log = logging.getLogger(__name__)
 
@@ -77,14 +78,33 @@ SYSTEM_PROMPT = (
     "role requirements, and a job posting, decide whether the posting genuinely "
     "matches the requirements, then score the fit. Be strict and realistic — do "
     "not inflate scores.\n"
-    "Rubric for match_score (0-100): must-have skills overlap, seniority fit, "
-    "domain/industry overlap, location & work-eligibility fit, and the candidate's "
-    "stated requirement notes.\n"
+    "Rubric for match_score (0-100), in rough order of weight:\n"
+    "1. VERTICAL EXPERIENCE — weigh this MOST heavily. Has the candidate actually "
+    "DONE this kind of work before: the same domain, product area, and problem "
+    "space the posting is about (e.g. ads ranking, payments risk, database "
+    "internals, LLM infra, autonomous-vehicle perception), not merely an adjacent "
+    "or generic background? Many of these roles explicitly want someone who has "
+    "done exactly this before. A direct prior match should score well above a "
+    "strong-but-generic candidate; little or no relevant vertical experience "
+    "should cap match_score in the low-to-mid range even when the raw skills and "
+    "seniority line up.\n"
+    "2. Must-have skills overlap. 3. Seniority fit. 4. Location & work-eligibility "
+    "fit. 5. The candidate's stated requirement notes.\n"
     "win_probability (0-100) is the candidate's realistic chance of receiving an "
-    "offer given typical competition, factoring seniority gaps and missing skills.\n"
+    "offer given typical competition, factoring vertical-experience fit, seniority "
+    "gaps, and missing skills — a candidate who has done this exact work before is "
+    "far likelier to land it than one relying on transferable skills.\n"
     "Set matches_requirements=false if the role violates a hard requirement "
-    "(wrong location, excluded keyword, wrong seniority). Keep reasoning to 2-4 "
-    "sentences addressed to the candidate."
+    "(wrong location, excluded keyword, wrong seniority). In `strengths`/`gaps` and "
+    "`reasoning`, state explicitly whether the candidate has direct vertical "
+    "experience for this role. Keep reasoning to 2-4 sentences addressed to the "
+    "candidate.\n"
+    "If — and ONLY if — the posting EXPLICITLY states a pay/salary range, fill "
+    "salary_min and salary_max (integers, no symbols or commas), salary_currency (a "
+    "code like USD/EUR/GBP) and salary_period (year|hour|month|week). Use the BASE-pay "
+    "range, not bonus, equity, or total-comp figures; if several level/geographic "
+    "ranges are listed, report the overall lowest min and highest max. If the posting "
+    "states no pay, leave all four null — never guess or infer from market norms."
 )
 
 _RESUME_CHARS = 6000
@@ -390,6 +410,26 @@ def _persist_exclude_reject(
     )
 
 
+def _apply_llm_salary(pos: Position, verdict: MatchVerdict) -> None:
+    """Overlay the salary the scoring model read off the posting onto the Position
+    (``salary_source = 'llm'`` so a later regex re-scrape won't downgrade it). Tolerates
+    a one-sided range and a reversed min/max; ignores values outside a sane band so a
+    hallucinated number can't poison the field."""
+    lo, hi = verdict.salary_min, verdict.salary_max
+    if lo is None and hi is None:
+        return
+    lo = lo if lo is not None else hi
+    hi = hi if hi is not None else lo
+    if lo > hi:
+        lo, hi = hi, lo
+    if not (1 <= lo and hi <= 20_000_000):
+        return
+    pos.salary_min, pos.salary_max = lo, hi
+    pos.salary_currency = (verdict.salary_currency or "USD")[:8]
+    pos.salary_period = (verdict.salary_period or "year")[:16]
+    pos.salary_source = "llm"
+
+
 def _persist_score_result(
     db: Session,
     user: User,
@@ -402,6 +442,7 @@ def _persist_score_result(
     """Persist one scored verdict; returns the row id, or None if a concurrent drain
     already scored this pair. Upserts, so a successful retry converts the pair's error
     marker into this real result (and resets its retry counter)."""
+    _apply_llm_salary(pos, verdict)  # position-level pay range, refined from the full JD
     return _upsert_match(
         db, user, resume, interest, pos,
         passed_filter=verdict.matches_requirements,
@@ -412,6 +453,36 @@ def _persist_score_result(
         gaps=json.dumps(verdict.gaps),
         model=model, attempts=0,
     )
+
+
+def _apply_regex_salary(pos: Position) -> None:
+    """Populate a position's ``salary_*`` from its description via the cheap, free,
+    deterministic regex (services.salary). No-op when nothing parses. Never clobbers a
+    value the LLM scoring pass already produced (``salary_source == 'llm'`` wins), so a
+    re-scrape can't downgrade a richer LLM extraction back to the regex guess."""
+    if pos.salary_source == "llm":
+        return
+    sal = extract_salary(pos.description)
+    if sal is None:
+        return
+    for key, value in sal.as_fields().items():
+        setattr(pos, key, value)
+    pos.salary_source = "regex"
+
+
+# Max lengths of the bounded string columns on Position (see models.py). A scraped
+# value longer than its column makes the batched insert fail and aborts the WHOLE
+# company's crawl (Meta's multi-office location strings hit this), so we clamp at the
+# single point where every scraper's data becomes a row. ``description`` is Text
+# (unbounded) and intentionally absent.
+_POSITION_FIELD_LIMITS = {
+    "external_id": 255, "title": 512, "location": 512,
+    "department": 255, "employment_type": 128, "url": 1024,
+}
+
+
+def _clip(value: str | None, maxlen: int) -> str | None:
+    return value[:maxlen] if isinstance(value, str) and len(value) > maxlen else value
 
 
 def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], list[str]]:
@@ -451,17 +522,18 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
             continue
         pos = Position(
             company_id=company.id,
-            external_id=sp.external_id,
-            title=sp.title,
-            location=sp.location,
-            department=sp.department,
-            employment_type=sp.employment_type,
-            url=sp.url,
+            external_id=_clip(sp.external_id, _POSITION_FIELD_LIMITS["external_id"]),
+            title=_clip(sp.title, _POSITION_FIELD_LIMITS["title"]),
+            location=_clip(sp.location, _POSITION_FIELD_LIMITS["location"]),
+            department=_clip(sp.department, _POSITION_FIELD_LIMITS["department"]),
+            employment_type=_clip(sp.employment_type, _POSITION_FIELD_LIMITS["employment_type"]),
+            url=_clip(sp.url, _POSITION_FIELD_LIMITS["url"]),
             description=sp.description,
             posted_at=sp.posted_at,
         )
         db.add(pos)
         new_positions.append(pos)
+        _apply_regex_salary(pos)  # parse pay range from the description we just stored
         # Guard against a board repeating an id within one scrape — a second
         # row would violate uq_position_company_extid and abort the whole run.
         existing[sp.external_id] = pos
@@ -476,6 +548,7 @@ def _upsert_positions(db: Session, company: Company) -> tuple[list[Position], li
             text = descs.get(url)
             if text:
                 pos.description = text
+                _apply_regex_salary(pos)  # eightfold desc arrives now — parse pay range
 
     _reconcile_removals(db, company, live_ids, coverage, existing)
 
@@ -921,7 +994,13 @@ def scrape_for_all_users() -> dict[int, RunResult]:
     until the user runs a scan, which scores the whole backlog."""
     from . import crawler
 
-    crawler.crawl_presets()  # shared, once — not per user
+    try:
+        crawler.crawl_presets()  # shared, once — not per user
+    except Exception:
+        # Isolate a preset-crawl failure (e.g. the DB is unreachable) so it doesn't skip
+        # every user's custom-company scrape below; crawl_presets already logs its own
+        # per-company failures, this catches a failure of the crawl as a whole.
+        log.exception("daily scrape: preset crawl failed")
 
     summaries: dict[int, RunResult] = {}
     with session_scope() as db:
@@ -933,6 +1012,11 @@ def scrape_for_all_users() -> dict[int, RunResult]:
                 res = scrape_only(db, user)
                 res.finalize_errors()
                 summaries[uid] = res
+            # Surface per-user warnings (e.g. a scrape/DB problem on one company) — they
+            # were previously returned but never logged, so a partial failure was silent.
+            if res.errors:
+                log.warning("daily scrape: user %s had %d warning(s): %s",
+                            uid, res.error_count, "; ".join(res.errors))
         except Exception as exc:  # isolate per-user failures
             log.exception("daily scrape failed for user %s", uid)
             r = RunResult()

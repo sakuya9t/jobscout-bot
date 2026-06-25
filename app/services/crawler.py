@@ -21,6 +21,10 @@ from ..timeutil import utcnow
 
 log = get_logger(__name__)
 
+# Cap on how many per-company error messages a single crawl logs, so one broad outage
+# (every company failing) can't flood the logs while still surfacing what went wrong.
+_MAX_LOGGED_ERRORS = 10
+
 # Only one crawl runs at a time across daily cron / startup / admin endpoint.
 _crawl_lock = threading.Lock()
 _executor: ThreadPoolExecutor | None = None
@@ -52,18 +56,31 @@ def crawl_presets() -> dict:
         # Per-company session + commit: release the write lock between companies and
         # never let one company's failure discard another's positions.
         for company_id in preset_ids:
-            with session_scope() as db:
-                company = db.get(Company, company_id)
-                if company is None:
-                    continue
-                new_positions, errs = _upsert_positions(db, company)
-                summary["companies"] += 1
-                summary["new_positions"] += len(new_positions)
-                summary["errors"].extend(errs)
+            try:
+                with session_scope() as db:
+                    company = db.get(Company, company_id)
+                    if company is None:
+                        continue
+                    new_positions, errs = _upsert_positions(db, company)
+                    summary["companies"] += 1
+                    summary["new_positions"] += len(new_positions)
+                    summary["errors"].extend(errs)
+            except Exception as exc:
+                # A DB-level failure (e.g. the managed-Postgres connection pool refusing
+                # clients, or the DB unreachable) raises here rather than coming back as a scrape-error
+                # string. Isolate it per company so one outage doesn't abort the rest of
+                # the crawl, and record it loudly — this path was previously silent and
+                # would propagate out, skipping every remaining company.
+                log.exception("preset crawl failed for company %s", company_id)
+                summary["errors"].append(f"company {company_id}: {exc}")
         log.info(
             "preset crawl done: %d companies, %d new positions, %d error(s)",
             summary["companies"], summary["new_positions"], len(summary["errors"]),
         )
+        # Log the actual messages, not just the count, so a scrape/DB problem is
+        # diagnosable from the logs (capped so one outage can't flood them).
+        for msg in summary["errors"][:_MAX_LOGGED_ERRORS]:
+            log.warning("preset crawl warning: %s", msg)
     finally:
         _crawl_lock.release()
     return summary

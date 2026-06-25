@@ -7,7 +7,7 @@ detached per-request thread: instead a bounded pool of at most
 `scoring_max_concurrency` worker threads claim users off the queue and drain them.
 That bound is the database-connection throttle — a peak of users all hitting
 *Run scan* enqueues cheap rows but can never push more than N drains (and thus N
-Supabase connections) at once. The same `scoring_queue` is drained by the
+DB connections) at once. The same `scoring_queue` is drained by the
 `jobscout run-scoring` cron via `drain_queue` (one-shot, run-to-completion).
 
 Concurrency model (web path):
@@ -16,9 +16,8 @@ Concurrency model (web path):
   `scoring_queue.claim_one` (FOR UPDATE SKIP LOCKED) -> drain that user -> repeat,
   exiting when the queue is empty. The per-user `scoring_jobs` row is the claim, so
   two workers (or a web worker and the cron) never drain the same user.
-- On serverless (`background_workers_enabled=0`) `ensure_draining` is a no-op:
-  threads don't survive a function freeze, so `ensure_running` only enqueues and the
-  GitHub Actions cron does the draining.
+- With `background_workers_enabled=0` `ensure_draining` is a no-op: `ensure_running`
+  only enqueues and the `jobscout run-scoring` cron drains the queue out-of-process.
 """
 from __future__ import annotations
 
@@ -31,7 +30,7 @@ from ..config import settings
 from ..db import session_scope
 from ..logging_config import get_logger
 from ..models import User
-from . import dispatch, matcher, reporter, scoring_log, scoring_queue
+from . import matcher, reporter, scoring_log, scoring_queue
 
 log = get_logger(__name__)
 
@@ -59,11 +58,10 @@ def _get_executor() -> ThreadPoolExecutor:
 
 
 def ensure_running(user_id: int) -> None:
-    """Enqueue ``user_id`` for scoring and kick the drain. Always enqueues (durably,
-    so the scheduled cron is a backstop even on serverless). On a long-lived server we
-    drain in-process (`ensure_draining`); where threads don't survive (serverless) we
-    instead fire the event-driven dispatch so a consumer drains now rather than at the
-    next scheduled run (`dispatch.dispatch_scoring_run`, a no-op when unconfigured)."""
+    """Enqueue ``user_id`` for scoring and kick the in-process drain. Always enqueues
+    (durably, so the `jobscout run-scoring` cron is a backstop). On a long-lived server
+    we drain in-process (`ensure_draining`); with `background_workers_enabled=0` we only
+    enqueue and let the scheduled cron drain."""
     with session_scope() as db:
         # force=True: this is a user-initiated re-run, so re-arm even a 'running' row —
         # recovers a job orphaned by a crashed/frozen worker, which would otherwise
@@ -71,8 +69,6 @@ def ensure_running(user_id: int) -> None:
         scoring_queue.enqueue(db, user_id, force=True)
     if settings.background_workers_enabled:
         ensure_draining()
-    else:
-        dispatch.dispatch_scoring_run()
 
 
 def ensure_draining() -> None:

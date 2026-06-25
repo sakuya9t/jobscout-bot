@@ -413,9 +413,12 @@ def scrape_google(careers_url: str | None, max_pages: int) -> list[ScrapedPositi
 # via ``ats_token``; if omitted we derive it by stripping a leading careers subdomain.
 _EIGHTFOLD_PAGE = 10
 _CAREERS_SUBDOMAINS = {"jobs", "careers", "career", "job", "apply", "talent", "recruiting"}
-# Pull JSON-LD <script> blocks out of an eightfold job detail page.
+# Pull JSON-LD <script> blocks out of a job detail page. Some boards HTML-entity-encode
+# the ``+`` in the type attribute (Phenom emits ``application/ld&#x2B;json``), so accept
+# the literal ``+`` and its hex/decimal entity forms.
 _LD_JSON_RE = re.compile(
-    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.S
+    r'<script[^>]+type=["\']application/ld(?:\+|&#x2[Bb];|&#43;)json["\'][^>]*>(.*?)</script>',
+    re.I | re.S,
 )
 
 
@@ -893,22 +896,51 @@ def _jsonld_jobposting(html: str) -> dict | None:
 
 
 def _jsonld_location(job: dict) -> str | None:
-    """Flatten a JobPosting's ``jobLocation`` (one or many) to "City, Region, Country"."""
+    """Flatten a JobPosting's ``jobLocation`` (one or many) to a readable string.
+
+    Prefer each ``Place``'s own ``name`` ("City, ST") when present: some boards
+    (Meta) carry a correct ``name`` but a broken/duplicated ``address`` breakdown
+    (every role claims the same city). Otherwise fall back to joining the
+    ``PostalAddress`` fields (Citadel). Only string-valued address fields are
+    joined, so a nested ``addressCountry`` object (``{"@type": "Country", ...}``,
+    again Meta) is skipped rather than stringified into the result.
+    """
     raw = job.get("jobLocation")
     items = raw if isinstance(raw, list) else [raw]
     seen: list[str] = []
     for it in items:
-        addr = it.get("address") if isinstance(it, dict) else None
-        if not isinstance(addr, dict):
+        if not isinstance(it, dict):
             continue
-        seg = ", ".join(
-            str(addr[k])
-            for k in ("addressLocality", "addressRegion", "addressCountry")
-            if addr.get(k)
-        )
+        name = it.get("name")
+        if isinstance(name, str) and name.strip():
+            seg = name.strip()
+        else:
+            addr = it.get("address")
+            if not isinstance(addr, dict):
+                continue
+            seg = ", ".join(
+                addr[k]
+                for k in ("addressLocality", "addressRegion", "addressCountry")
+                if isinstance(addr.get(k), str) and addr[k]
+            )
         if seg and seg not in seen:
             seen.append(seg)
-    return "; ".join(seen) or None
+    if not seen:
+        return None
+    # A role open in many offices (Meta lists dozens) can blow past the location
+    # column (varchar(512)). Keep the offices that fit a budget and summarize the rest
+    # as "+N more" — both readable and safely within the column, instead of a hard
+    # mid-string truncation (or a batch-aborting overflow).
+    kept: list[str] = []
+    used = 0
+    for seg in seen:
+        extra = len(seg) + (2 if kept else 0)  # "; " separator
+        if kept and used + extra > 460:  # leave headroom for the " +N more" tail
+            break
+        kept.append(seg)
+        used += extra
+    more = len(seen) - len(kept)
+    return "; ".join(kept) + (f" +{more} more" if more else "")
 
 
 def _sitemap_position(url: str, lastmod: str | None) -> ScrapedPosition:
@@ -939,9 +971,13 @@ def _sitemap_position(url: str, lastmod: str | None) -> ScrapedPosition:
     )
 
 
-def scrape_sitemap(sitemap_url: str) -> list[ScrapedPosition]:
+def scrape_sitemap(sitemap_url: str, url_filter: str | None = None) -> list[ScrapedPosition]:
     from concurrent.futures import ThreadPoolExecutor
 
+    # When the sitemap mixes job-detail pages with marketing/blog URLs, ``url_filter``
+    # (a regex) keeps only the job-detail entries so we don't fetch — and surface as
+    # description-less "jobs" — the non-job pages. None keeps every entry.
+    keep = re.compile(url_filter) if url_filter else None
     xml = _fetch_impersonated(sitemap_url)
     entries: list[tuple[str, str | None]] = []
     seen: set[str] = set()
@@ -951,6 +987,8 @@ def scrape_sitemap(sitemap_url: str) -> list[ScrapedPosition]:
             continue
         url = _http_url(m.group(1).strip())
         if not url or url in seen:
+            continue
+        if keep and not keep.search(url):
             continue
         seen.add(url)
         lm = _SITEMAP_LASTMOD.search(block)
@@ -1099,7 +1137,7 @@ def scrape_company(company) -> ScrapeResult:
     elif ats_type == "sitemap":
         if not token:
             raise ScrapeError(f"{company.name}: sitemap scrape needs ats_token (the sitemap URL)")
-        results = scrape_sitemap(token)
+        results = scrape_sitemap(token, getattr(company, "job_url_filter", None))
         # The sitemap enumerates every open-role page, so it's a complete listing:
         # an id's absence means the role was removed (same as the full-board ATSs).
         coverage = "full"

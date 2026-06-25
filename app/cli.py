@@ -20,8 +20,8 @@ Commands:
   backfill-descriptions
                    Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
                    whose search API returns none, so older postings become scoreable.
-  migrate-db       Copy schema + data to another database (e.g. SQLite -> Supabase
-                   Postgres) to publish the app on a hosted DB.
+  migrate-db       Copy schema + data to another database (e.g. SQLite -> DigitalOcean
+                   Managed Postgres) to publish the app on a hosted DB.
 """
 from __future__ import annotations
 
@@ -57,21 +57,20 @@ def cmd_mcp(_: argparse.Namespace) -> int:
 
 def cmd_run_daily(_: argparse.Namespace) -> int:
     from .db import init_db, session_scope
-    from .services import dispatch, matcher, scoring_queue
+    from .services import matcher, scoring_queue
 
     init_db()
     summaries = matcher.scrape_for_all_users()
     new = sum(s.new_positions for s in summaries.values())
     errors = [e for s in summaries.values() for e in s.errors]
-    # Publish the scraped work: enqueue users with a backlog and fire the scoring
-    # trigger (no-op when JOBSCOUT_SCORING_DISPATCH_URL is unset). Scrape and scoring
-    # remain separate jobs — this only marks work ready and kicks the consumer.
+    # Publish the scraped work: enqueue every user with a backlog. Scrape and scoring
+    # remain separate jobs — this only marks work ready; the `jobscout run-scoring`
+    # drain (or the long-lived server's in-process workers) does the matching.
     with session_scope() as db:
         enqueued = scoring_queue.reconcile(db)
-    fired = dispatch.dispatch_scoring_run() if enqueued else False
     print(
         f"Users: {len(summaries)} | new positions: {new} | warnings: {len(errors)} | "
-        f"enqueued: {enqueued} | dispatched: {fired}"
+        f"enqueued: {enqueued}"
     )
     for e in errors:
         print(f"  - {e}")
@@ -85,7 +84,7 @@ def cmd_run_scoring(_: argparse.Namespace) -> int:
     have work. Separate from ``run-daily`` (scrape-only) on purpose."""
     from .config import settings
     from .db import init_db, session_scope
-    from .services import dispatch, evaluator, scoring_queue
+    from .services import evaluator, scoring_queue
 
     init_db()
     with session_scope() as db:
@@ -97,16 +96,15 @@ def cmd_run_scoring(_: argparse.Namespace) -> int:
     with session_scope() as db:
         states = scoring_queue.counts_by_state(db)
         more = scoring_queue.has_pending(db)
-    # The per-run budget may stop a big backlog mid-drain (rows re-armed to pending);
-    # re-fire the trigger so the next run continues instead of waiting for the schedule.
-    fired = dispatch.dispatch_scoring_run() if more else False
     print(
         f"Enqueued: {enqueued} | users drained: {summary.users} | "
         f"scored: {summary.scored} | failed: {summary.failed}"
     )
     print(f"Queue: {states or '{}'}")  # e.g. {'done': 3, 'error': 1, 'pending': 2}
     if more:
-        print(f"Backlog remains -> re-dispatched follow-up run: {fired}")
+        # The per-run budget stopped a big backlog mid-drain (rows re-armed to pending);
+        # the next scheduled run continues it.
+        print("Backlog remains -> will continue on the next run")
     for e in summary.errors:
         print(f"  - {e}")
     return 0
@@ -293,6 +291,48 @@ def cmd_backfill_descriptions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_salaries(args: argparse.Namespace) -> int:
+    """Populate Position.salary_* for already-stored postings with the deterministic
+    regex extractor (services.salary) — free, no LLM, idempotent. Skips rows whose
+    salary came from the LLM scoring pass (salary_source == 'llm') so it never
+    downgrades a richer value, and clears a stale regex value that no longer parses.
+    Re-running only touches rows whose parse changed."""
+    from sqlalchemy import select
+
+    from .db import init_db, session_scope
+    from .models import Position
+    from .services.salary import extract_salary
+
+    init_db()  # ensures the salary_* columns exist (additive schema reconcile)
+    scanned = filled = cleared = 0
+    with session_scope() as db:
+        positions = db.scalars(select(Position)).all()
+        for i, p in enumerate(positions, 1):
+            if p.salary_source == "llm":
+                continue  # the scoring model's value wins; don't overwrite it
+            scanned += 1
+            sal = extract_salary(p.description)
+            current = (p.salary_min, p.salary_max, p.salary_currency, p.salary_period)
+            if sal is None:
+                if p.salary_source == "regex" and any(current):
+                    p.salary_min = p.salary_max = p.salary_currency = p.salary_period = None
+                    p.salary_source = None
+                    cleared += 1
+                continue
+            new = sal.as_fields()
+            if current != (new["salary_min"], new["salary_max"],
+                           new["salary_currency"], new["salary_period"]):
+                for key, value in new.items():
+                    setattr(p, key, value)
+                p.salary_source = "regex"
+                filled += 1
+            if i % 1000 == 0:
+                db.commit()  # release the write lock periodically over a big table
+        db.commit()
+    print(f"Scanned {scanned} posting(s): set/updated {filled}, cleared {cleared} stale.")
+    return 0
+
+
 def _redact_url(url: str) -> str:
     """Mask the password in a DB URL for safe printing."""
     return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", url)
@@ -300,7 +340,7 @@ def _redact_url(url: str) -> str:
 
 def cmd_migrate_db(args: argparse.Namespace) -> int:
     """Copy schema + all rows from the current database (``settings.database_url``,
-    e.g. the local SQLite file) into a target database (e.g. Supabase Postgres).
+    e.g. the local SQLite file) into a target database (e.g. DigitalOcean Managed Postgres).
 
     Creates the schema on the target from the ORM models, copies every table in
     FK-safe dependency order, then fixes Postgres autoincrement sequences so future
@@ -500,8 +540,12 @@ def main() -> None:
                    help="Max postings to fetch per company (0 = all description-less rows)")
     p.set_defaults(func=cmd_backfill_descriptions)
 
+    sub.add_parser("backfill-salaries",
+                   help="Parse pay ranges from stored descriptions into Position.salary_* "
+                        "(regex, free, idempotent)").set_defaults(func=cmd_backfill_salaries)
+
     p = sub.add_parser("migrate-db",
-                       help="Copy schema + data to another DB (e.g. SQLite -> Supabase Postgres)")
+                       help="Copy schema + data to another DB (e.g. SQLite -> DigitalOcean Managed Postgres)")
     p.add_argument("--target", help="Target SQLAlchemy URL (or set JOBSCOUT_TARGET_DATABASE_URL)")
     p.add_argument("--drop", action="store_true", help="Recreate the target schema first")
     p.add_argument("--batch", type=int, default=1000, help="Rows per insert batch")

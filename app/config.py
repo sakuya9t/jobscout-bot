@@ -41,14 +41,14 @@ class Settings(BaseSettings):
 
     # Rate limiting (see app/ratelimit.py). In-process per-IP limits: a global blanket
     # plus stricter caps on login/register. Disable for tests/dev with
-    # JOBSCOUT_RATE_LIMIT_ENABLED=0. Behind a multi-instance/serverless deploy these are
-    # per-instance only — use the platform WAF as the real DoS shield (docs/DEPLOY_VERCEL.md).
+    # JOBSCOUT_RATE_LIMIT_ENABLED=0. Behind a multi-instance deploy these are per-instance
+    # only — front the app with a CDN/WAF as the real DoS shield (docs/DEPLOY.md).
     rate_limit_enabled: bool = True
     rate_limit_global_per_minute: int = 120
     rate_limit_auth_per_minute: int = 5      # login attempts / IP / minute
     rate_limit_register_per_hour: int = 5    # signups / IP / hour (also throttles code guessing)
     # Trust the left-most X-Forwarded-For hop for the client IP (correct behind a proxy
-    # like Vercel/nginx). Turn OFF for a directly-exposed server, where the header is
+    # like App Platform's router / nginx). Turn OFF for a directly-exposed server, where the header is
     # client-controlled and could be spoofed to dodge the limit.
     trust_forwarded_for: bool = True
 
@@ -92,9 +92,9 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = True
     # Background worker threads (evaluator + kit_worker) started in the app lifespan.
     # They drain scoring/kit-generation backlogs off the request path on a long-lived
-    # server. Set JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0 on serverless (Vercel), where
-    # threads don't survive a function freeze — there scoring is enqueued durably and
-    # drained by the run-scoring cron instead of in-process workers.
+    # server. Set JOBSCOUT_BACKGROUND_WORKERS_ENABLED=0 on a short-lived/serverless host
+    # where threads don't survive a freeze — there scoring is enqueued durably and drained
+    # by the `jobscout run-scoring` cron instead of in-process workers.
     background_workers_enabled: bool = True
 
     # Scraping
@@ -164,9 +164,9 @@ class Settings(BaseSettings):
     # worker pool (and by the `jobscout run-scoring` CLI for an out-of-process drain).
     # This drains every user's matching backlog separately from the daily scrape.
     # scoring_max_concurrency is THE database-connection throttle: at most this many
-    # users drain at once, so concurrent Supabase connections stay constant in the
-    # number of users (each held connection = one pooler client; the cap is ~15 and
-    # shared with the web app, so keep this well under it).
+    # users drain at once, so concurrent DB connections stay constant in the number of
+    # users (each held connection = one PgBouncer client on DigitalOcean Managed
+    # Postgres; the pool's size is shared with the web app, so keep this well under it).
     scoring_max_concurrency: int = 3
     # Wall-clock cap for one cron run (under the workflow's 60-min timeout), so a huge
     # backlog spans several runs instead of being killed mid-drain. 0 = no cap.
@@ -182,16 +182,6 @@ class Settings(BaseSettings):
     # ...and is automatically requeued for a fresh round once it's been parked this
     # long — so a parked job never sits failed forever (auto-resolve).
     scoring_job_retry_cooldown_minutes: int = 60
-
-    # Optional event-driven scoring kick (services/dispatch.py). When work becomes
-    # pending and this process can't drain it in-process (serverless), POST a trigger to
-    # this URL so a consumer picks it up. Point it at any `jobscout run-scoring` consumer
-    # — e.g. this app's own POST /api/cron/run-scoring (token = CRON_SECRET). Empty
-    # (default, incl. DigitalOcean) = no-op: the long-lived server drains in-process the
-    # moment work is enqueued, so nothing extra is needed.
-    scoring_dispatch_url: str = ""
-    scoring_dispatch_token: str = ""
-    scoring_dispatch_event: str = "score"  # repository_dispatch event_type
 
     @property
     def resume_dir(self) -> Path:

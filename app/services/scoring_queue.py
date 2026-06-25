@@ -10,8 +10,8 @@ Why a DB queue instead of a broker: the durable backlog already exists as DB sta
 host for RabbitMQ/Redis. A ``scoring_jobs`` row per user, claimed with ``SELECT …
 FOR UPDATE SKIP LOCKED``, gives an atomic, cross-process-safe claim with zero new
 infra. The point of the queue is throttling: a bounded worker pool claims a few
-users at a time, so concurrent Supabase connections stay constant in the number of
-users (which otherwise exhausts the pooler — see app/db.py:NullPool).
+users at a time, so concurrent DB connections stay constant in the number of
+users (which otherwise exhausts the connection pool — see app/db.py:NullPool).
 
 Lifecycle of a row: ``pending`` (work to do) -> ``running`` (claimed) -> ``done``
 (drained) / ``error`` (failed) / back to ``pending`` (re-armed because more work
@@ -84,7 +84,7 @@ def enqueue(
 
 def reconcile(db: Session, *, reclaim_all_running: bool = False) -> int:
     """Prepare the queue for a drain AND self-heal stuck work, then enqueue every user
-    with a backlog. Run before every drain (cron/dispatch/startup), so nothing sits
+    with a backlog. Run before every drain (cron/web/startup), so nothing sits
     failed forever. Returns the number of users enqueued. Three passes:
 
     1. *Per-posting auto-resolve*: clear terminal error-markers older than the TTL so
@@ -92,7 +92,7 @@ def reconcile(db: Session, *, reclaim_all_running: bool = False) -> int:
     2. *Orphan reclaim/park*: a ``running`` row whose worker died goes back to ``pending``
        to retry — unless it has used up its attempts (``scoring_job_max_attempts``), in
        which case it's parked as ``error`` (kicked out of the active queue) so it stops
-       hot-looping. Mid-run (cron/dispatch) a ``running`` row may belong to a LIVE
+       hot-looping. Mid-run (cron/web) a ``running`` row may belong to a LIVE
        in-process worker, so only rows stuck past the stale window (``scoring_stale_minutes``)
        are treated as orphans. At process startup that's not so — no worker thread has
        been spawned yet, so EVERY ``running`` row is orphaned by the dead process;
@@ -263,7 +263,7 @@ def mark_error(db: Session, user_id: int, message: str) -> None:
         .values(state="error", last_error=(message or "")[:1000], finished_at=utcnow())
     )
     db.commit()
-    # A stop point: the row won't be retried until reconcile runs (cron/dispatch/startup)
+    # A stop point: the row won't be retried until reconcile runs (cron/web/startup)
     # — on a long-lived dev server with no cron that's the next restart or forced re-run,
     # which is exactly how a drain "goes flaky". The full traceback is already on stdout
     # (evaluator logs the exception); here we record the queue transition for the trail.

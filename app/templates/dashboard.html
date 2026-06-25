@@ -24,6 +24,9 @@
   input, textarea, select {
     background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
   }
+  input:disabled, textarea:disabled, select:disabled {
+    background:#eef1f0; color:var(--muted); cursor:not-allowed; opacity:.7;
+  }
   input:focus, textarea:focus, select:focus, button:focus-visible {
     outline:2px solid rgba(15, 118, 110, .28); outline-offset:2px;
   }
@@ -128,6 +131,11 @@
   /* One compact, consistent size for every job-control select, so the toolbar
      row lines up. */
   .control select, .filters select, .pager select { width:auto; padding:8px 10px; font-size:13px; }
+  /* The company filter must keep a constant width: with width:auto it grows to fit
+     the selected company name (e.g. "Google DeepMind"), widening the toolbar enough
+     to wrap the control onto a second row for long names but not short ones. Pin it
+     so the row layout never depends on which company is picked (long names ellipsize). */
+  #jobCompany { width:170px; max-width:170px; text-overflow:ellipsis; }
   /* Job-list view switcher: a 3-way segmented control whose highlighted segment
      always names the list currently shown (top 5 / all matches / all jobs). */
   .segmented { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
@@ -154,6 +162,9 @@
   .job-title a:hover { color:var(--accent); text-decoration:underline; }
   .job-meta { color:var(--muted); font-size:13px; }
   .score { color:var(--good); font-weight:800; white-space:nowrap; }
+  /* Score + pay range stack on the right of a job row, right-aligned. */
+  .job-head-right { display:flex; flex-direction:column; align-items:flex-end; gap:3px; flex-shrink:0; }
+  .salary { color:var(--ink); font-size:13px; font-weight:650; white-space:nowrap; }
   /* Per-job footer: the application toggle + the posting link on one baseline,
      with the application-kit status icon pushed to the bottom-right. */
   .job-actions { display:flex; align-items:center; gap:14px; margin-top:2px; }
@@ -288,6 +299,14 @@
             <label for="jobCompany">Company</label>
             <select id="jobCompany" onchange="setCompanyFilter()">
               <option value="">All companies</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="jobSort">Sort by</label>
+            <select id="jobSort" onchange="setJobSort()">
+              <option value="match">Best match</option>
+              <option value="salary_desc">Salary: high → low</option>
+              <option value="salary_asc">Salary: low → high</option>
             </select>
           </div>
           <div class="segmented" id="jobModes" role="tablist" aria-label="Job list view">
@@ -570,6 +589,9 @@
           </div>
           <div><label for="cToken">ATS token</label><input id="cToken" placeholder="board token / org slug" /></div>
         </div>
+        <div id="cPresetHint" class="muted" style="display:none; margin-top:8px; font-size:13px;">
+          Preset companies are shared and managed centrally — their settings can't be edited here.
+          Clear the preset to add a custom company.</div>
         <div class="toolbar" style="margin-top:12px;"><button onclick="addCompany()">Add company</button></div>
       </div>
       <div class="surface"><div id="companies"></div></div>
@@ -712,6 +734,7 @@ let minScore = 0;           // match-score floor: 0 (default) | 50 | 75 | 90
 let minWin = 0;             // win-rate floor: 0 (default) | 50 | 75 | 90
 let postedWithin = 7;       // post-date window in days: 1 | 3 | 7 (default) | 30 | 0 (all)
 let companyFilter = "";     // watch-list company id (string); "" = all companies
+let jobSort = "match";      // "match" (default) | "salary_desc" | "salary_asc"
 let selectedSnapshotId = null;
 const JOB_MODES = ["top5", "matching", "all"];
 let hasActiveResume = false;
@@ -1006,13 +1029,29 @@ function renderPresetOptions(){
   if(available.some(p => p.key === keep)){ sel.value = keep; }
 }
 
+// The company config fields (name/URL/ATS/token) are user-editable only for custom
+// companies. For a preset they describe a shared, centrally-managed company, and the
+// backend ignores any submitted values (it subscribes via preset_key), so we lock them.
+const COMPANY_FIELDS = ["cName", "cUrl", "cAts", "cToken"];
+function setCompanyFieldsLocked(locked){
+  COMPANY_FIELDS.forEach(id => { document.getElementById(id).disabled = locked; });
+  document.getElementById("cPresetHint").style.display = locked ? "block" : "none";
+}
+
 function applyPreset(){
   const p = ALL_PRESETS.find(x => x.key === document.getElementById("cPreset").value);
-  if(!p){ return; }
+  if(!p){
+    // Preset cleared back to "Choose a preset": re-enable for custom entry and reset.
+    setCompanyFieldsLocked(false);
+    COMPANY_FIELDS.forEach(id => document.getElementById(id).value = "");
+    document.getElementById("cAts").value = "auto";
+    return;
+  }
   document.getElementById("cName").value = p.name;
   document.getElementById("cUrl").value = p.careers_url;
   document.getElementById("cAts").value = p.ats_type;
   document.getElementById("cToken").value = p.ats_token || "";
+  setCompanyFieldsLocked(true);  // preset settings are fixed
 }
 
 async function addCompany(){
@@ -1025,6 +1064,7 @@ async function addCompany(){
   ["cName","cUrl","cToken"].forEach(i=>document.getElementById(i).value="");
   document.getElementById("cAts").value = "auto";
   document.getElementById("cPreset").value = "";
+  setCompanyFieldsLocked(false);  // back to editable custom-entry state
   await loadCompanies();
   markRescorePending();
 }
@@ -1259,6 +1299,12 @@ function setDateFilter(){
   loadJobList();
 }
 
+function setJobSort(){
+  jobSort = document.getElementById("jobSort").value || "match";
+  pageOffset = 0;  // a new ordering invalidates the current page
+  loadJobList();
+}
+
 // Populate the job-list "Company" filter from the user's watch-list, preserving
 // the current selection across reloads (and resetting to "all" if it's gone).
 async function loadJobCompanyOptions(){
@@ -1303,6 +1349,7 @@ async function loadJobList(){
   let q = `limit=${limit}&offset=${offset}&category=${category}&min_score=${ms}&min_win=${mw}`;
   if(postedWithin > 0){ q += `&posted_within_days=${postedWithin}`; }
   if(companyFilter){ q += `&company_id=${encodeURIComponent(companyFilter)}`; }
+  if(jobSort !== "match"){ q += `&sort=${jobSort}`; }
   const r = await api(`${base}?${q}`);
   if(!r.ok){
     document.getElementById("jobList").innerHTML = '<div class="empty">Could not load this job list.</div>';
@@ -1394,6 +1441,9 @@ function renderJobList(data){
     const head = m.non_matching
       ? '<span class="pill" style="background:#f6e4e4; color:var(--danger);">not a match</span>'
       : `<div class="score">${m.match_score}/100 · win ${m.win_probability}%</div>`;
+    // Pay range (when the posting disclosed one) sits under the score on the right, so
+    // the meta line stays short and the two "numbers about this job" read together.
+    const salary = m.salary_display ? `<div class="salary">${esc(m.salary_display)}</div>` : "";
     const listed = fmtListed(m.listed_at);
     return `<article class="job-row">
       <div class="job-head">
@@ -1401,7 +1451,7 @@ function renderJobList(data){
           <div class="job-title"><a href="/positions/${m.position_id}">${esc(m.title)}</a></div>
           <div class="job-meta">${esc(m.company)}${m.location?` · ${esc(m.location)}`:""}${listed?` · ${esc(listed)}`:""}</div>
         </div>
-        ${head}
+        <div class="job-head-right">${head}${salary}</div>
       </div>
       ${m.removed ? '<span class="pill" style="background:#eceff1; color:var(--muted);">✕ Closed — no longer listed</span>' : ""}
       ${(!m.non_matching && m.below_threshold) ? '<span class="pill warn">below threshold</span>' : ""}

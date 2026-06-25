@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -20,16 +21,50 @@ if _is_sqlite:
         settings.database_url, connect_args={"check_same_thread": False}, future=True
     )
 else:
-    # Postgres is reached through Supabase's connection pooler (Supavisor). Pooling
-    # *again* in-process means every serverless instance and batch run hoards idle
-    # connections and exhausts the pooler's per-client cap ("max clients reached in
-    # session mode - ... pool_size: 15"). NullPool keeps no idle connections: one is
-    # opened per checkout and closed on release, so we only ever hold what we're
-    # actively using. pool_pre_ping drops a connection the pooler closed under us.
+    # Postgres is DigitalOcean Managed Postgres, reached through its PgBouncer
+    # connection pool (transaction mode). Pooling *again* in-process means every app
+    # instance, cron run, and scoring worker hoards idle connections and exhausts the
+    # pool's client cap. NullPool keeps no idle connections: one is opened per checkout
+    # and closed on release, so we only ever hold what we're actively using.
+    # pool_pre_ping drops a connection the pooler closed under us (e.g. across a
+    # managed-DB maintenance restart).
     engine = create_engine(
         settings.database_url, poolclass=NullPool, pool_pre_ping=True, future=True
     )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+@event.listens_for(engine, "handle_error")
+def _log_db_error(context):  # pragma: no cover - exercised against a live/failing DB
+    """Log every DBAPI-level error at the engine, so a database outage is visible in
+    the logs even when a caller catches and swallows the exception.
+
+    The motivating failure: the managed-Postgres connection pool refuses new clients
+    once its size cap is hit (or the DB is briefly unreachable across a maintenance
+    restart), which surfaces as a connection/operational error deep inside the daily
+    scrape or a scoring drain. Several call sites legitimately catch broad
+    exceptions for per-company / per-user isolation (e.g. crawler.crawl_presets,
+    matcher.scrape_for_all_users), so without logging *here* a whole day's writes can
+    fail with nothing in the logs — exactly what we hit. ``handle_error`` fires for
+    statement-execution errors AND failed connects/pre-pings, so this single hook sees
+    them all regardless of who catches the exception downstream.
+
+    ``IntegrityError`` is excluded: it's the *expected* concurrent-drain race on
+    ``uq_match_unique`` that ``matcher._flush_match`` recovers via SAVEPOINT — logging
+    it here would cry wolf on a normal, handled condition. The hook only reads context
+    and never re-raises, so it does not alter exception propagation."""
+    exc = context.original_exception
+    if isinstance(exc, IntegrityError):
+        return
+    statement = " ".join((context.statement or "").split())
+    if len(statement) > 200:
+        statement = statement[:200] + "…"
+    log.error(
+        "database error%s: %s%s",
+        " (connection lost)" if context.is_disconnect else "",
+        exc,
+        f" | while executing: {statement}" if statement else "",
+    )
 
 
 if _is_sqlite:
@@ -80,7 +115,7 @@ def _reconcile_schema(bind: Engine) -> None:
 
     The additive passes (1: ADD COLUMN, 3: CREATE INDEX) run on SQLite **and**
     Postgres — both support ``ALTER TABLE ADD COLUMN`` for a nullable/defaulted
-    column instantly, so prod (Supabase Postgres) picks up a new model field without a
+    column instantly, so prod (DigitalOcean Managed Postgres) picks up a new model field without a
     hand-written migration. The table-rebuild pass (2) stays SQLite-only: it exists to
     work around SQLite's inability to ALTER a column constraint, which Postgres can do
     natively and which is out of scope here anyway."""
@@ -225,7 +260,8 @@ def seed_presets(db: Session) -> None:
             continue
         db.add(Company(
             preset_key=p.key, user_id=None, name=p.name, careers_url=p.careers_url,
-            ats_type=p.ats_type, ats_token=p.ats_token, location_hint=p.location_hint,
+            ats_type=p.ats_type, ats_token=p.ats_token, job_url_filter=p.job_url_filter,
+            location_hint=p.location_hint,
         ))
     db.flush()
 

@@ -29,6 +29,9 @@
   .meta { color:var(--muted); font-size:14px; }
   .score { color:var(--good); font-weight:800; font-size:18px; white-space:nowrap; }
   .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+  /* Score + pay range stack on the right of the header, right-aligned. */
+  .head-right { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; }
+  .pay { color:var(--ink); font-size:14px; font-weight:650; white-space:nowrap; }
   .actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:16px; }
   .apply-btn {
     background:transparent; color:var(--ink); border:1px solid var(--line);
@@ -190,6 +193,8 @@ function renderDetail(){
   const head = m.non_matching
     ? `<span class="pill bad">not a match</span>`
     : `<div class="score">${m.match_score}/100<div class="muted" style="text-align:right;">win ${m.win_probability}%</div></div>`;
+  // Pay range (when the posting disclosed one), under the score on the right.
+  const salary = m.salary_display ? `<div class="pay">${esc(m.salary_display)}</div>` : "";
 
   const strengths = m.strengths || [];
   const gaps = m.gaps || [];
@@ -208,7 +213,7 @@ function renderDetail(){
           <h1>${esc(m.title)}</h1>
           <div class="meta">${metaBits}</div>
         </div>
-        ${head}
+        <div class="head-right">${head}${salary}</div>
       </div>
       ${m.removed ? `<div class="pill" style="background:#eceff1; color:var(--muted); margin-top:8px;">✕ No longer listed — this posting has been removed from the company's board. Your application record is kept.</div>` : ""}
       <div class="actions">

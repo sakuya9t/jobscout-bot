@@ -25,6 +25,42 @@ class MatchVerdict(BaseModel):
     # omit these arrays, so default them empty rather than failing the whole score.
     strengths: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
+    # Pay range read from the posting itself, when it explicitly states one (the LLM
+    # reads the full description anyway, so this is ~free and catches prose the regex
+    # can't). All optional + leniently coerced below so a malformed value degrades to
+    # null instead of failing the whole score. Persisted onto the Position, not here.
+    salary_min: int | None = None
+    salary_max: int | None = None
+    salary_currency: str | None = None  # ISO-ish code, e.g. "USD"
+    salary_period: str | None = None    # "year" | "hour" | "month" | "week"
+
+    @field_validator("salary_min", "salary_max", mode="before")
+    @classmethod
+    def _coerce_amount(cls, v):
+        """Models sometimes emit "$120,000" / "120k" / "120000.0" instead of an int.
+        Coerce best-effort; on anything unparseable return None (NEVER raise, or one
+        stray salary token would invalidate the whole posting in the batch)."""
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return int(v) if v > 0 else None
+        if isinstance(v, str):
+            s = v.strip().lower().replace("$", "").replace(",", "").replace("usd", "").strip()
+            mult = 1000 if s.endswith("k") else 1
+            s = s[:-1].strip() if s.endswith("k") else s
+            try:
+                n = float(s) * mult
+            except ValueError:
+                return None
+            return int(n) if n > 0 else None
+        return None
+
+    @field_validator("salary_currency", "salary_period", mode="before")
+    @classmethod
+    def _coerce_short_str(cls, v):
+        if not isinstance(v, str):
+            return None
+        return v.strip()[:16] or None
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -353,6 +389,9 @@ class MatchOut(BaseModel):
     # Effective "listed" date (ISO, naive UTC): the ATS post date when known, else
     # when our crawler first saw it. Drives the dashboard's post-date filter/label.
     listed_at: str | None = None
+    # Preformatted pay range parsed from the posting (e.g. "$120,000–$150,000/yr"),
+    # or null when the posting states no pay. Shown as a chip on the job-list row.
+    salary_display: str | None = None
     # Whether the current user has marked this position applied (the "Mark applied"
     # toggle). Overlaid live at render time, not stored in saved snapshots.
     applied: bool = False
@@ -422,6 +461,14 @@ class PositionDetailOut(BaseModel):
     # listed" banner and locks apply/kit actions). Only reachable for applied postings.
     removed: bool = False
     applied: bool = False
+    # Pay range parsed from the posting (pay-transparency disclosures), when present.
+    # ``salary_display`` is the preformatted one-liner; the raw fields are for clients
+    # that want to filter/sort. All null when the posting states no pay.
+    salary_min: int | None = None
+    salary_max: int | None = None
+    salary_currency: str | None = None
+    salary_period: str | None = None
+    salary_display: str | None = None
     kit: ApplicationKitOut | None = None
 
 

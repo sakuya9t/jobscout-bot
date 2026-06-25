@@ -7,14 +7,13 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 
-import httpx
 from fastapi.testclient import TestClient
 
 from app import models
 from app.config import settings
 from app.db import session_scope
 from app.main import app
-from app.services import dispatch, evaluator, matcher, scoring_queue
+from app.services import evaluator, matcher, scoring_queue
 from app.timeutil import utcnow
 
 
@@ -111,7 +110,6 @@ def test_ensure_running_recovers_an_orphaned_running_job(monkeypatch):
     row so the click actually restarts scoring — regression: a stale running row left
     enqueue a no-op and nothing drained."""
     monkeypatch.setattr(evaluator, "ensure_draining", lambda: None)
-    monkeypatch.setattr(evaluator.dispatch, "dispatch_scoring_run", lambda: True)
     with session_scope() as db:
         uid = _seed_user(db)
         db.add(models.ScoringJob(user_id=uid, state="running", claimed_at=utcnow(), attempts=4))
@@ -350,57 +348,16 @@ def test_score_to_completion_drains_within_budget(monkeypatch):
         assert matcher.count_pending(db, user) == 0
 
 
-# ── dispatch hook (the pub/sub kick) ──────────────────────────────────────────
-def test_dispatch_is_noop_when_unconfigured(monkeypatch):
-    monkeypatch.setattr(settings, "scoring_dispatch_url", "")
-    called = []
-    monkeypatch.setattr(dispatch.httpx, "post", lambda *a, **k: called.append(1))
-    assert dispatch.dispatch_scoring_run() is False
-    assert called == []  # no URL → no request
-
-
-def test_dispatch_posts_when_configured(monkeypatch):
-    monkeypatch.setattr(settings, "scoring_dispatch_url", "https://api.github.test/repos/o/r/dispatches")
-    monkeypatch.setattr(settings, "scoring_dispatch_token", "tok")
-    monkeypatch.setattr(settings, "scoring_dispatch_event", "score")
-    captured = {}
-
-    class _Resp:
-        status_code = 204
-        def raise_for_status(self): pass
-
-    def fake_post(url, json=None, headers=None, timeout=None):
-        captured.update(url=url, json=json, headers=headers)
-        return _Resp()
-
-    monkeypatch.setattr(dispatch.httpx, "post", fake_post)
-    assert dispatch.dispatch_scoring_run() is True
-    assert captured["url"].endswith("/dispatches")
-    assert captured["json"] == {"event_type": "score"}
-    assert captured["headers"]["Authorization"] == "Bearer tok"
-
-
-def test_dispatch_swallows_errors(monkeypatch):
-    monkeypatch.setattr(settings, "scoring_dispatch_url", "https://api.github.test/x")
-
-    def boom(*a, **k):
-        raise httpx.ConnectError("down")
-
-    monkeypatch.setattr(dispatch.httpx, "post", boom)
-    assert dispatch.dispatch_scoring_run() is False  # never raises; backstop cron covers it
-
-
-def test_ensure_running_dispatches_when_workers_off(monkeypatch):
-    """Serverless (background workers off): ensure_running enqueues, then fires the
-    dispatch trigger instead of spawning an in-process drain."""
+def test_ensure_running_enqueues_without_draining_when_workers_off(monkeypatch):
+    """With in-process workers off, ensure_running only enqueues (durably) and does not
+    spawn a drain — the `jobscout run-scoring` cron is the backstop."""
     assert settings.background_workers_enabled is False  # the test env (conftest)
-    fired = []
-    monkeypatch.setattr(evaluator.dispatch, "dispatch_scoring_run", lambda: fired.append(1) or True)
-    monkeypatch.setattr(evaluator, "ensure_draining", lambda: fired.append("DRAIN"))
+    drained = []
+    monkeypatch.setattr(evaluator, "ensure_draining", lambda: drained.append(1))
     with session_scope() as db:
         uid = _seed_user(db)
     evaluator.ensure_running(uid)
-    assert fired == [1]  # dispatched, did not spawn an in-process drain
+    assert drained == []  # did not spawn an in-process drain
     with session_scope() as db:
         assert _job(db, uid).state == "pending"
 
@@ -429,34 +386,28 @@ def test_run_scoring_endpoint_drains_the_queue(monkeypatch):
         assert matcher.count_pending(db, db.get(models.User, uid)) == 0
 
 
-def test_run_scoring_endpoint_redispatches_when_backlog_remains(monkeypatch):
-    """If the budget leaves work pending, the endpoint re-fires the trigger so the
-    queue keeps draining without waiting for the schedule."""
+def test_run_scoring_endpoint_reports_backlog_remaining(monkeypatch):
+    """If the budget leaves work pending, the endpoint reports more_pending=True so the
+    next run continues the drain."""
     monkeypatch.setenv("CRON_SECRET", "s3cret")
     # Drain is a no-op, so the reconciled backlog stays pending after the call.
     monkeypatch.setattr(evaluator, "drain_queue", lambda **k: evaluator.DrainSummary())
-    fired = []
-    monkeypatch.setattr("app.routers.cron.dispatch.dispatch_scoring_run", lambda: fired.append(1) or True)
     with session_scope() as db:
         _seed_user(db)
     with TestClient(app) as c:
         r = c.post("/api/cron/run-scoring", headers={"Authorization": "Bearer s3cret"})
     assert r.status_code == 200 and r.json()["more_pending"] is True
-    assert fired == [1]  # continuation dispatch fired
 
 
-def test_run_daily_endpoint_publishes_and_dispatches(monkeypatch):
-    """After the scrape, run-daily enqueues users with a backlog and fires the trigger."""
+def test_run_daily_endpoint_publishes_backlog(monkeypatch):
+    """After the scrape, run-daily enqueues users with a backlog (scoring is deferred)."""
     monkeypatch.setenv("CRON_SECRET", "s3cret")
     monkeypatch.setattr(matcher, "scrape_for_all_users", lambda: {})  # skip real scraping
-    fired = []
-    monkeypatch.setattr("app.routers.cron.dispatch.dispatch_scoring_run", lambda: fired.append(1) or True)
     with session_scope() as db:
-        _seed_user(db)  # has a backlog → should be enqueued + trigger fired
+        _seed_user(db)  # has a backlog → should be enqueued
     with TestClient(app) as c:
         r = c.get("/api/cron/run-daily", headers={"Authorization": "Bearer s3cret"})
     assert r.status_code == 200 and r.json()["enqueued"] == 1
-    assert fired == [1]
 
 
 # ── bounded retry for failed scoring pairs ────────────────────────────────────

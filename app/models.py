@@ -148,6 +148,10 @@ class Company(Base):
     ats_type: Mapped[str] = mapped_column(String(32), default="auto")
     # Board token / org slug for the ATS API (e.g. greenhouse board token).
     ats_token: Mapped[str | None] = mapped_column(String(255))
+    # Optional regex: for ats_type="sitemap" boards whose sitemap mixes job-detail
+    # pages with marketing/blog URLs (e.g. Pinterest), only entries matching this are
+    # fetched as jobs. NULL means fetch every sitemap URL (jobs-only sitemaps).
+    job_url_filter: Mapped[str | None] = mapped_column(String(255))
     location_hint: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -274,6 +278,16 @@ class Position(Base):
     # currently listed. Removed positions are hidden everywhere except an application the
     # user already made; a later reappearance on the board clears this back to NULL.
     removed_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    # Pay range parsed from the posting itself (pay-transparency disclosures). Populated
+    # by services.salary at scrape time (cheap deterministic regex) and refined by the
+    # LLM scoring pass when it reads the description. NULL = no figure stated/parsed.
+    # ``salary_period`` is "year" | "hour" | "month" | "week"; ``salary_source`` is
+    # "regex" | "llm" (provenance, so an LLM value isn't clobbered by a later regex pass).
+    salary_min: Mapped[int | None] = mapped_column(Integer)
+    salary_max: Mapped[int | None] = mapped_column(Integer)
+    salary_currency: Mapped[str | None] = mapped_column(String(8))
+    salary_period: Mapped[str | None] = mapped_column(String(16))
+    salary_source: Mapped[str | None] = mapped_column(String(16))
 
     company: Mapped[Company] = relationship(back_populates="positions")
     matches: Mapped[list[MatchResult]] = relationship(

@@ -1,0 +1,55 @@
+# DigitalOcean App Platform spec — source of truth for PR PREVIEW apps.
+#
+# The preview workflow (.github/workflows/preview.yml) runs
+# digitalocean/app_action/deploy@v2 with `deploy_pr_preview: "true"`, which reads
+# THIS file, repoints the git source at the PR's head branch, and creates/updates a
+# throwaway app named after the PR. Closing the PR deletes it (delete@v2).
+#
+# This is NOT the production app. Prod stays the control-panel app that auto-deploys
+# `main` via DO's native GitHub integration. If you later move prod under this spec,
+# keep the two in sync (region, instance size, the *real* secret env vars).
+name: jobscout-bot
+region: nyc
+services:
+  - name: web
+    # Python buildpack, auto-detected from requirements.txt + .python-version (3.11).
+    # No run_command here on purpose: App Platform uses the repo Procfile
+    # (`web: python -m app.cli serve ...`), so the start command has one source of
+    # truth. Tables self-create on boot (app lifespan -> init_db), so a preview's
+    # empty ephemeral SQLite DB works with no init step.
+    github:
+      repo: sakuya9t/jobscout-bot
+      branch: release/next
+      # The action drives preview deploys itself (once per PR push); don't also let
+      # DO auto-deploy on push or the two race.
+      deploy_on_push: false
+    http_port: 8080                          # matches the Procfile's ${PORT:-8080}
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb   # smallest basic tier; previews are short-lived
+    envs:
+      # Preview-only throwaway key. Previews use an ephemeral SQLite DB that's
+      # discarded on every redeploy, so there's no real data to protect and nothing
+      # secret to commit — this only has to be stable within one preview and not the
+      # app's built-in "dev-insecure-change-me" default. The real prod key lives on
+      # the prod app, never in the repo.
+      - key: JOBSCOUT_SECRET_KEY
+        scope: RUN_AND_BUILD_TIME
+        value: preview-env-throwaway-key-not-a-real-secret
+      # Open registration so a reviewer can sign in without minting invite codes.
+      - key: JOBSCOUT_REQUIRE_INVITE
+        scope: RUN_AND_BUILD_TIME
+        value: "0"
+      # App Platform serves HTTPS, so the session cookie can be Secure.
+      - key: JOBSCOUT_COOKIE_SECURE
+        scope: RUN_AND_BUILD_TIME
+        value: "1"
+      # No background scraping/scoring on a throwaway preview.
+      - key: JOBSCOUT_SCHEDULER_ENABLED
+        scope: RUN_AND_BUILD_TIME
+        value: "0"
+      - key: JOBSCOUT_LOG_LEVEL
+        scope: RUN_AND_BUILD_TIME
+        value: INFO
+    # No explicit health_check block: GET /health pings the (per-user, usually unset
+    # on a preview) LLM provider, which can add latency/flakiness. App Platform's
+    # default TCP readiness check on http_port is enough for an ephemeral preview.

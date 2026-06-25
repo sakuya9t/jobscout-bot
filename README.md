@@ -133,22 +133,26 @@ are decoupled from the cheap daily scrape:
 0 */4 * * *  cd /path/to/jobscout && /path/to/.venv/bin/jobscout run-scoring
 ```
 
-### Production database (Supabase / Postgres)
+### Production database (DigitalOcean Managed Postgres)
 The app is database-agnostic (SQLAlchemy) and runs on Postgres unchanged — only
 the default is SQLite. To publish on a hosted DB:
 ```bash
 # 1) Copy the local SQLite schema + data into the target (creates tables, copies
 #    every row, fixes Postgres id sequences). --drop recreates the target schema.
-jobscout migrate-db --target 'postgresql://postgres:[PW]@db.[REF].supabase.co:5432/postgres?sslmode=require' --drop
-# 2) Point the app at it and restart:
-export JOBSCOUT_DATABASE_URL='postgresql://postgres:[PW]@db.[REF].supabase.co:5432/postgres?sslmode=require'
+#    Use the DIRECT connection (port 25060) for the bulk copy, not the pooler.
+jobscout migrate-db --target 'postgresql://doadmin:[PW]@[HOST]:25060/defaultdb?sslmode=require' --drop
+# 2) Point the running app at it and restart (any host that sets env vars):
+export JOBSCOUT_DATABASE_URL='postgresql://doadmin:[PW]@[HOST]:25060/defaultdb?sslmode=require'
 jobscout serve
 ```
 Use the **same `JOBSCOUT_SECRET_KEY`** on the target — encrypted application-account
-credentials (and JWT sessions) are keyed off it. For Supabase prefer the direct /
-session-pooler connection (port 5432) with `sslmode=require`. The same `migrate-db`
-command works against a **local** Supabase/Postgres too (e.g. `supabase start`'s
-`postgresql://postgres:postgres@127.0.0.1:54322/postgres`).
+credentials (and JWT sessions) are keyed off it. On **DigitalOcean App Platform**, attach
+the Managed Postgres cluster to the app and set `JOBSCOUT_DATABASE_URL=${db.DATABASE_URL}`
+(the bindable var) — attaching also auto-adds the app as a trusted source. Reserve the
+direct connection string (port 25060) for one-off bulk/admin work like the copy above, and
+create a PgBouncer pool (port 25061) only if you outgrow the direct connection limit. The
+same `migrate-db` command works against any local Postgres too (e.g.
+`postgresql://postgres:postgres@127.0.0.1:5432/postgres`).
 
 ### Maintenance
 ```bash

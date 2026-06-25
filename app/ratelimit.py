@@ -2,10 +2,9 @@
 limits on the auth routes (login / register).
 
 This is a sliding-window log kept in memory, which is the right tool for the current
-single-process uvicorn / VM deployment and for defense-in-depth. It is NOT shared across
-processes: behind a multi-instance or serverless deploy (e.g. Vercel) each instance keeps
-its own counters, so the real DoS front line there is the platform WAF — see
-``docs/DEPLOY_VERCEL.md``.
+single-process DigitalOcean App Platform deployment and for defense-in-depth. It is NOT
+shared across processes: behind a multi-instance deploy each instance keeps its own
+counters, so the real DoS front line there is a CDN/WAF — see ``docs/DEPLOY.md``.
 """
 from __future__ import annotations
 
@@ -69,7 +68,7 @@ limiter = InMemoryRateLimiter()
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort client IP. Behind a proxy (Vercel, nginx, …) the socket peer is the
+    """Best-effort client IP. Behind a proxy (a load balancer, nginx, …) the socket peer is the
     proxy, so trust the left-most ``X-Forwarded-For`` hop when configured to. Disable
     ``JOBSCOUT_TRUST_FORWARDED_FOR`` for a directly-exposed server, where the header is
     attacker-controlled and would let a client forge a fresh IP per request."""
