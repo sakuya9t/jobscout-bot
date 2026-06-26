@@ -15,7 +15,7 @@
   main.detail { max-width:920px; margin:0 auto; padding:26px clamp(16px, 3vw, 32px); }
   .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
   .top-actions { display:flex; align-items:center; justify-content:flex-end; gap:12px; }
-  .brand-mark { color:var(--brand-primary); font-size:20px; font-weight:800; }
+  .brand-mark { color:var(--brand-primary); font-size:20px; font-weight:800; text-decoration:none; }
   .back { font-size:14px; }
   .surface {
     background:var(--surface); border:1px solid var(--line); border-radius:16px;
@@ -221,7 +221,7 @@
 
 <main class="detail">
   <div class="topbar">
-    <div class="brand-mark">JobScout</div>
+    <a class="brand-mark" href="/#jobs">JobScout</a>
     <div class="top-actions">
       <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
         <span class="sun">☀</span><span class="moon">☾</span>
