@@ -465,6 +465,62 @@ def test_delete_interest_with_matches_cascades():
         assert db.scalar(matcher.select(models.MatchResult)) is None
 
 
+def test_interest_min_score_change_keeps_matches_and_skips_rescore(monkeypatch):
+    """Editing only the report threshold (min_score) must not drop the interest's
+    matches or kick a re-evaluation: the new threshold is applied live when the list /
+    report is built, so existing results just get re-filtered. The edit form re-sends
+    every field, so this also proves presence-in-payload alone doesn't count as a change."""
+    from app.routers.interests import update_interest
+    from app.schemas import InterestUpdate
+
+    kicked: list[int] = []
+    monkeypatch.setattr("app.routers.interests.evaluator.ensure_running", lambda uid: kicked.append(uid))
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:
+        interest = db.scalar(matcher.select(models.Interest))
+        assert db.scalar(matcher.select(models.MatchResult)) is not None
+        # Re-send the whole form (as the UI does), nudging only min_score.
+        update_interest(interest.id, InterestUpdate(
+            label=interest.label, title_keywords=interest.title_keywords,
+            locations=interest.locations, seniority=interest.seniority,
+            employment_type=interest.employment_type, exclude_keywords=interest.exclude_keywords,
+            notes=interest.notes, min_score=interest.min_score + 5,
+        ), user=db.get(models.User, uid), db=db)
+    with session_scope() as db:
+        assert db.scalar(matcher.select(models.MatchResult)) is not None  # not dropped
+        assert db.scalar(matcher.select(models.Interest)).min_score == 75  # threshold updated
+    assert kicked == []  # no re-evaluation kicked
+
+
+def test_interest_criteria_change_drops_matches_and_kicks_rescore(monkeypatch):
+    """Editing a scoring field (here title_keywords) drops the interest's matches so
+    every posting is re-screened against the new criteria, and kicks the re-evaluation."""
+    from app.routers.interests import update_interest
+    from app.schemas import InterestUpdate
+
+    kicked: list[int] = []
+    monkeypatch.setattr("app.routers.interests.evaluator.ensure_running", lambda uid: kicked.append(uid))
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:
+        interest = db.scalar(matcher.select(models.Interest))
+        assert db.scalar(matcher.select(models.MatchResult)) is not None
+        update_interest(interest.id, InterestUpdate(
+            label=interest.label, title_keywords="frontend",  # was "backend"
+            locations=interest.locations, min_score=interest.min_score,
+        ), user=db.get(models.User, uid), db=db)
+    with session_scope() as db:
+        assert db.scalar(matcher.select(models.MatchResult)) is None  # dropped for re-screen
+    assert kicked == [uid]  # re-evaluation kicked
+
+
 def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     """Google has no ATS API; we parse the jobs embedded in its results-page HTML
     (AF_initDataCallback) and page via ?page=N until a page yields nothing."""

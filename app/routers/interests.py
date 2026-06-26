@@ -51,9 +51,17 @@ def update_interest(
 ):
     interest = _owned(db, user, interest_id)
     changes = payload.model_dump(exclude_unset=True)
+    # Only a *real* change to a scoring field invalidates existing matches. The edit
+    # form re-sends every field on each save, so a field's mere presence in the payload
+    # doesn't mean it changed — compare against the stored value. In particular,
+    # min_score is a read-time report threshold (the reporter applies it live when
+    # building the job list), so editing it alone re-filters existing results for free
+    # and must not drop matches or trigger a re-score.
+    criteria_changed = any(
+        changes[field] != getattr(interest, field) for field in _SCORING_FIELDS & changes.keys()
+    )
     for field, value in changes.items():
         setattr(interest, field, value)
-    criteria_changed = bool(_SCORING_FIELDS & changes.keys())
     if criteria_changed:
         # Matching criteria changed: drop this interest's matches (incl. cheap-filter
         # rejections) so every posting is re-screened against the new criteria instead

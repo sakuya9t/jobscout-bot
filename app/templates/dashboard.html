@@ -1134,16 +1134,29 @@ function interestBody(){
     min_score:parseInt(val("iMin")||"70")};
 }
 
+// Fields that change *what the LLM matches against* (mirrors the API's _SCORING_FIELDS).
+// Editing only the report threshold (min_score) or label doesn't — it just re-filters
+// the existing results, so it must not trigger a scrape/re-score.
+const SCORING_INTEREST_FIELDS = ["title_keywords", "locations", "seniority", "exclude_keywords", "notes"];
+
 async function saveInterest(){
   const body = interestBody();
   if(!body.label){ alert("Give the interest a label."); return; }
+  const prev = editingInterestId ? interestsById[editingInterestId] : null;
   const r = editingInterestId
     ? await api(`/api/interests/${editingInterestId}`,{method:"PATCH", body:JSON.stringify(body)})
     : await api("/api/interests",{method:"POST", body:JSON.stringify(body)});
   if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); return; }
   resetInterestForm();
   await loadInterests();
-  markRescorePending();
+  const criteriaChanged = !prev || SCORING_INTEREST_FIELDS.some(f => (body[f]||"") !== (prev[f]||""));
+  if(criteriaChanged){
+    markRescorePending();
+  } else {
+    // Only the threshold/label changed: re-filter the already-scored results against the
+    // new min_score (the server applies it live when building the list) — no scan needed.
+    loadJobList();
+  }
 }
 
 function editInterest(id){
