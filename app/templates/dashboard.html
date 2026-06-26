@@ -156,6 +156,22 @@
     box-shadow:var(--shadow-xs); transition:box-shadow 150ms ease, border-color 150ms ease;
   }
   .job-row:hover { border-left-color:var(--brand-primary); box-shadow:var(--shadow-md); }
+  /* First-paint placeholder: same card shape as .job-row, with shimmer bars for the
+     company mark, title/meta and score, so the list's structure shows immediately
+     instead of a blank panel while the first fetch is in flight. */
+  .job-skeleton { pointer-events:none; }
+  .sk-bar, .job-skeleton .company-mark {
+    background:linear-gradient(90deg, var(--bg-tag) 25%, var(--surface-raised) 50%, var(--bg-tag) 75%);
+    background-size:200% 100%; animation:sk-shimmer 1.4s linear infinite; border:0; border-radius:6px;
+  }
+  .sk-bar { height:12px; }
+  .sk-title { width:55%; height:16px; margin-bottom:8px; }
+  .sk-meta { width:35%; }
+  .sk-line { width:100%; margin-top:10px; }
+  .sk-line.short { width:80%; }
+  .sk-score { width:64px; height:40px; border-radius:8px; }
+  @keyframes sk-shimmer { 0% { background-position:200% 0; } 100% { background-position:-200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .sk-bar, .job-skeleton .company-mark { animation:none; } }
   .job-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
   .job-main { display:flex; align-items:flex-start; gap:14px; min-width:0; }
   .company-mark {
@@ -1377,6 +1393,25 @@ function nextPage(){
   loadJobList();
 }
 
+// Paint placeholder cards the instant the page is interactive, so the user sees the
+// list's shape right away and the first render swaps in the real rows. Done here —
+// once, on initial load — rather than inside loadJobList, which also runs on every
+// poll tick during a drain and would otherwise flash the skeleton each refresh.
+function showJobListSkeleton(){
+  const card = `<div class="job-row job-skeleton" aria-hidden="true">
+      <div class="job-head">
+        <div class="job-main"><div class="company-mark"></div>
+          <div style="flex:1; min-width:0;">
+            <div class="sk-bar sk-title"></div><div class="sk-bar sk-meta"></div>
+          </div>
+        </div>
+        <div class="sk-bar sk-score"></div>
+      </div>
+      <div class="sk-bar sk-line"></div><div class="sk-bar sk-line short"></div>
+    </div>`;
+  document.getElementById("jobList").innerHTML = card.repeat(3);
+}
+
 async function loadJobList(){
   // top5 mode is a fixed 5-row glance; the two "all" modes paginate.
   const limit = jobViewMode === "top5" ? 5 : pageSize;
@@ -1763,15 +1798,29 @@ window.addEventListener("pagehide", () => {
 
 const initialView = (location.hash || "#jobs").replace("#", "");
 showView(initialView);
-loadResumes();
-loadPresets();
-loadCompanies();
-loadJobCompanyOptions();
-loadInterests();
-loadProfile();
-loadLlmConfig();
-loadTelegramConfig();
-loadJobRuns().then(loadJobList);
+
+// The job list is the only thing on the initial screen, so get it moving first:
+// paint the skeleton, then fire its fetch un-gated. loadJobRuns (the saved-version
+// dropdown) is an independent control — loadJobList doesn't read anything it sets —
+// so it runs alongside rather than blocking the list behind an extra round-trip.
+showJobListSkeleton();
+loadJobList();
+loadJobRuns();
 startEvalPolling();  // resume the backlog indicator if a drain is already running
+
+// The remaining panels (resume / companies / interests / settings) aren't on screen
+// at first paint, so defer their fetches to an idle slot. That keeps eight secondary
+// requests from contending with the job list for the browser's connection pool.
+const loadSecondaryPanels = () => {
+  loadResumes();
+  loadPresets();
+  loadCompanies();
+  loadJobCompanyOptions();
+  loadInterests();
+  loadProfile();
+  loadLlmConfig();
+  loadTelegramConfig();
+};
+(window.requestIdleCallback || ((fn) => setTimeout(fn, 0)))(loadSecondaryPanels, {timeout: 500});
 </script>
 {% endblock %}
