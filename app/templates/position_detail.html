@@ -3,49 +3,63 @@
 {% block body %}
 <style>
   :root {
-    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
-    --muted:#68746e; --line:#d8e0dc; --accent:#0f766e; --accent-ink:#f5fffd;
-    --amber:#b76b00; --danger:#b42318; --good:#157347;
+    --page:var(--bg-page); --surface:var(--bg-surface); --surface-soft:var(--bg-tag); --ink:var(--text-heading);
+    --muted:var(--text-secondary); --line:var(--border-default); --accent:var(--brand-primary); --accent-ink:var(--text-on-primary);
+    --amber:var(--text-warning); --danger:var(--text-error); --good:var(--text-success);
   }
-  body { background:var(--page); color:var(--ink); }
-  a { color:var(--accent); }
+  body { background:var(--page); color:var(--text-body); }
+  a { color:var(--text-link); }
   header { display:none; }
-  button { background:var(--accent); color:var(--accent-ink); border-radius:8px;
-    border:0; padding:9px 16px; font-weight:600; cursor:pointer; }
-  button:disabled { opacity:.55; cursor:not-allowed; }
-  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button { background:var(--interactive-primary-bg); color:var(--accent-ink); border-radius:8px; }
+  button.ghost { background:transparent; color:var(--text-secondary); border:1px solid var(--line); }
   main.detail { max-width:920px; margin:0 auto; padding:26px clamp(16px, 3vw, 32px); }
   .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
-  .brand-mark { font-size:20px; font-weight:800; }
+  .top-actions { display:flex; align-items:center; justify-content:flex-end; gap:12px; }
+  .brand-mark { color:var(--brand-primary); font-size:20px; font-weight:800; }
   .back { font-size:14px; }
   .surface {
-    background:var(--surface); border:1px solid var(--line); border-radius:10px;
-    padding:20px; margin-bottom:16px;
+    background:var(--surface); border:1px solid var(--line); border-radius:16px;
+    padding:24px; margin-bottom:16px; box-shadow:var(--shadow-sm);
   }
   h1 { margin:0 0 6px; font-size:23px; line-height:1.25; }
   h2 { margin:0 0 12px; font-size:17px; }
   h3 { margin:0 0 6px; font-size:15px; }
   .muted { color:var(--muted); font-size:13px; }
   .meta { color:var(--muted); font-size:14px; }
-  .score { color:var(--good); font-weight:800; font-size:18px; white-space:nowrap; }
+  .score { color:var(--text-score-primary); font-weight:700; font-size:18px; white-space:nowrap; }
+  .score-block { text-align:right; white-space:nowrap; }
+  .score-number { color:var(--text-score-primary); font-size:28px; line-height:32px; font-weight:700; }
+  .score-suffix { color:var(--text-secondary); font-size:16px; font-weight:500; }
+  .score-win {
+    display:inline-flex; align-items:center; margin-top:4px; padding:2px 8px;
+    border-radius:999px; background:var(--bg-badge-success); color:var(--text-score-secondary);
+    font-size:13px; line-height:16px; font-weight:600;
+  }
   .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+  .job-main { display:flex; align-items:flex-start; gap:14px; min-width:0; }
+  .company-mark {
+    width:48px; height:48px; flex:0 0 48px; border-radius:10px;
+    display:grid; place-items:center; background:var(--bg-tag); color:var(--brand-primary);
+    font-size:20px; line-height:1; font-weight:800; border:1px solid var(--border-default);
+  }
   /* Score + pay range stack on the right of the header, right-aligned. */
   .head-right { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; }
   .pay { color:var(--ink); font-size:14px; font-weight:650; white-space:nowrap; }
   .actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:16px; }
   .apply-btn {
-    background:transparent; color:var(--ink); border:1px solid var(--line);
+    background:transparent; color:var(--interactive-outline-text); border:1.5px solid var(--interactive-outline-border);
     border-radius:8px; padding:8px 14px; font-size:14px; font-weight:600; cursor:pointer;
   }
-  .apply-btn:hover:not(.applied):not(:disabled) { border-color:var(--accent); color:var(--accent); }
-  .apply-btn.applied { background:var(--good); color:#fff; border-color:var(--good); }
+  .apply-btn:hover:not(.applied):not(:disabled) { background:var(--interactive-outline-hover-bg); color:var(--interactive-outline-text); }
+  .apply-btn.applied { background:var(--bg-badge-success); color:var(--text-success); border-color:transparent; }
   .apply-btn:disabled { opacity:.6; cursor:default; }
   .pill {
     display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px;
-    font-size:12px; background:#eef7f5; color:var(--accent);
+    font-size:12px; font-weight:600; background:var(--bg-tag); color:var(--brand-primary);
   }
-  .pill.warn { background:#fff4df; color:var(--amber); }
-  .pill.bad { background:#f6e4e4; color:var(--danger); }
+  .pill.warn { background:var(--bg-badge-warning); color:var(--text-warning); }
+  .pill.bad { background:var(--bg-badge-error); color:var(--text-error); }
+  .pill.neutral { background:var(--bg-badge-neutral); color:var(--text-secondary); }
   ul.tight { margin:6px 0; padding-left:20px; }
   ul.tight li { margin:3px 0; }
   .kit-controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
@@ -54,7 +68,7 @@
   .qa .q { font-weight:700; }
   .qa .advice { color:var(--muted); font-size:13px; margin:6px 0; }
   .doc {
-    background:#fbfdfc; border:1px solid var(--line); border-radius:8px;
+    background:var(--bg-input); border:1px solid var(--line); border-radius:8px;
     padding:10px 14px 14px; margin-top:8px;
   }
   /* The Copy button lives in its own right-aligned bar above the text, so it can
@@ -65,7 +79,7 @@
   }
   .doc .copy {
     font-size:12px; padding:5px 10px; border-radius:6px;
-    background:transparent; color:var(--ink); border:1px solid var(--line);
+    background:transparent; color:var(--text-secondary); border:1px solid var(--line);
   }
   .doc .copy:hover { border-color:var(--accent); color:var(--accent); }
   .spinner {
@@ -74,20 +88,20 @@
     vertical-align:-2px; margin-right:7px;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:#fbfdfc; }
-  .errbox { border:1px solid var(--danger); background:#fdecea; color:var(--danger); border-radius:8px; padding:12px 14px; }
+  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:var(--bg-input); }
+  .errbox { border:1px solid var(--border-error); background:var(--bg-badge-error); color:var(--text-error); border-radius:8px; padding:12px 14px; }
   .section-gap { margin-top:18px; }
   /* Rendered (formatted) resume — Markdown turned into real headings/lists, and
      the element the "Download PDF" print view isolates. */
   .resume-rendered {
-    --resume-accent:#0f766e; --resume-ink:#17211d; --resume-muted:#58635e;
-    --resume-line:#d6e0dc; --resume-soft:#eef7f5;
+    --resume-accent:var(--brand-primary); --resume-ink:#111827; --resume-muted:#6B7280;
+    --resume-line:#E5E7EB; --resume-soft:#F3F4F6;
     background:#fff; color:var(--resume-ink); font:13.5px/1.48 inherit;
     padding:28px 34px; border-radius:6px; box-shadow:0 1px 0 rgba(16,34,29,.04);
     max-width:780px; margin:0 auto;
   }
   .resume-rendered h1 {
-    font-size:30px; line-height:1.08; margin:0; color:#10221d;
+    font-size:30px; line-height:1.08; margin:0; color:#111827;
     text-align:center; font-weight:850; letter-spacing:.02em;
   }
   .resume-rendered h1 + p {
@@ -106,10 +120,10 @@
   /* Each entry's company is a ### heading; the role title is the bold line under
      it (body size), so the company never renders smaller than the position. */
   .resume-rendered h3 {
-    font-size:15.5px; font-weight:800; margin:13px 0 1px; color:#13251f;
+    font-size:15.5px; font-weight:800; margin:13px 0 1px; color:#111827;
   }
   .resume-rendered h3 + p { margin-top:0; color:var(--resume-muted); }
-  .resume-rendered h3 + p strong { color:#27352f; font-weight:750; }
+  .resume-rendered h3 + p strong { color:#374151; font-weight:750; }
   .resume-rendered p { margin:4px 0; }
   .resume-rendered ul, .resume-rendered ol { margin:6px 0 8px; padding-left:0; list-style:none; }
   .resume-rendered li {
@@ -143,7 +157,12 @@
 <main class="detail">
   <div class="topbar">
     <div class="brand-mark">JobScout</div>
-    <a class="back" href="/#jobs">← Back to job list</a>
+    <div class="top-actions">
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
+      <a class="back" href="/#jobs">← Back to job list</a>
+    </div>
   </div>
 
   <div id="content">
@@ -169,6 +188,15 @@ function fmtListed(value){
   return `Listed ${d.toLocaleDateString([], {dateStyle:"medium"})}`;
 }
 
+function companyInitial(name){
+  const trimmed = (name || "").trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() : "?";
+}
+
+function companyMark(name){
+  return `<div class="company-mark" aria-hidden="true">${esc(companyInitial(name))}</div>`;
+}
+
 let detail = null;        // last loaded detail payload
 let kitPolling = false;
 
@@ -192,7 +220,10 @@ function renderDetail(){
   const metaBits = [m.company, m.location, m.department, listed].filter(Boolean).map(esc).join(" · ");
   const head = m.non_matching
     ? `<span class="pill bad">not a match</span>`
-    : `<div class="score">${m.match_score}/100<div class="muted" style="text-align:right;">win ${m.win_probability}%</div></div>`;
+    : `<div class="score-block">
+        <div class="score-number">${m.match_score}<span class="score-suffix">/100</span></div>
+        <div class="score-win">win ${m.win_probability}%</div>
+      </div>`;
   // Pay range (when the posting disclosed one), under the score on the right.
   const salary = m.salary_display ? `<div class="pay">${esc(m.salary_display)}</div>` : "";
 
@@ -209,13 +240,16 @@ function renderDetail(){
   document.getElementById("content").innerHTML = `
     <div class="surface">
       <div class="head-row">
-        <div>
-          <h1>${esc(m.title)}</h1>
-          <div class="meta">${metaBits}</div>
+        <div class="job-main">
+          ${companyMark(m.company)}
+          <div>
+            <h1>${esc(m.title)}</h1>
+            <div class="meta">${metaBits}</div>
+          </div>
         </div>
         <div class="head-right">${head}${salary}</div>
       </div>
-      ${m.removed ? `<div class="pill" style="background:#eceff1; color:var(--muted); margin-top:8px;">✕ No longer listed — this posting has been removed from the company's board. Your application record is kept.</div>` : ""}
+      ${m.removed ? `<div class="pill neutral" style="margin-top:8px;">No longer listed — this posting has been removed from the company's board. Your application record is kept.</div>` : ""}
       <div class="actions">
         <button type="button" id="applyBtn" class="apply-btn${m.applied ? " applied" : ""}"
                 aria-pressed="${m.applied ? "true" : "false"}" onclick="toggleApplied(this)">

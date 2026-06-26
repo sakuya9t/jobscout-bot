@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% block title %}JobScout · AI-Powered Job Scout{% endblock %}
+{% block body %}
+<style>
+  .landing-shell {
+    min-height:100vh;
+    background:
+      radial-gradient(circle at 74% 16%, rgba(99,102,241,.10), transparent 28%),
+      radial-gradient(circle at 16% 88%, rgba(16,185,129,.08), transparent 22%),
+      var(--bg-page);
+  }
+  .landing-nav {
+    position:sticky; top:0; z-index:10; height:64px; display:flex; align-items:center;
+    justify-content:space-between; max-width:1200px; margin:0 auto; padding:0 24px;
+    background:color-mix(in srgb, var(--bg-page) 84%, transparent);
+    backdrop-filter:blur(12px);
+  }
+  .landing-brand { color:var(--brand-primary); font-size:20px; font-weight:800; }
+  .landing-links { display:flex; align-items:center; gap:28px; font-size:13px; font-weight:500; }
+  .landing-actions { display:flex; align-items:center; gap:12px; }
+  .landing-actions .ghost { border:0; padding-inline:10px; }
+  .hero {
+    max-width:1200px; min-height:calc(100vh - 64px); margin:0 auto; padding:72px 24px 40px;
+    display:grid; grid-template-columns:minmax(300px, .9fr) minmax(420px, 1.1fr); gap:48px;
+    align-items:start;
+  }
+  .hero h1 {
+    max-width:520px; margin:0; font-size:48px; line-height:56px; font-weight:800;
+  }
+  .hero-copy { max-width:530px; margin:18px 0 0; color:var(--text-secondary); font-size:16px; line-height:28px; }
+  .hero-actions { display:flex; flex-wrap:wrap; gap:14px; margin-top:28px; }
+  .hero-actions button, .hero-actions a { min-width:132px; }
+  .outline-link {
+    display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:11px 22px;
+    border:1.5px solid var(--interactive-outline-border); border-radius:8px;
+    color:var(--interactive-outline-text); font-weight:600; font-size:14px;
+  }
+  .outline-link:hover { background:var(--interactive-outline-hover-bg); text-decoration:none; }
+  .preview-frame {
+    border:1px solid var(--border-default); border-radius:16px; overflow:hidden;
+    background:var(--bg-surface); box-shadow:var(--shadow-xl);
+  }
+  [data-theme="dark"] .preview-frame { box-shadow:0 0 0 1px rgba(129,140,248,.18), var(--shadow-xl); }
+  .browser-bar {
+    height:34px; display:grid; grid-template-columns:auto 1fr auto; align-items:center;
+    gap:18px; padding:0 12px; border-bottom:1px solid var(--border-default);
+    background:var(--bg-surface-raised);
+  }
+  .browser-dots { display:flex; gap:6px; }
+  .browser-dots span { width:8px; height:8px; border-radius:50%; display:block; }
+  .browser-dots span:nth-child(1) { background:#F87171; }
+  .browser-dots span:nth-child(2) { background:#FBBF24; }
+  .browser-dots span:nth-child(3) { background:#34D399; }
+  .browser-url {
+    justify-self:center; width:min(260px, 70%); height:18px; border-radius:999px;
+    background:var(--bg-input); color:var(--text-secondary); font-size:10px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .preview-app { display:grid; grid-template-columns:118px 1fr; min-height:330px; }
+  .preview-side {
+    border-right:1px solid var(--border-default); padding:18px 12px; background:var(--bg-sidebar);
+  }
+  .preview-logo { color:var(--brand-primary); font-size:13px; font-weight:800; margin-bottom:18px; }
+  .preview-nav { display:grid; gap:7px; }
+  .preview-nav span {
+    height:24px; display:flex; align-items:center; padding:0 8px; border-radius:0 8px 8px 0;
+    color:var(--text-sidebar-inactive); font-size:11px;
+  }
+  .preview-nav span:first-child { background:var(--bg-sidebar-active); color:var(--text-sidebar-active); box-shadow:inset 3px 0 0 var(--border-sidebar-active); }
+  .preview-main { padding:18px; min-width:0; }
+  .preview-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }
+  .preview-title { color:var(--text-heading); font-size:16px; font-weight:700; }
+  .preview-subtitle { color:var(--text-secondary); font-size:11px; }
+  .preview-tabs { display:flex; gap:6px; margin-top:10px; }
+  .preview-tabs span {
+    padding:5px 9px; border-radius:8px; background:var(--bg-sidebar-active);
+    color:var(--text-sidebar-active); font-size:10px; font-weight:600;
+  }
+  .preview-score {
+    width:82px; height:82px; border-radius:50%; display:grid; place-items:center;
+    color:var(--text-score-primary); font-size:20px; font-weight:800;
+    background:conic-gradient(var(--brand-primary) 0 86%, var(--bg-input-hover) 86% 100%);
+    position:relative;
+  }
+  .preview-score::after {
+    content:""; position:absolute; inset:9px; border-radius:50%; background:var(--bg-surface);
+  }
+  .preview-score span { position:relative; z-index:1; display:grid; text-align:center; line-height:1; }
+  .preview-score small { color:var(--text-secondary); font-size:10px; font-weight:600; margin-top:3px; }
+  .preview-list { display:grid; gap:10px; }
+  .preview-job {
+    display:grid; grid-template-columns:34px 1fr auto; gap:10px; align-items:center;
+    border:1px solid var(--border-default); border-radius:12px; padding:10px;
+    background:var(--bg-surface-raised);
+  }
+  .preview-mark {
+    width:34px; height:34px; border-radius:8px; display:grid; place-items:center;
+    background:var(--bg-tag); color:var(--brand-primary); font-weight:800;
+  }
+  .preview-job b { display:block; color:var(--text-heading); font-size:12px; }
+  .preview-job small { color:var(--text-secondary); font-size:10px; }
+  .preview-job-score { color:var(--text-score-primary); font-weight:800; font-size:15px; }
+  .features {
+    max-width:1200px; margin:-28px auto 0; padding:0 24px 64px;
+    display:grid; grid-template-columns:repeat(3, 1fr); gap:16px;
+  }
+  .feature-card {
+    background:var(--bg-surface); border:1px solid var(--border-default);
+    border-radius:16px; padding:22px; box-shadow:var(--shadow-sm);
+  }
+  .feature-icon {
+    width:36px; height:36px; border-radius:10px; display:grid; place-items:center;
+    background:var(--bg-tag); color:var(--brand-primary); font-weight:800; margin-bottom:14px;
+  }
+  .feature-card h2 { margin:0 0 6px; font-size:18px; }
+  .feature-card p { margin:0; color:var(--text-secondary); font-size:13px; line-height:22px; }
+  @media (max-width: 920px) {
+    .landing-links { display:none; }
+    .hero { grid-template-columns:1fr; min-height:auto; padding-top:40px; }
+    .hero h1 { font-size:40px; line-height:48px; }
+    .features { margin:0 auto; grid-template-columns:1fr; }
+  }
+  @media (max-width: 560px) {
+    .landing-nav { padding:0 16px; }
+    .landing-actions .ghost { display:none; }
+    .hero { padding:32px 16px 24px; gap:28px; }
+    .hero h1 { font-size:34px; line-height:40px; }
+    .hero-actions a, .hero-actions button { width:100%; }
+    .preview-app { grid-template-columns:1fr; }
+    .preview-side { display:none; }
+    .features { padding:0 16px 40px; }
+  }
+</style>
+<div class="landing-shell">
+  <nav class="landing-nav" aria-label="Landing">
+    <a class="landing-brand" href="/">JobScout</a>
+    <div class="landing-links">
+      <a href="#features">Features</a>
+      <a href="#features">How it works</a>
+      <a href="/login">Log in</a>
+    </div>
+    <div class="landing-actions">
+      <button class="ghost" type="button" onclick="location.href='/login'">Log in</button>
+      <button type="button" onclick="location.href='/register'">Get Started Free</button>
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
+    </div>
+  </nav>
+  <main class="hero">
+    <section>
+      <h1>Your AI-Powered Job Scout</h1>
+      <p class="hero-copy">
+        JobScout scans company career pages, scores every role against your resume,
+        and delivers a ranked shortlist so you apply smarter, not harder.
+      </p>
+      <div class="hero-actions">
+        <button type="button" onclick="location.href='/register'">Start for free</button>
+        <a class="outline-link" href="/login">Log in</a>
+      </div>
+    </section>
+    <section class="preview-frame" aria-label="JobScout dashboard preview">
+      <div class="browser-bar">
+        <div class="browser-dots"><span></span><span></span><span></span></div>
+        <div class="browser-url">jobscout.app</div>
+        <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+          <span class="sun">☀</span><span class="moon">☾</span>
+        </button>
+      </div>
+      <div class="preview-app">
+        <aside class="preview-side">
+          <div class="preview-logo">JobScout</div>
+          <div class="preview-nav">
+            <span>Job lists</span><span>Resume</span><span>Companies</span><span>Interests</span><span>Settings</span>
+          </div>
+        </aside>
+        <div class="preview-main">
+          <div class="preview-head">
+            <div>
+              <div class="preview-title">Job lists</div>
+              <div class="preview-subtitle">Latest ranked positions from your scans</div>
+              <div class="preview-tabs"><span>Top 5</span><span>All matches</span><span>All jobs</span></div>
+            </div>
+            <div class="preview-score"><span>94<small>match</small></span></div>
+          </div>
+          <div class="preview-list">
+            <div class="preview-job">
+              <div class="preview-mark">N</div>
+              <div><b>ML and Agentic Systems Engineer</b><small>NVIDIA · Santa Clara · 3 days ago</small></div>
+              <div class="preview-job-score">98/100</div>
+            </div>
+            <div class="preview-job">
+              <div class="preview-mark">A</div>
+              <div><b>Senior LLM Release Engineer</b><small>Apple · Seattle · 2 days ago</small></div>
+              <div class="preview-job-score">92/100</div>
+            </div>
+            <div class="preview-job">
+              <div class="preview-mark">S</div>
+              <div><b>Staff Backend Engineer</b><small>Stripe · Remote · today</small></div>
+              <div class="preview-job-score">86/100</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <section id="features" class="features" aria-label="Features">
+    <article class="feature-card">
+      <div class="feature-icon">AI</div>
+      <h2>AI Match Scoring</h2>
+      <p>Compare every posting against your resume and role preferences before you spend time applying.</p>
+    </article>
+    <article class="feature-card">
+      <div class="feature-icon">CV</div>
+      <h2>Resume-Tailored Kits</h2>
+      <p>Generate cover letters, revised resumes, and draft answers grounded in each role.</p>
+    </article>
+    <article class="feature-card">
+      <div class="feature-icon">HQ</div>
+      <h2>Multi-Company Scanning</h2>
+      <p>Watch preset and custom company boards from one quiet, ranked dashboard.</p>
+    </article>
+  </section>
+</div>
+{% endblock %}
