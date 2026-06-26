@@ -27,7 +27,7 @@ from .routers import (
     resumes,
     telegram_config,
 )
-from .services import evaluator, kit_worker, scheduler
+from .services import evaluator, kit_worker, rescore_worker, scheduler
 from .services.ollama_client import get_client
 
 configure_logging()
@@ -78,6 +78,7 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
     evaluator.shutdown()
     kit_worker.shutdown()
+    rescore_worker.shutdown()
 
 
 app = FastAPI(title="JobScout", version="0.1.0", lifespan=lifespan)

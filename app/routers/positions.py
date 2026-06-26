@@ -18,8 +18,9 @@ from ..schemas import (
     OpenQuestionOut,
     PositionDetailOut,
     PositionOut,
+    RescoreStatusOut,
 )
-from ..services import kit_worker, kits, reporter
+from ..services import kit_worker, kits, reporter, rescore_worker
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
@@ -155,3 +156,48 @@ def generate_kit(
     db.commit()
     kit_worker.ensure_generating(user.id, position_id)
     return _kit_out(kit)
+
+
+@router.post("/{position_id}/rescore", response_model=RescoreStatusOut, status_code=status.HTTP_202_ACCEPTED)
+def rescore(
+    position_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-run the AI scoring for just this posting. Hands the work to the background
+    worker and returns immediately; the detail page polls ``GET .../rescore`` and
+    reloads the detail once it's done, showing the refreshed score, "How you line up",
+    and Winning/Risks. Re-posting while one is in flight is a no-op."""
+    position = _require_visible_position(db, user, position_id)
+    if position.removed_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This posting is no longer listed; it can't be re-evaluated.",
+        )
+    resume = db.scalar(
+        select(Resume)
+        .where(Resume.user_id == user.id, Resume.is_active == True)  # noqa: E712
+        .order_by(Resume.created_at.desc())
+    )
+    if resume is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Upload a resume before re-evaluating a posting.",
+        )
+    rescore_worker.ensure_rescoring(user.id, position_id)
+    return RescoreStatusOut(in_progress=True, error=None)
+
+
+@router.get("/{position_id}/rescore", response_model=RescoreStatusOut)
+def rescore_status(
+    position_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Poll a re-evaluation's progress: ``in_progress`` until the background re-score
+    finishes, then ``error`` (null on success). Read-only."""
+    _require_visible_position(db, user, position_id)
+    return RescoreStatusOut(
+        in_progress=rescore_worker.is_rescoring(user.id, position_id),
+        error=rescore_worker.last_error(user.id, position_id),
+    )

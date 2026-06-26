@@ -92,6 +92,19 @@
   /* Score + pay range stack on the right of the header, right-aligned. */
   .head-right { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; }
   .pay { color:var(--ink); font-size:14px; font-weight:650; white-space:nowrap; }
+  /* "How you line up" section header: title on the left, the "Re-evaluate" button
+     (re-runs AI scoring for just this posting) on the right. */
+  .fit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }
+  .fit-head h2 { margin:0; }
+  .reeval-wrap { display:flex; flex-direction:column; align-items:flex-end; gap:4px; flex-shrink:0; }
+  .reeval-btn {
+    background:transparent; color:var(--text-link); border:1px solid var(--line);
+    border-radius:8px; padding:5px 11px; font-size:12.5px; font-weight:600;
+    cursor:pointer; white-space:nowrap;
+  }
+  .reeval-btn:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .reeval-btn:disabled { opacity:.6; cursor:default; }
+  .reeval-status { color:var(--text-secondary); font-size:12px; line-height:16px; max-width:220px; text-align:right; }
   .actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:16px; }
   .apply-btn {
     background:transparent; color:var(--interactive-outline-text); border:1.5px solid var(--interactive-outline-border);
@@ -300,8 +313,24 @@ function fitOutcomeSection(strengths, gaps){
   </div>`;
 }
 
+// The "Re-evaluate" button in the "How you line up" header: re-runs AI scoring for
+// just this posting, refreshing the score, the breakdown, and the Winning/Risks
+// columns. Disabled for a closed posting (the server rejects it too).
+function reevalControl(m){
+  const disabled = m.removed ? " disabled" : "";
+  const title = m.removed
+    ? "This posting is no longer listed — re-evaluation is disabled."
+    : "Re-run the AI scoring for this posting";
+  return `<div class="reeval-wrap">
+    <button type="button" id="reevalBtn" class="reeval-btn"${disabled}
+            title="${esc(title)}" onclick="reevaluate()">↻ Re-evaluate</button>
+    <span id="reevalStatus" class="reeval-status"></span>
+  </div>`;
+}
+
 let detail = null;        // last loaded detail payload
 let kitPolling = false;
+let reevalPolling = false;
 
 async function loadDetail(){
   let r;
@@ -333,13 +362,22 @@ function renderDetail(){
   const strengths = m.strengths || [];
   const gaps = m.gaps || [];
   const breakdown = scoreBreakdownSection(m);
-  const fit = (breakdown || m.reasoning || strengths.length || gaps.length) ? `
+  const hasFit = breakdown || m.reasoning || strengths.length || gaps.length;
+  // "How you line up" always renders so its "Re-evaluate" button is always available
+  // (incl. for a posting that isn't currently a match — re-scoring is how you give it
+  // another look). The body falls back to a short prompt when there's no fit yet.
+  const fit = `
     <div class="surface">
-      <h2>How you line up</h2>
-      ${breakdown}
-      ${m.reasoning ? `<div class="fit-summary">${esc(m.reasoning)}</div>` : ""}
-      ${fitOutcomeSection(strengths, gaps)}
-    </div>` : "";
+      <div class="fit-head">
+        <h2>How you line up</h2>
+        ${reevalControl(m)}
+      </div>
+      ${hasFit ? `
+        ${breakdown}
+        ${m.reasoning ? `<div class="fit-summary">${esc(m.reasoning)}</div>` : ""}
+        ${fitOutcomeSection(strengths, gaps)}`
+      : `<p class="fit-empty">No fit breakdown yet — re-evaluate to score this posting.</p>`}
+    </div>`;
 
   document.getElementById("content").innerHTML = `
     <div class="surface">
@@ -550,6 +588,49 @@ async function pollKit(){
   }
   if(kit){ renderKit(kit); }   // refresh partial progress, keeps kitPolling truthy
   setTimeout(pollKit, 4000);
+}
+
+async function reevaluate(){
+  if(detail && detail.removed){ return; }  // closed posting — server rejects too
+  const btn = document.getElementById("reevalBtn");
+  const statusEl = document.getElementById("reevalStatus");
+  if(btn){ btn.disabled = true; }
+  if(statusEl){ statusEl.textContent = ""; }
+  let r;
+  try { r = await api(`/api/positions/${POSITION_ID}/rescore`, {method:"POST"}); }
+  catch(e){ r = null; }
+  if(!r || !r.ok){
+    const d = r ? await r.json().catch(()=>({})) : {};
+    if(statusEl){ statusEl.textContent = d.detail || "Could not start re-evaluation."; }
+    if(btn){ btn.disabled = false; }
+    return;
+  }
+  if(statusEl){ statusEl.innerHTML = `<span class="spinner"></span>Re-evaluating…`; }
+  startReevalPolling();
+}
+
+function startReevalPolling(){
+  if(reevalPolling){ return; }
+  reevalPolling = true;
+  setTimeout(pollReeval, 3000);
+}
+
+async function pollReeval(){
+  let st = null;
+  try { const r = await api(`/api/positions/${POSITION_ID}/rescore`); if(r.ok){ st = await r.json(); } } catch(e){}
+  if(st && !st.in_progress){
+    reevalPolling = false;
+    if(st.error){
+      const statusEl = document.getElementById("reevalStatus");
+      const btn = document.getElementById("reevalBtn");
+      if(statusEl){ statusEl.textContent = st.error; }
+      if(btn){ btn.disabled = false; }
+      return;
+    }
+    await loadDetail();   // refetch + re-render with the refreshed score / fit
+    return;
+  }
+  setTimeout(pollReeval, 3000);
 }
 
 async function toggleApplied(btn){

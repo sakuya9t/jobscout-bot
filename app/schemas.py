@@ -485,6 +485,16 @@ class PositionDetailOut(BaseModel):
     kit: ApplicationKitOut | None = None
 
 
+class RescoreStatusOut(BaseModel):
+    """Status of a single-position "Re-evaluate" kicked from the detail page.
+    ``in_progress`` is true while the background re-score runs; ``error`` carries a
+    one-line reason from the last completed run (null on success). The page polls this
+    until ``in_progress`` is false, then reloads the detail to show the new score."""
+
+    in_progress: bool = False
+    error: str | None = None
+
+
 class JobListRunOut(BaseModel):
     id: int
     created_at: datetime

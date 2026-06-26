@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..db import session_scope
 from ..models import Company, Interest, MatchResult, Position, Resume, Subscription, User
-from ..schemas import MatchVerdict
+from ..schemas import MatchSubScore, MatchVerdict
 from ..timeutil import utcnow
 from . import llm, scraper
 from .ollama_client import OllamaBudgetError, OllamaClient, OllamaError
@@ -41,6 +41,31 @@ class MatchBatchResponse(BaseModel):
 
 
 MATCH_BATCH_SCHEMA = MatchBatchResponse.model_json_schema()
+
+
+def _score_one_schema() -> dict:
+    """Single-verdict schema for scoring ONE posting (the detail-page re-score). No batch
+    wrapper and no per-posting ``id``, so there's nothing for the model to mis-number —
+    which is exactly the failure a 1-element batch hits. It also marks otherwise-optional
+    fields REQUIRED so the grammar forces the model to emit them: the supplementary arrays
+    (``strengths``/``gaps``/``score_breakdown``) — else Winning/Risks come back empty — and
+    each subscore's ``rationale`` — else the per-aspect description under the breakdown is
+    blank. Forcing the keys (plus an emphatic prompt) makes the model populate them;
+    parsing stays lenient (``_loose_verdict``) so a model that still omits them degrades
+    gracefully instead of failing."""
+    schema = MatchVerdict.model_json_schema()
+    schema["required"] = sorted(
+        set(schema.get("required", [])) | {"strengths", "gaps", "score_breakdown"}
+    )
+    subscore = schema.get("$defs", {}).get("MatchSubScore")
+    if subscore is not None:
+        subscore["required"] = sorted(
+            set(subscore.get("required", [])) | {"label", "score", "rationale"}
+        )
+    return schema
+
+
+SCORE_ONE_SCHEMA = _score_one_schema()
 
 # Stage 1: a CHEAP model decides relevance (semantic, not substring) so we only
 # spend the expensive scoring model on postings that actually fit the interest.
@@ -113,6 +138,7 @@ SYSTEM_PROMPT = (
 _RESUME_CHARS = 6000
 _FILTER_DESC_CHARS = 800  # the cheap relevance filter only needs a short blurb per posting
 _SCORE_BATCH_DESC_CHARS = 1500  # batch scoring keeps one resume + N postings in context
+_SCORE_ONE_DESC_CHARS = 4000  # single re-score has room for far more of the JD than a batch
 
 # Marker stored on the `model` column of a MatchResult when scoring terminally
 # failed, so the pair is skipped on re-runs rather than re-billed. Cleared by
@@ -974,6 +1000,262 @@ def _score_locked(
                 f"{excluded} posting(s) were dropped by your interest's exclude "
                 "keywords before scoring. Loosen the exclude list if that's too broad."
             )
+
+
+def _build_score_one_prompt(resume: Resume, interest: Interest, pos: Position) -> str:
+    """Stage-2 prompt for scoring a SINGLE posting (the detail-page re-score). Unlike
+    the batched variant it asks for one verdict object — no array, no per-posting id —
+    and gives the model far more of the job description, since one posting isn't sharing
+    the context window with N others."""
+    reqs = [f"- {k}: {v}" for k, v in {
+        "Desired titles": interest.title_keywords,
+        "Locations": interest.locations,
+        "Seniority": interest.seniority,
+        "Employment type": interest.employment_type,
+        "Exclusions": interest.exclude_keywords,
+        "Notes": interest.notes,
+    }.items() if v]
+    block = (
+        f"Title: {pos.title}\n"
+        f"Company position id: {pos.external_id}\n"
+        f"Location: {pos.location or 'n/a'}\n"
+        f"Department: {pos.department or 'n/a'}\n"
+        f"Employment type: {pos.employment_type or 'n/a'}\n"
+        f"Description:\n{(pos.description or '(no description scraped)')[:_SCORE_ONE_DESC_CHARS]}\n"
+    )
+    return (
+        "Score this single job posting against the candidate's resume and requirements. "
+        "Return ONE JSON object with the verdict fields requested by the schema — not an "
+        "array, and not wrapped in any other key.\n"
+        "Fill EVERY field. In particular, do not leave these empty:\n"
+        "- `strengths`: 2-4 specific reasons this candidate is a strong fit for THIS role "
+        "(concrete overlaps in experience, domain, or skills), addressed to the candidate "
+        "(\"you have…\").\n"
+        "- `gaps`: 1-3 specific risks or missing/under-evidenced qualifications for THIS "
+        "role, addressed to the candidate — only empty if the candidate genuinely meets "
+        "every requirement.\n"
+        "- `score_breakdown`: the five aspect scores named in the rubric, and for EACH a "
+        "non-empty `rationale` of one short sentence addressed to the candidate explaining "
+        "that aspect's score.\n\n"
+        "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
+        "## RESUME\n" + resume.content_text[:_RESUME_CHARS] + "\n\n"
+        "## JOB POSTING\n" + block + "\n"
+    )
+
+
+def _clamp_score(value, default: int | None = 0) -> int | None:
+    """A 0-100 int from a loose value ("91", "91%", 91.0); ``default`` when unparseable."""
+    if isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value)
+        value = m.group(0) if m else None
+    try:
+        return max(0, min(100, int(float(value))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_list(value) -> list[str]:
+    """Non-empty trimmed strings from a loose list (drops non-strings / blanks)."""
+    if not isinstance(value, list):
+        return []
+    return [s.strip() for s in value if isinstance(s, str) and s.strip()]
+
+
+# Key-name drift these models show in score_breakdown items (e.g. "aspect"/"name"
+# instead of "label"). Accept the common synonyms so a renamed key doesn't drop the
+# whole breakdown and fall back to the synthetic "Estimated…" note.
+_BREAKDOWN_LABEL_KEYS = ("label", "aspect", "name", "category", "dimension", "criterion", "area")
+_BREAKDOWN_SCORE_KEYS = ("score", "value", "rating", "points", "out_of_100")
+_BREAKDOWN_RATIONALE_KEYS = (
+    "rationale", "reason", "reasoning", "explanation", "note", "notes", "detail", "comment"
+)
+
+
+def _first_key(item: dict, keys: tuple[str, ...]):
+    """First present, non-empty value among ``keys`` (tolerates the model's key drift)."""
+    for k in keys:
+        v = item.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _loose_breakdown(value) -> list[MatchSubScore]:
+    """Sanitize score_breakdown ITEM BY ITEM — keep each well-formed aspect, clamp its
+    score, accept synonym keys, and silently drop a malformed one. Crucially this isolates
+    a bad subscore so it can't sink the whole verdict (the previous all-or-nothing validate
+    dropped strengths/gaps too, leaving Winning/Risks empty). Also normalizes the two
+    common non-list shapes these models emit — an object keyed by aspect name
+    ({"Vertical experience": {...}} or {"Skills": 80}) — into a list first."""
+    if isinstance(value, dict):
+        normalized = []
+        for key, val in value.items():
+            if isinstance(val, dict):
+                item = dict(val)
+                item.setdefault("label", key)
+                normalized.append(item)
+            elif isinstance(val, (int, float, str)):
+                normalized.append({"label": key, "score": val})
+        value = normalized
+    out: list[MatchSubScore] = []
+    if not isinstance(value, list):
+        return out
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = str(_first_key(item, _BREAKDOWN_LABEL_KEYS) or "").strip()
+        if not label:
+            continue
+        out.append(MatchSubScore(
+            label=label[:80],
+            score=_clamp_score(_first_key(item, _BREAKDOWN_SCORE_KEYS), 0),
+            rationale=str(_first_key(item, _BREAKDOWN_RATIONALE_KEYS) or "").strip()[:240],
+        ))
+    return out[:5]
+
+
+def _loose_verdict(data) -> MatchVerdict | None:
+    """Best-effort MatchVerdict from a loose model response, built FIELD BY FIELD so one
+    drifting field never discards a good one. These models drift from the schema even
+    under ``format`` (the matcher uses a free-text relevance filter for the same reason —
+    see the scoring memory): they skip ``strengths``/``gaps``, return a stray subscore,
+    or omit ``matches_requirements``. We sanitize each field independently rather than
+    validating the whole object strictly. Returns None only when there's no usable score
+    at all, so the caller keeps the prior result instead of persisting a hollow zero."""
+    if not isinstance(data, dict):
+        return None
+    score = _clamp_score(data.get("match_score"), None)
+    if score is None:  # no real score -> the model didn't actually score this posting
+        return None
+    mr = data.get("matches_requirements")
+    if not isinstance(mr, bool):
+        mr = score > 0  # infer the verdict flag from the score when the model omits it
+    reasoning = data.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = "Re-scored against this posting."
+    try:
+        return MatchVerdict(
+            matches_requirements=mr,
+            match_score=score,
+            win_probability=_clamp_score(data.get("win_probability"), 0),
+            reasoning=reasoning.strip(),
+            strengths=_str_list(data.get("strengths")),
+            gaps=_str_list(data.get("gaps")),
+            score_breakdown=_loose_breakdown(data.get("score_breakdown")),
+            # MatchVerdict's own field validators coerce these (or null them), so pass through.
+            salary_min=data.get("salary_min"),
+            salary_max=data.get("salary_max"),
+            salary_currency=data.get("salary_currency"),
+            salary_period=data.get("salary_period"),
+        )
+    except ValidationError:
+        return None
+
+
+def _score_one(
+    client: OllamaClient,
+    db: Session,
+    user: User,
+    resume: Resume,
+    interest: Interest,
+    pos: Position,
+) -> tuple[int | None, str | None]:
+    """Score ONE posting with a single-verdict call (no batch wrapper) and persist the
+    MatchResult in place. Returns ``(match_id, None)`` on success, ``(None, message)``
+    on a recoverable failure (the caller decides whether to keep the prior result), and
+    raises ``OllamaBudgetError`` up to the caller. Used by the on-demand re-score; the
+    daily drain still batches for throughput."""
+    try:
+        data = client.chat_json(SYSTEM_PROMPT, _build_score_one_prompt(resume, interest, pos),
+                                SCORE_ONE_SCHEMA)
+    except OllamaBudgetError:
+        raise
+    except OllamaError as exc:
+        log.warning("single-posting scoring failed for position %s: %s", pos.id, exc)
+        return None, f"Scoring failed: {exc}"
+    verdict = _loose_verdict(data)
+    if verdict is None:
+        snippet = json.dumps(data)[:300] if isinstance(data, (dict, list)) else str(data)[:300]
+        log.warning("re-score: unparseable verdict for position %s: %s", pos.id, snippet)
+        return None, "Scoring failed: the model returned an unexpected response. Please try again."
+    # Diagnostics: when a field the schema forces still parses empty, log the RAW value so
+    # we can tell "the model omitted it" from "our parser dropped it" (e.g. a key-name we
+    # don't yet recognize). Cheap and only fires on the unhappy path.
+    if isinstance(data, dict):
+        if not (verdict.strengths or verdict.gaps):
+            log.warning("re-score: position %s scored but no strengths/gaps; raw keys=%s",
+                        pos.id, sorted(data.keys()))
+        if not verdict.score_breakdown:
+            log.warning("re-score: position %s scored but breakdown empty; raw score_breakdown=%s",
+                        pos.id, json.dumps(data.get("score_breakdown"))[:400])
+    return _persist_score_result(db, user, resume, interest, pos, verdict, client.model), None
+
+
+def rescore_position(
+    db: Session,
+    user: User,
+    position: Position,
+    *,
+    client: OllamaClient | None = None,
+) -> RunResult:
+    """Re-score a SINGLE position on demand (the detail page's "Re-evaluate" button),
+    overwriting the stored MatchResult(s) so the score, reasoning, strengths/gaps and
+    aspect breakdown all refresh. Scores the posting against every active interest
+    (the detail page then surfaces the best), reusing the same batched scoring call and
+    upsert as the backlog drain — so a fresh verdict replaces the existing row in place.
+
+    Unlike ``score_to_completion`` this deliberately skips the cheap relevance
+    pre-filter: the user is explicitly asking to (re)score THIS posting, so it always
+    runs the expensive scoring model, even for a posting a prior filter rejected.
+
+    All-or-nothing: nothing is committed until every interest scores cleanly, and on
+    any failure the whole attempt is rolled back. That's the key difference from the
+    drain — a transient LLM error here must NOT persist an error-marker over the
+    existing good result (which would flip the detail page to "not a match"); the user
+    keeps their previous score and simply retries.
+
+    No per-user score lock is taken: the target pair already has a settled MatchResult,
+    which a concurrent backlog drain skips (it only scores unsettled pairs), and the
+    upsert is an in-place update — so this can't double-score, and needn't stall behind
+    a multi-minute full drain."""
+    res = RunResult()
+    resume, interests, _companies = _active_inputs(db, user)
+    if not resume:
+        res.add_error("No active resume uploaded — cannot score.")
+    if not interests:
+        res.add_error("No active interests configured — nothing to match against.")
+    if not resume or not interests:
+        return res
+    if not (position.description or "").strip():
+        res.add_error("This posting has no scraped description to evaluate.")
+        return res
+
+    score_client = client or llm.clients_for_user(db, user)[0]
+    try:
+        for interest in interests:
+            match_id, serr = _score_one(score_client, db, user, resume, interest, position)
+            if serr is not None:
+                # Discard rather than persist a partial/failed result over the existing
+                # good row — an interactive re-score must leave the prior score intact on
+                # failure (nothing was committed yet, so rollback restores it).
+                db.rollback()
+                res.add_error(serr)
+                res.finalize_errors()
+                return res
+            if match_id is not None:  # None ⇒ a concurrent drain just scored this pair
+                res.scored += 1
+                res.match_ids.append(match_id)
+        db.commit()
+    except OllamaBudgetError as exc:
+        db.rollback()
+        res.budget_exhausted = True
+        res.add_error(
+            "Ollama budget/quota appears to be exhausted, so the re-evaluation couldn't "
+            f"finish — your previous score is unchanged. Try again once your account has "
+            f"quota. (Ollama said: {exc})"
+        )
+    res.finalize_errors()
+    return res
 
 
 def run_for_user(
