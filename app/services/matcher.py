@@ -43,32 +43,49 @@ class MatchBatchResponse(BaseModel):
     results: list[BatchMatchVerdict]
 
 
-MATCH_BATCH_SCHEMA = MatchBatchResponse.model_json_schema()
+def _force_supplementary_required(verdict_node: dict, subscore_node: dict | None) -> None:
+    """Mark the otherwise-optional verdict fields REQUIRED on a JSON-schema verdict node so
+    the model-facing grammar forces the model to emit them: the supplementary arrays
+    (``strengths``/``gaps``/``score_breakdown``) — else Winning/Risks come back empty — and
+    each subscore's ``rationale`` — else the per-aspect description under the breakdown is
+    blank. Mutates the nodes in place. Both scoring schemas (single re-score and batch
+    drain) run through this so they request the same shape; parsing stays lenient
+    (``_loose_verdict``) so a model that still omits a field degrades gracefully."""
+    verdict_node["required"] = sorted(
+        set(verdict_node.get("required", [])) | {"strengths", "gaps", "score_breakdown"}
+    )
+    if subscore_node is not None:
+        subscore_node["required"] = sorted(
+            set(subscore_node.get("required", [])) | {"label", "score", "rationale"}
+        )
 
 
 def _score_one_schema() -> dict:
     """Single-verdict schema for scoring ONE posting (the detail-page re-score). No batch
     wrapper and no per-posting ``id``, so there's nothing for the model to mis-number —
-    which is exactly the failure a 1-element batch hits. It also marks otherwise-optional
-    fields REQUIRED so the grammar forces the model to emit them: the supplementary arrays
-    (``strengths``/``gaps``/``score_breakdown``) — else Winning/Risks come back empty — and
-    each subscore's ``rationale`` — else the per-aspect description under the breakdown is
-    blank. Forcing the keys (plus an emphatic prompt) makes the model populate them;
-    parsing stays lenient (``_loose_verdict``) so a model that still omits them degrades
-    gracefully instead of failing."""
+    which is exactly the failure a 1-element batch hits. The supplementary fields are forced
+    required via ``_force_supplementary_required`` (else Winning/Risks come back empty)."""
     schema = MatchVerdict.model_json_schema()
-    schema["required"] = sorted(
-        set(schema.get("required", [])) | {"strengths", "gaps", "score_breakdown"}
-    )
-    subscore = schema.get("$defs", {}).get("MatchSubScore")
-    if subscore is not None:
-        subscore["required"] = sorted(
-            set(subscore.get("required", [])) | {"label", "score", "rationale"}
-        )
+    _force_supplementary_required(schema, schema.get("$defs", {}).get("MatchSubScore"))
+    return schema
+
+
+def _score_batch_schema() -> dict:
+    """Batch (drain) counterpart to ``_score_one_schema``: the multi-posting ``results``
+    wrapper, with the SAME supplementary fields forced required on EACH verdict. Without
+    this the raw Pydantic batch schema left ``strengths``/``gaps``/``score_breakdown``
+    optional (they default to empty lists), so the bulk drain stored a bare score with empty
+    Winning/Risks — only the single re-score forced them. This brings the drain to parity."""
+    schema = MatchBatchResponse.model_json_schema()
+    defs = schema.get("$defs", {})
+    verdict = defs.get("BatchMatchVerdict")
+    if verdict is not None:
+        _force_supplementary_required(verdict, defs.get("MatchSubScore"))
     return schema
 
 
 SCORE_ONE_SCHEMA = _score_one_schema()
+MATCH_BATCH_SCHEMA = _score_batch_schema()
 
 # Stage 1: a CHEAP model decides relevance (semantic, not substring) so we only
 # spend the expensive scoring model on postings that actually fit the interest.
@@ -281,8 +298,15 @@ def _posting_block(pos: Position, *, max_desc_chars: int, number: int | None = N
 _SCORE_BATCH_INTRO = (
     "Score every numbered posting independently against the same resume and "
     "candidate requirements. Return JSON with a top-level `results` array. "
-    "Each result must include the posting's 1-based `id` and the same verdict "
-    "fields requested by the schema. Do not omit postings."
+    "Each result must include the posting's 1-based `id` and ALL the verdict fields "
+    "requested by the schema. Do not omit postings, and for EACH posting do not leave "
+    "these empty:\n"
+    "- `strengths`: 2-4 specific reasons this candidate is a strong fit for THAT role, "
+    "addressed to the candidate (\"you have…\").\n"
+    "- `gaps`: 1-3 specific risks or missing/under-evidenced qualifications for THAT role "
+    "(only empty if the candidate genuinely meets every requirement).\n"
+    "- `score_breakdown`: the five aspect scores named in the rubric, each with a non-empty "
+    "one-sentence `rationale` addressed to the candidate."
 )
 _SCORE_ONE_INTRO = (
     "Score this single job posting against the candidate's resume and requirements. "

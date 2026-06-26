@@ -1367,6 +1367,22 @@ def test_scoring_batch_scores_multiple_survivors_in_one_call(monkeypatch):
     assert good.calls == 1
 
 
+def test_batch_score_schema_forces_strengths_gaps_breakdown():
+    """Regression: the bulk-drain (batch) schema must force the same supplementary fields
+    REQUIRED as the single re-score. The raw Pydantic batch schema left strengths/gaps/
+    score_breakdown optional, so capable models omitted them and every batch-scored position
+    came back with empty Winning/Risks and no score breakdown — only the detail-page re-score
+    forced them. This keeps the two schemas at parity."""
+    from app.services.matcher import MATCH_BATCH_SCHEMA, SCORE_ONE_SCHEMA
+
+    batch_verdict = set(MATCH_BATCH_SCHEMA["$defs"]["BatchMatchVerdict"]["required"])
+    assert {"strengths", "gaps", "score_breakdown"} <= batch_verdict
+    assert "rationale" in MATCH_BATCH_SCHEMA["$defs"]["MatchSubScore"]["required"]
+    # Parity: the single-object re-score schema already forced these.
+    assert {"strengths", "gaps", "score_breakdown"} <= set(SCORE_ONE_SCHEMA["required"])
+    assert "rationale" in SCORE_ONE_SCHEMA["$defs"]["MatchSubScore"]["required"]
+
+
 def test_resume_reupload_same_content_is_noop():
     """Re-uploading identical resume content reuses the existing resume (same id),
     so scores cached against it aren't recomputed; new content replaces it."""
