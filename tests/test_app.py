@@ -195,6 +195,20 @@ def test_reconcile_schema_adds_column_relaxes_notnull_and_keeps_data():
                 pass
 
 
+def test_literal_default_renders_boolean_as_sql_keyword():
+    """A boolean column default must reconcile as TRUE/FALSE, not 1/0: Postgres rejects an
+    integer literal as a BOOLEAN column default when ALTER TABLE ADD COLUMN backfills
+    existing rows ("column is of type boolean but default expression is of type integer").
+    SQLite accepts either, so only this dialect-agnostic check guards the Postgres path."""
+    from app.db import _literal_default
+
+    assert _literal_default(models.User.__table__.c.must_change_password) == "FALSE"
+    assert _literal_default(models.Resume.__table__.c.is_active) == "TRUE"
+    # Non-boolean scalars are unaffected (int stays a bare number, str gets quoted).
+    assert _literal_default(models.MatchResult.__table__.c.match_score) == "0"
+    assert _literal_default(models.JobListSnapshot.__table__.c.items_json) == "'[]'"
+
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def _register(client, email, password="secret123"):
     return client.post("/api/auth/register", json={"email": email, "password": password})
