@@ -7,6 +7,8 @@ export interface UserOut {
   email: string;
   telegram_chat_id: string | null;
   telegram_link_code: string | null;
+  // True only between logging in with a temporary password and choosing a real one.
+  must_change_password: boolean;
 }
 
 export type KitStatus = "generating" | "ok" | "error" | null;

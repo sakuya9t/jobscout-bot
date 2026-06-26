@@ -34,6 +34,9 @@
     <label for="password">Password</label>
     <input id="password" type="password"
            autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" />
+    {% if mode != "register" %}
+    <p style="margin:6px 0 0; font-size:13px;"><a href="/forgot-password">Forgot password?</a></p>
+    {% endif %}
     {% if mode == "register" %}
     <p class="muted" style="margin:6px 0 0;">
       At least 8 characters, including a letter and a number.
@@ -78,7 +81,16 @@
     const r = await fetch(path, {
       method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
     });
-    if (r.ok) { window.location = "/"; }
+    if (r.ok) {
+      // A temp-password login (forgot-password flow) forces a password change before the
+      // app is usable — ask /me and route there instead of the dashboard.
+      let dest = "/";
+      try {
+        const me = await fetch("/api/auth/me").then((res) => res.ok ? res.json() : null);
+        if (me && me.must_change_password) dest = "/set-new-password";
+      } catch (_) { /* fall back to dashboard */ }
+      window.location = dest;
+    }
     else { const d = await r.json().catch(() => ({})); err.textContent = errorText(d.detail) || "Something went wrong"; }
   };
 </script>

@@ -258,6 +258,168 @@ def test_change_password():
                        ).status_code == 401
 
 
+# ── Forgot password (temporary password over Telegram) ───────────────────────
+def _uid_by_email(email):
+    from sqlalchemy import select
+    with session_scope() as db:
+        return db.scalar(select(models.User.id).where(models.User.email == email))
+
+
+def _link_telegram(uid, *, token="bot-xyz", chat_id="999"):
+    with session_scope() as db:
+        u = db.get(models.User, uid)
+        u.telegram_bot_token = token
+        u.telegram_chat_id = chat_id
+
+
+def _temp_from(text):
+    """Pull the temp password out of the captured Telegram message body."""
+    return text.split("<code>")[1].split("</code>")[0]
+
+
+def test_forgot_password_via_telegram_forces_change(monkeypatch):
+    """Forgot-password mints a single-use temp password, delivers it over the user's
+    Telegram bot, and logging in with it gates the whole app behind a forced change
+    until a real password is set."""
+    import app.services.telegram_bot as tg
+    sent = {}
+    monkeypatch.setattr(
+        tg, "send_message",
+        lambda token, chat_id, text: sent.update(token=token, chat_id=chat_id, text=text) or True,
+    )
+    with TestClient(app) as c:
+        _register(c, "fp@x.com")  # password "secret123"
+        uid = _uid_by_email("fp@x.com")
+        _link_telegram(uid, token="bot-xyz", chat_id="999")
+
+        assert c.post("/api/auth/forgot-password", json={"email": "fp@x.com"}).json() == {"ok": True}
+        assert sent["token"] == "bot-xyz" and sent["chat_id"] == "999"
+        temp = _temp_from(sent["text"])
+
+        # Temp password recorded, but the account isn't forced yet (only on login with it).
+        with session_scope() as db:
+            u = db.get(models.User, uid)
+            assert u.temp_password_hash and u.temp_password_expires_at
+            assert u.must_change_password is False
+
+        # Logging in with the temp password works and flips the forced-change flag.
+        assert c.post("/api/auth/login", json={"email": "fp@x.com", "password": temp}).status_code == 200
+        # Now the app is gated: every protected route 403s with a stable code...
+        gated = c.get("/api/interests")
+        assert gated.status_code == 403 and gated.json()["detail"] == "password_change_required"
+        # ...except /me, which stays open and advertises the flag for the frontend.
+        assert c.get("/api/auth/me").json()["must_change_password"] is True
+        # Single-use: the login that consumed it cleared the temp password.
+        with session_scope() as db:
+            assert db.get(models.User, uid).temp_password_hash is None
+
+        # Setting a real password clears the flag, un-gates the app, and becomes the login.
+        assert c.post("/api/auth/set-new-password", json={"new_password": "brandnew1"}).status_code == 200
+        assert c.get("/api/interests").status_code == 200
+        assert c.get("/api/auth/me").json()["must_change_password"] is False
+        assert c.post("/api/auth/login", json={"email": "fp@x.com", "password": temp}).status_code == 401
+        assert c.post("/api/auth/login",
+                      json={"email": "fp@x.com", "password": "brandnew1"}).status_code == 200
+
+
+def test_forgot_password_generic_for_unknown_and_unlinked(monkeypatch):
+    """The response never reveals whether the email is registered or has Telegram
+    linked — both cases return the same generic ok and deliver nothing."""
+    import app.services.telegram_bot as tg
+    calls = []
+    monkeypatch.setattr(tg, "send_message", lambda *a, **k: calls.append(a) or True)
+    with TestClient(app) as c:
+        assert c.post("/api/auth/forgot-password", json={"email": "nobody@x.com"}).json() == {"ok": True}
+        _register(c, "nolink@x.com")  # registered but no Telegram linked
+        assert c.post("/api/auth/forgot-password", json={"email": "nolink@x.com"}).json() == {"ok": True}
+        assert calls == []  # nothing ever sent
+        with session_scope() as db:
+            assert db.get(models.User, _uid_by_email("nolink@x.com")).temp_password_hash is None
+
+
+def test_temp_password_expiry_and_real_login_clears_it(monkeypatch):
+    """An expired temp password is rejected at login; and remembering the real password
+    (logging in with it) invalidates any outstanding temp password."""
+    from app.auth import hash_password
+    from app.timeutil import utcnow
+    import app.services.telegram_bot as tg
+    sent = {}
+    monkeypatch.setattr(tg, "send_message",
+                        lambda token, chat_id, text: sent.update(text=text) or True)
+    with TestClient(app) as c:
+        _register(c, "exp@x.com")  # password "secret123"
+        uid = _uid_by_email("exp@x.com")
+        _link_telegram(uid)
+
+        # Expired temp password -> rejected like any wrong password (401), no forced change.
+        with session_scope() as db:
+            u = db.get(models.User, uid)
+            u.temp_password_hash = hash_password("oldtemp12")
+            u.temp_password_expires_at = utcnow() - timedelta(minutes=1)
+        assert c.post("/api/auth/login",
+                      json={"email": "exp@x.com", "password": "oldtemp12"}).status_code == 401
+
+        # Fresh temp password issued, then a real-password login clears it.
+        c.post("/api/auth/forgot-password", json={"email": "exp@x.com"})
+        temp = _temp_from(sent["text"])
+        assert c.post("/api/auth/login",
+                      json={"email": "exp@x.com", "password": "secret123"}).status_code == 200
+        with session_scope() as db:
+            assert db.get(models.User, uid).temp_password_hash is None
+        assert c.post("/api/auth/login",
+                      json={"email": "exp@x.com", "password": temp}).status_code == 401
+
+
+def test_old_password_still_works_while_temp_outstanding_and_never_forces_change(monkeypatch):
+    """Requesting a reset doesn't lock out a user who then remembers their password:
+    logging in with the real password succeeds, voids the outstanding temp password, and
+    never forces a change — even if the temp password had already been used once."""
+    import app.services.telegram_bot as tg
+    sent = {}
+    monkeypatch.setattr(tg, "send_message",
+                        lambda token, chat_id, text: sent.update(text=text) or True)
+    with TestClient(app) as c:
+        _register(c, "remember@x.com")  # password "secret123"
+        uid = _uid_by_email("remember@x.com")
+        _link_telegram(uid)
+
+        # Temp password outstanding, but the user remembers the real one and logs in.
+        c.post("/api/auth/forgot-password", json={"email": "remember@x.com"})
+        temp = _temp_from(sent["text"])
+        assert c.post("/api/auth/login",
+                      json={"email": "remember@x.com", "password": "secret123"}).status_code == 200
+        # Not forced to change, and the app is usable straight away...
+        assert c.get("/api/auth/me").json()["must_change_password"] is False
+        assert c.get("/api/interests").status_code == 200
+        # ...and the temp password was voided by the real login.
+        with session_scope() as db:
+            assert db.get(models.User, uid).temp_password_hash is None
+        assert c.post("/api/auth/login",
+                      json={"email": "remember@x.com", "password": temp}).status_code == 401
+
+        # Edge case: even if a forced change was already pending (temp used once before),
+        # a real-password login lifts it rather than trapping the user.
+        with session_scope() as db:
+            db.get(models.User, uid).must_change_password = True
+        assert c.post("/api/auth/login",
+                      json={"email": "remember@x.com", "password": "secret123"}).status_code == 200
+        assert c.get("/api/auth/me").json()["must_change_password"] is False
+        assert c.get("/api/interests").status_code == 200
+
+
+def test_set_new_password_requires_session_and_forced_state():
+    """set-new-password needs a valid session (401 without one) and only applies while
+    the forced-change flag is set (400 otherwise); the complexity rule still runs."""
+    with TestClient(app) as c:
+        assert c.post("/api/auth/set-new-password",
+                      json={"new_password": "brandnew1"}).status_code == 401  # no session
+        _register(c, "snp@x.com")  # logged in, but no forced change pending
+        assert c.post("/api/auth/set-new-password",
+                      json={"new_password": "weak"}).status_code == 422      # complexity first
+        assert c.post("/api/auth/set-new-password",
+                      json={"new_password": "brandnew1"}).status_code == 400  # nothing to change
+
+
 def test_email_normalized_case_insensitive():
     """A@b.com and a@b.com are the same account; login is case-insensitive."""
     with TestClient(app) as c:

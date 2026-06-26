@@ -744,7 +744,17 @@
 </main>
 
 <script>
-const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts});
+const api = (p, opts={}) => fetch(p, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => {
+  // A user mid password-reset is gated: the backend 403s every protected route with this
+  // code. Funnel them to the set-new-password screen (peek at a clone so callers still
+  // read the body). Mirrors the SPA's API client.
+  if (r.status === 403) {
+    r.clone().json().then(d => {
+      if (d && d.detail === "password_change_required") window.location = "/set-new-password";
+    }).catch(() => {});
+  }
+  return r;
+});
 const esc = s => (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const val = id => document.getElementById(id).value.trim();
 // FastAPI sends `detail` as a string for raised HTTPExceptions but an array of

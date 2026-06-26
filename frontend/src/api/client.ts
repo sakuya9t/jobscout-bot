@@ -33,6 +33,13 @@ function goToLogin(): void {
   window.location.assign(`/login?next=${next}`);
 }
 
+let redirectingToReset = false;
+function goToSetNewPassword(): void {
+  if (redirectingToReset) return;
+  redirectingToReset = true;
+  window.location.assign("/set-new-password");
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = { method, credentials: "include", headers: {} };
   if (body instanceof FormData) {
@@ -57,6 +64,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     payload = await res.json();
   } catch {
     /* empty/non-JSON body */
+  }
+
+  // A user who logged in with a temporary password is gated until they pick a real one:
+  // the backend 403s every protected route with this code. Funnel them to the
+  // (server-rendered) set-new-password screen, the same way a 401 funnels to /login.
+  if (res.status === 403 && payload?.detail === "password_change_required") {
+    goToSetNewPassword();
+    throw new ApiError(403, "password_change_required");
   }
 
   if (!res.ok) {

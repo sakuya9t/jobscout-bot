@@ -20,6 +20,7 @@ from app.models import Base, LlmConfig, User
 # must be safe by other means — keep this list short and justified.
 _PLAINTEXT_ALLOWED = {
     ("users", "hashed_password"),          # bcrypt hash: one-way, not reversible by design
+    ("users", "temp_password_hash"),       # bcrypt hash of the forgot-password temp password: one-way like hashed_password
     ("companies", "ats_token"),            # public ATS board slug (part of the careers URL), not a credential
     ("company_accounts", "password_enc"),  # Fernet-encrypted via crypto.encrypt() at the router; stored as Text
 }

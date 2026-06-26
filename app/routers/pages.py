@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from ..auth import get_optional_user
+from ..config import settings
 from ..models import User
 
 router = APIRouter(tags=["pages"])
@@ -23,6 +24,22 @@ def login_page(request: Request):
 @router.get("/register", response_class=HTMLResponse)
 def register_page(request: Request):
     return templates.TemplateResponse(request, "login.html", {"mode": "register"})
+
+
+@router.get("/forgot-password", response_class=HTMLResponse)
+def forgot_password_page(request: Request):
+    # Public, like /login. The page shows the TTL so the copy matches the configured
+    # expiry; the POST it submits never reveals whether the email exists.
+    return templates.TemplateResponse(
+        request, "forgot_password.html", {"ttl": settings.password_reset_ttl_minutes}
+    )
+
+
+@router.get("/set-new-password", response_class=HTMLResponse)
+def set_new_password_page(request: Request):
+    # Public page; the POST it submits requires a valid session (401 -> /login) and only
+    # succeeds while must_change_password is set.
+    return templates.TemplateResponse(request, "set_new_password.html", {})
 
 
 @router.get("/", response_class=HTMLResponse)

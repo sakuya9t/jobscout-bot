@@ -15,6 +15,14 @@ export const useAuthStore = defineStore("auth", () => {
     if (status.value !== "unknown") return status.value === "authed";
     try {
       user.value = await api.get<UserOut>("/api/auth/me");
+      // Logged in with a temporary password but haven't set a real one yet: the rest of
+      // the app's API calls would 403, so funnel straight to the reset screen. (/me is
+      // the one authed route that isn't gated, so we catch it here rather than via the
+      // client's 403 handler.)
+      if (user.value?.must_change_password) {
+        window.location.assign("/set-new-password");
+        return false;
+      }
       status.value = "authed";
       return true;
     } catch (e) {
