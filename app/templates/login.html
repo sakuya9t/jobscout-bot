@@ -13,9 +13,10 @@
   .auth-actions button { width:100%; }
   .auth-footer { margin:18px 0 0; color:var(--text-secondary); font-size:13px; }
   .auth-header-actions { display:flex; align-items:center; gap:12px; }
+  header .brand:hover { text-decoration:none; }
 </style>
 <header>
-  <span class="brand">JobScout</span>
+  <a class="brand" href="/" aria-label="Go to JobScout landing page">JobScout</a>
   <div class="auth-header-actions">
     <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
       <span class="sun">☀</span><span class="moon">☾</span>
