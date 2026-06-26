@@ -35,6 +35,53 @@
     border-radius:999px; background:var(--bg-badge-success); color:var(--text-score-secondary);
     font-size:13px; line-height:16px; font-weight:600;
   }
+  .breakdown-grid {
+    display:grid; grid-template-columns:180px minmax(0, 1fr); gap:24px; align-items:center;
+    margin-bottom:18px;
+  }
+  .score-orb {
+    width:160px; height:160px; border-radius:50%; display:grid; place-items:center;
+    justify-self:center; background:conic-gradient(var(--brand-primary) var(--score-pct), var(--bg-input-hover) 0);
+    position:relative; box-shadow:var(--shadow-sm);
+  }
+  .score-orb::before {
+    content:""; position:absolute; inset:14px; border-radius:50%; background:var(--bg-surface);
+    border:1px solid var(--border-default);
+  }
+  .score-orb-inner { position:relative; z-index:1; display:grid; justify-items:center; line-height:1; }
+  .score-orb-score { color:var(--text-score-primary); font-size:36px; font-weight:800; }
+  .score-orb-label { color:var(--text-secondary); font-size:12px; font-weight:700; margin-top:6px; }
+  .subscore-list { display:grid; gap:12px; }
+  .subscore-row { display:grid; gap:6px; }
+  .subscore-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .subscore-label { color:var(--text-heading); font-size:13px; font-weight:700; }
+  .subscore-value { color:var(--text-score-primary); font-size:13px; font-weight:800; white-space:nowrap; }
+  .subscore-track { height:8px; border-radius:999px; background:var(--bg-input-hover); overflow:hidden; }
+  .subscore-fill { height:100%; width:var(--subscore-pct); border-radius:inherit; background:var(--brand-primary); }
+  .subscore-note { color:var(--text-secondary); font-size:12px; line-height:18px; }
+  .fit-summary {
+    margin-top:16px; padding:14px 16px; border:1px solid var(--border-default);
+    border-radius:12px; background:var(--bg-input); color:var(--text-body);
+  }
+  .fit-columns { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:16px; }
+  .fit-card {
+    border:1px solid var(--border-default); border-radius:12px; padding:16px;
+    background:var(--bg-surface-raised);
+  }
+  .fit-card.is-winning { border-color:color-mix(in srgb, var(--text-success) 34%, var(--border-default)); }
+  .fit-card.is-risk { border-color:color-mix(in srgb, var(--text-warning) 38%, var(--border-default)); }
+  .fit-card h3 {
+    display:flex; align-items:center; gap:8px; margin:0 0 10px;
+    font-size:14px; line-height:20px;
+  }
+  .fit-card h3::before {
+    content:""; width:9px; height:9px; border-radius:50%; background:var(--brand-primary);
+  }
+  .fit-card.is-winning h3::before { background:var(--text-success); }
+  .fit-card.is-risk h3::before { background:var(--text-warning); }
+  .fit-card ul { margin:0; padding-left:18px; }
+  .fit-card li { margin:6px 0; }
+  .fit-empty { color:var(--text-secondary); font-size:13px; line-height:20px; margin:0; }
   .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
   .job-main { display:flex; align-items:flex-start; gap:14px; min-width:0; }
   .company-mark {
@@ -152,6 +199,11 @@
     }
     #printRoot .resume-rendered h2, #printRoot .resume-rendered h3 { break-after:avoid; }
   }
+  @media (max-width: 640px) {
+    .breakdown-grid { grid-template-columns:1fr; }
+    .fit-columns { grid-template-columns:1fr; }
+    .score-orb { width:140px; height:140px; }
+  }
 </style>
 
 <main class="detail">
@@ -197,6 +249,57 @@ function companyMark(name){
   return `<div class="company-mark" aria-hidden="true">${esc(companyInitial(name))}</div>`;
 }
 
+function clampScore(value){
+  const n = Number.parseInt(value, 10);
+  if(Number.isNaN(n)){ return 0; }
+  return Math.max(0, Math.min(100, n));
+}
+
+function scoreBreakdownSection(m){
+  const items = m.score_breakdown || [];
+  if(m.non_matching || !items.length || m.match_score == null){ return ""; }
+  const total = clampScore(m.match_score);
+  return `<div class="breakdown-grid">
+    <div class="score-orb" style="--score-pct:${total}%;">
+      <div class="score-orb-inner">
+        <div class="score-orb-score">${total}</div>
+        <div class="score-orb-label">match score</div>
+      </div>
+    </div>
+    <div class="subscore-list">
+      ${items.map(item => {
+        const score = clampScore(item.score);
+        return `<div class="subscore-row">
+          <div class="subscore-head">
+            <div class="subscore-label">${esc(item.label || "Aspect")}</div>
+            <div class="subscore-value">${score}/100</div>
+          </div>
+          <div class="subscore-track"><div class="subscore-fill" style="--subscore-pct:${score}%;"></div></div>
+          ${item.rationale ? `<div class="subscore-note">${esc(item.rationale)}</div>` : ""}
+        </div>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+
+function fitList(items, emptyText){
+  if(!items.length){ return `<p class="fit-empty">${esc(emptyText)}</p>`; }
+  return `<ul>${items.map(item => `<li>${esc(item)}</li>`).join("")}</ul>`;
+}
+
+function fitOutcomeSection(strengths, gaps){
+  return `<div class="fit-columns">
+    <section class="fit-card is-winning">
+      <h3>Winning</h3>
+      ${fitList(strengths, "No clear winning signals were identified yet.")}
+    </section>
+    <section class="fit-card is-risk">
+      <h3>Risks</h3>
+      ${fitList(gaps, "No major risk areas were identified.")}
+    </section>
+  </div>`;
+}
+
 let detail = null;        // last loaded detail payload
 let kitPolling = false;
 
@@ -229,12 +332,13 @@ function renderDetail(){
 
   const strengths = m.strengths || [];
   const gaps = m.gaps || [];
-  const fit = (m.reasoning || strengths.length || gaps.length) ? `
+  const breakdown = scoreBreakdownSection(m);
+  const fit = (breakdown || m.reasoning || strengths.length || gaps.length) ? `
     <div class="surface">
       <h2>How you line up</h2>
-      ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
-      ${strengths.length ? `<div class="section-gap"><h3>Your strengths</h3><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
-      ${gaps.length ? `<div class="section-gap"><h3>Your weak spots</h3><ul class="tight">${gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
+      ${breakdown}
+      ${m.reasoning ? `<div class="fit-summary">${esc(m.reasoning)}</div>` : ""}
+      ${fitOutcomeSection(strengths, gaps)}
     </div>` : "";
 
   document.getElementById("content").innerHTML = `

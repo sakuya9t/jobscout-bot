@@ -98,6 +98,9 @@ SYSTEM_PROMPT = (
     "(wrong location, excluded keyword, wrong seniority). In `strengths`/`gaps` and "
     "`reasoning`, state explicitly whether the candidate has direct vertical "
     "experience for this role. Keep reasoning to 2-4 sentences addressed to the "
+    "candidate. Also fill score_breakdown with these five aspect scores, each 0-100, "
+    "using exactly these labels: Vertical experience, Skills overlap, Seniority fit, "
+    "Location fit, Preferences. Give each one a short rationale addressed to the "
     "candidate.\n"
     "If — and ONLY if — the posting EXPLICITLY states a pay/salary range, fill "
     "salary_min and salary_max (integers, no symbols or commas), salary_currency (a "
@@ -379,6 +382,7 @@ def _persist_error_marker(
         db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=message[:1000], strengths=None, gaps=None,
+        score_breakdown=None,
         model=ERROR_MODEL, attempts=prior + 1,
     )
 
@@ -393,7 +397,8 @@ def _persist_filter_reject(
         db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=(reason or "Screened out as not a match.")[:1000],
-        strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model, attempts=0,
+        strengths=json.dumps([]), gaps=json.dumps([]), score_breakdown=json.dumps([]),
+        model=filter_model, attempts=0,
     )
 
 
@@ -406,7 +411,8 @@ def _persist_exclude_reject(
         db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning="Dropped by an interest exclude keyword.",
-        strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL, attempts=0,
+        strengths=json.dumps([]), gaps=json.dumps([]), score_breakdown=json.dumps([]),
+        model=EXCLUDED_MODEL, attempts=0,
     )
 
 
@@ -451,6 +457,7 @@ def _persist_score_result(
         reasoning=verdict.reasoning,
         strengths=json.dumps(verdict.strengths),
         gaps=json.dumps(verdict.gaps),
+        score_breakdown=json.dumps([s.model_dump() for s in verdict.score_breakdown]),
         model=model, attempts=0,
     )
 

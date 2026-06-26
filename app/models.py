@@ -324,6 +324,7 @@ class MatchResult(Base):
     reasoning: Mapped[str | None] = mapped_column(Text)
     strengths: Mapped[str | None] = mapped_column(Text)  # JSON-encoded list
     gaps: Mapped[str | None] = mapped_column(Text)  # JSON-encoded list
+    score_breakdown: Mapped[str | None] = mapped_column(Text)  # JSON-encoded sub-score list
     model: Mapped[str | None] = mapped_column(String(128))
     # Retry counter for a failed (position, interest) pair: how many times scoring has
     # been tried and failed (only set on error-markers, model == matcher.ERROR_MODEL).

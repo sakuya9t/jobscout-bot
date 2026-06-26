@@ -2722,6 +2722,9 @@ def test_position_detail_endpoint_returns_best_match(monkeypatch):
         assert d["position_id"] == pid and d["title"] == "Backend Engineer"
         assert d["match_score"] == 88 and d["non_matching"] is False
         assert d["strengths"] == ["Python"] and d["applied"] is False
+        assert [x["label"] for x in d["score_breakdown"]] == [
+            "Vertical experience", "Skills overlap", "Seniority fit", "Location fit", "Preferences"
+        ]
         assert d["kit"] is None  # nothing generated yet
 
 
