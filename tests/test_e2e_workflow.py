@@ -28,7 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services import evaluator, kit_worker, matcher
+from app.services import evaluator, kit_worker, matcher, rescore_worker
 from app.services import scraper as scraper_mod
 
 
@@ -66,7 +66,7 @@ class FakeLLM:
             "gaps": [],
         }
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         props = schema.get("properties", {})
         if "results" in props:  # batched scoring: one verdict per "### Posting N" block
             n = user.count("### Posting ")
@@ -266,6 +266,40 @@ def test_position_detail_then_generate_kit(e2e_env):
         assert body["status"] == "ok"
         assert body["cover_letter"] and body["revised_resume"]
         assert body["looking_for"] and body["open_questions"]
+
+
+def test_position_detail_rescore_refreshes_score(e2e_env, monkeypatch):
+    """The detail page's "Re-evaluate" button: POST kicks a background re-score (202 +
+    in_progress) for just this posting; driving that worker re-runs the matcher and the
+    refreshed score is served from the detail endpoint — re-scored in place, no
+    duplicate match row."""
+    rescore_kicks: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        rescore_worker, "ensure_rescoring", lambda uid, pid: rescore_kicks.append((uid, pid))
+    )
+    with TestClient(app) as c:
+        _onboard(c)
+        _scan_and_score(c)
+        uid = c.get("/api/auth/me").json()["id"]
+        pid = _latest(c, category="matching")["items"][0]["position_id"]
+
+        # Kick a re-evaluation: 202 + in_progress, worker kicked for this pair only.
+        started = c.post(f"/api/positions/{pid}/rescore")
+        assert started.status_code == 202 and started.json()["in_progress"] is True
+        assert rescore_kicks == [(uid, pid)]
+
+        # The poll endpoint reports nothing in flight (the worker is stubbed out here).
+        assert c.get(f"/api/positions/{pid}/rescore").json() == {"in_progress": False, "error": None}
+
+        # Drive the real background re-score, then confirm the detail still serves a
+        # fresh score (the matcher overwrote the existing match in place).
+        rescore_worker._run(uid, pid)
+        detail = c.get(f"/api/positions/{pid}/detail").json()
+        assert detail["match_score"] == 88 and detail["non_matching"] is False
+
+        # A posting that isn't in the user's job list 404s on both verbs.
+        assert c.post("/api/positions/999999/rescore").status_code == 404
+        assert c.get("/api/positions/999999/rescore").status_code == 404
 
 
 # ── The full journey, end to end ──────────────────────────────────────────────

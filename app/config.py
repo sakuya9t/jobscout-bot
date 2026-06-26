@@ -137,6 +137,17 @@ class Settings(BaseSettings):
     # generous without leaving stale postings around.
     scrape_max_age_days: int = 90
 
+    # Preset crawl pacing. The shared preset catalog is crawled once per run, but as
+    # the preset list grows, firing every board back-to-back hammers a dozen-plus
+    # career sites in the same few seconds. Instead the crawl spreads the companies
+    # across this many minutes: the first board is crawled immediately, then a gap is
+    # waited between each subsequent company so the requests trickle out over the
+    # window. 0 = no spacing (back-to-back — tests and a one-off catch-up crawl).
+    scrape_preset_spread_minutes: int = 30
+    # Random +/- fraction applied to each inter-company gap so boards aren't hit on a
+    # perfectly fixed cadence (0.0 = exact even spacing; 0.3 = each gap varies +/-30%).
+    scrape_preset_spread_jitter: float = 0.3
+
     # Scoring
     # Stage-1 relevance filtering is batched: one cheap call screens this many
     # postings at once (returns a verdict per posting), cutting filter calls ~Nx.
@@ -144,6 +155,15 @@ class Settings(BaseSettings):
     # Stage-2 scoring is also batched: after the cheap filter passes postings,
     # one expensive request scores this many postings against the resume.
     score_batch_size: int = 10
+    # Scoring determinism. The same (resume, posting) pair used to swing 30+ points
+    # between identical calls because the scoring model sampled stochastically. Run it
+    # at temperature 0 with a fixed seed so a single sample is reproducible; the headline
+    # match_score is additionally derived from the rubric sub-scores in code (see
+    # matcher._derive_match_score), which damps the residual variance a cloud backend
+    # can't fully pin down. These are deliberately NOT applied to cover-letter / résumé
+    # generation, which want some variety.
+    score_temperature: float = 0.0
+    score_seed: int = 11
     # A single (posting, interest) pair can fail to score — a transient provider error,
     # or the model returning an incomplete/invalid batch that omits it. Rather than mark
     # it permanently failed on the first miss, retry it on later runs up to this many

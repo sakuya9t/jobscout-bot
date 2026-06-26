@@ -11,6 +11,15 @@ class _ORM(BaseModel):
 
 
 # ── LLM structured-output contract ───────────────────────────────────────────
+class MatchSubScore(BaseModel):
+    """One aspect of a match score. Labels are intentionally human-readable because
+    they are rendered directly in the job detail score breakdown."""
+
+    label: str
+    score: int = Field(ge=0, le=100)
+    rationale: str = ""
+
+
 class MatchVerdict(BaseModel):
     """The LLM's scoring of one (resume, role) pair. This is the single source of
     truth for both the Ollama ``format`` (``model_json_schema()``) and parsing
@@ -25,6 +34,9 @@ class MatchVerdict(BaseModel):
     # omit these arrays, so default them empty rather than failing the whole score.
     strengths: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
+    # Optional detailed rubric for the job-detail breakdown. Defaults empty so older
+    # tests/models that only return the original top-level score remain valid.
+    score_breakdown: list[MatchSubScore] = Field(default_factory=list)
     # Pay range read from the posting itself, when it explicitly states one (the LLM
     # reads the full description anyway, so this is ~free and catches prose the regex
     # can't). All optional + leniently coerced below so a malformed value degrades to
@@ -454,6 +466,7 @@ class PositionDetailOut(BaseModel):
     reasoning: str | None = None
     strengths: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
+    score_breakdown: list[MatchSubScore] = Field(default_factory=list)
     # True when the best stored match for this position did not pass the relevance
     # filter (score fields aren't meaningful) — the page shows a "not a match" pill.
     non_matching: bool = False
@@ -470,6 +483,16 @@ class PositionDetailOut(BaseModel):
     salary_period: str | None = None
     salary_display: str | None = None
     kit: ApplicationKitOut | None = None
+
+
+class RescoreStatusOut(BaseModel):
+    """Status of a single-position "Re-evaluate" kicked from the detail page.
+    ``in_progress`` is true while the background re-score runs; ``error`` carries a
+    one-line reason from the last completed run (null on success). The page polls this
+    until ``in_progress`` is false, then reloads the detail to show the new score."""
+
+    in_progress: bool = False
+    error: str | None = None
 
 
 class JobListRunOut(BaseModel):

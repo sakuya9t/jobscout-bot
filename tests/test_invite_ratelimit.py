@@ -16,7 +16,7 @@ from app.config import settings
 from app.db import session_scope
 from app.main import app
 from app.models import InviteCode
-from app.timeutil import utcnow
+from app.timeutil import parse_duration, utcnow
 
 
 def _mint(**kw) -> str:
@@ -96,6 +96,36 @@ def test_redeem_respects_max_uses_expiry_and_revoke():
         revoked = invites.mint(db, max_uses=1)[0]
         invites.revoke(db, code=revoked)
         assert invites.redeem(db, revoked) is False       # revoked
+
+
+def test_parse_duration_units_compound_and_errors():
+    """The `--expiry` parser handles each unit, compound tokens, and rejects junk."""
+    assert parse_duration("24h") == timedelta(hours=24)
+    assert parse_duration("30m") == timedelta(minutes=30)
+    assert parse_duration("7d") == timedelta(days=7)
+    assert parse_duration("2w") == timedelta(weeks=2)
+    assert parse_duration("1d12h") == timedelta(days=1, hours=12)
+    assert parse_duration(" 24H ") == timedelta(hours=24)         # trimmed + case-insensitive
+    for bad in ["24", "24hh", "abc", "0h", ""]:                   # missing/garbled/zero
+        with pytest.raises(ValueError):
+            parse_duration(bad)
+
+
+def test_mint_expires_in_takes_subday_precision_and_wins_over_days():
+    """`expires_in` (a timedelta) gives sub-day expiry the CLI's `--expiry 24h` needs,
+    and overrides the whole-day `expires_in_days` shorthand when both are passed."""
+    before = utcnow()
+    with session_scope() as db:
+        code = invites.mint(db, max_uses=1, expires_in=timedelta(hours=24))[0]
+        row = db.scalar(select(InviteCode).where(InviteCode.code_hash == invites.hash_code(code)))
+        delta = row.expires_at - before
+        assert timedelta(hours=23) < delta < timedelta(hours=25)
+
+        # expires_in wins over expires_in_days; a 30-minute code is redeemable now.
+        soon = invites.mint(db, max_uses=1, expires_in=timedelta(minutes=30), expires_in_days=7)[0]
+        soon_row = db.scalar(select(InviteCode).where(InviteCode.code_hash == invites.hash_code(soon)))
+        assert soon_row.expires_at - before < timedelta(hours=1)
+        assert invites.redeem(db, soon) is True
 
 
 def test_invite_ignored_when_not_required(monkeypatch):

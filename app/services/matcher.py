@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..db import session_scope
 from ..models import Company, Interest, MatchResult, Position, Resume, Subscription, User
-from ..schemas import MatchVerdict
+from ..schemas import MatchSubScore, MatchVerdict
 from ..timeutil import utcnow
 from . import llm, scraper
 from .ollama_client import OllamaBudgetError, OllamaClient, OllamaError
@@ -30,8 +30,11 @@ from .salary import extract_salary
 log = logging.getLogger(__name__)
 
 class BatchMatchVerdict(MatchVerdict):
-    """One scoring verdict inside a batched response. ``id`` is the 1-based
-    posting number from the prompt so we can persist each result to the right row."""
+    """One scoring verdict inside a batched response. ``id`` is the 1-based posting
+    number from the prompt, used to map each result back to the right row. Defines the
+    SHAPE we request (``MATCH_BATCH_SCHEMA``); the response itself is parsed leniently
+    (``_parse_score_response`` + ``_loose_verdict``), not validated against this class,
+    so a model that drifts from the schema still yields a usable score."""
 
     id: int = Field(ge=1)
 
@@ -41,6 +44,31 @@ class MatchBatchResponse(BaseModel):
 
 
 MATCH_BATCH_SCHEMA = MatchBatchResponse.model_json_schema()
+
+
+def _score_one_schema() -> dict:
+    """Single-verdict schema for scoring ONE posting (the detail-page re-score). No batch
+    wrapper and no per-posting ``id``, so there's nothing for the model to mis-number —
+    which is exactly the failure a 1-element batch hits. It also marks otherwise-optional
+    fields REQUIRED so the grammar forces the model to emit them: the supplementary arrays
+    (``strengths``/``gaps``/``score_breakdown``) — else Winning/Risks come back empty — and
+    each subscore's ``rationale`` — else the per-aspect description under the breakdown is
+    blank. Forcing the keys (plus an emphatic prompt) makes the model populate them;
+    parsing stays lenient (``_loose_verdict``) so a model that still omits them degrades
+    gracefully instead of failing."""
+    schema = MatchVerdict.model_json_schema()
+    schema["required"] = sorted(
+        set(schema.get("required", [])) | {"strengths", "gaps", "score_breakdown"}
+    )
+    subscore = schema.get("$defs", {}).get("MatchSubScore")
+    if subscore is not None:
+        subscore["required"] = sorted(
+            set(subscore.get("required", [])) | {"label", "score", "rationale"}
+        )
+    return schema
+
+
+SCORE_ONE_SCHEMA = _score_one_schema()
 
 # Stage 1: a CHEAP model decides relevance (semantic, not substring) so we only
 # spend the expensive scoring model on postings that actually fit the interest.
@@ -98,6 +126,9 @@ SYSTEM_PROMPT = (
     "(wrong location, excluded keyword, wrong seniority). In `strengths`/`gaps` and "
     "`reasoning`, state explicitly whether the candidate has direct vertical "
     "experience for this role. Keep reasoning to 2-4 sentences addressed to the "
+    "candidate. Also fill score_breakdown with these five aspect scores, each 0-100, "
+    "using exactly these labels: Vertical experience, Skills overlap, Seniority fit, "
+    "Location fit, Preferences. Give each one a short rationale addressed to the "
     "candidate.\n"
     "If — and ONLY if — the posting EXPLICITLY states a pay/salary range, fill "
     "salary_min and salary_max (integers, no symbols or commas), salary_currency (a "
@@ -110,6 +141,7 @@ SYSTEM_PROMPT = (
 _RESUME_CHARS = 6000
 _FILTER_DESC_CHARS = 800  # the cheap relevance filter only needs a short blurb per posting
 _SCORE_BATCH_DESC_CHARS = 1500  # batch scoring keeps one resume + N postings in context
+_SCORE_ONE_DESC_CHARS = 4000  # single re-score has room for far more of the JD than a batch
 
 # Marker stored on the `model` column of a MatchResult when scoring terminally
 # failed, so the pair is skipped on re-runs rather than re-billed. Cleared by
@@ -198,10 +230,9 @@ def _passes_prefilter(pos: Position, interest: Interest) -> bool:
     return not any(x in haystack for x in excludes)
 
 
-def _build_filter_batch_prompt(interest: Interest, positions: list[Position]) -> str:
-    """Stage-1 prompt: interest requirements vs a NUMBERED batch of postings (no
-    resume — relevance doesn't need it, and a short per-posting blurb keeps the
-    cheap batch call small)."""
+def _requirement_lines(interest: Interest) -> str:
+    """The interest's requirements as prompt bullet lines — shared by the relevance
+    filter and both scoring protocols so they describe the candidate identically."""
     reqs = [f"- {k}: {v}" for k, v in {
         "Desired titles": interest.title_keywords,
         "Locations": interest.locations,
@@ -210,47 +241,87 @@ def _build_filter_batch_prompt(interest: Interest, positions: list[Position]) ->
         "Exclusions": interest.exclude_keywords,
         "Notes": interest.notes,
     }.items() if v]
+    return "\n".join(reqs) or "(none specified)"
+
+
+def _build_filter_batch_prompt(interest: Interest, positions: list[Position]) -> str:
+    """Stage-1 prompt: interest requirements vs a NUMBERED batch of postings (no
+    resume — relevance doesn't need it, and a short per-posting blurb keeps the
+    cheap batch call small)."""
     blocks = [
         f"{i}. {pos.title} | loc: {pos.location or 'n/a'} | dept: {pos.department or 'n/a'}\n"
         f"   {(pos.description or '')[:_FILTER_DESC_CHARS]}"
         for i, pos in enumerate(positions, 1)
     ]
     return (
-        "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
+        "## CANDIDATE REQUIREMENTS\n" + _requirement_lines(interest) + "\n\n"
         "## JOB POSTINGS (decide a match for each, by its number)\n" + "\n".join(blocks) + "\n"
     )
 
 
-def _build_score_batch_prompt(resume: Resume, interest: Interest, positions: list[Position]) -> str:
-    """Stage-2 prompt: score multiple postings in one model call. The resume and
-    requirements are repeated once, then each posting is numbered so the JSON
-    response can be mapped back to DB rows."""
-    reqs = [f"- {k}: {v}" for k, v in {
-        "Desired titles": interest.title_keywords,
-        "Locations": interest.locations,
-        "Seniority": interest.seniority,
-        "Employment type": interest.employment_type,
-        "Exclusions": interest.exclude_keywords,
-        "Notes": interest.notes,
-    }.items() if v]
-    blocks = [
-        f"### Posting {i}\n"
-        f"Company position id: {pos.external_id}\n"
+def _posting_block(pos: Position, *, max_desc_chars: int, number: int | None = None) -> str:
+    """One posting rendered for a scoring prompt. ``number`` adds the ``### Posting N``
+    header the batch protocol keys its response by; the single re-score omits it (one
+    posting, one verdict) and passes a larger ``max_desc_chars`` to fit more of the JD."""
+    header = f"### Posting {number}\n" if number is not None else ""
+    return (
+        f"{header}"
         f"Title: {pos.title}\n"
+        f"Company position id: {pos.external_id}\n"
         f"Location: {pos.location or 'n/a'}\n"
         f"Department: {pos.department or 'n/a'}\n"
         f"Employment type: {pos.employment_type or 'n/a'}\n"
-        f"Description:\n{(pos.description or '(no description scraped)')[:_SCORE_BATCH_DESC_CHARS]}\n"
-        for i, pos in enumerate(positions, 1)
-    ]
+        f"Description:\n{(pos.description or '(no description scraped)')[:max_desc_chars]}\n"
+    )
+
+
+# The two stage-2 scoring protocols share their resume/requirements assembly and differ
+# only in framing + per-posting layout: a NUMBERED batch whose `results` array is keyed
+# back to each posting by id, vs ONE bare verdict object (no array/id to mis-number).
+_SCORE_BATCH_INTRO = (
+    "Score every numbered posting independently against the same resume and "
+    "candidate requirements. Return JSON with a top-level `results` array. "
+    "Each result must include the posting's 1-based `id` and the same verdict "
+    "fields requested by the schema. Do not omit postings."
+)
+_SCORE_ONE_INTRO = (
+    "Score this single job posting against the candidate's resume and requirements. "
+    "Return ONE JSON object with the verdict fields requested by the schema — not an "
+    "array, and not wrapped in any other key.\n"
+    "Fill EVERY field. In particular, do not leave these empty:\n"
+    "- `strengths`: 2-4 specific reasons this candidate is a strong fit for THIS role "
+    "(concrete overlaps in experience, domain, or skills), addressed to the candidate "
+    "(\"you have…\").\n"
+    "- `gaps`: 1-3 specific risks or missing/under-evidenced qualifications for THIS "
+    "role, addressed to the candidate — only empty if the candidate genuinely meets "
+    "every requirement.\n"
+    "- `score_breakdown`: the five aspect scores named in the rubric, and for EACH a "
+    "non-empty `rationale` of one short sentence addressed to the candidate explaining "
+    "that aspect's score."
+)
+
+
+def _build_score_prompt(
+    resume: Resume, interest: Interest, positions: list[Position], *, single: bool
+) -> str:
+    """Stage-2 scoring prompt for one model call over ``positions``. ``single`` picks the
+    protocol: one bare verdict object for the interactive re-score (one posting, with more
+    of the JD in context), or a numbered ``results`` batch for the drain. The resume and
+    requirements are stated once either way."""
+    if single:
+        intro, heading = _SCORE_ONE_INTRO, "JOB POSTING"
+        blocks = _posting_block(positions[0], max_desc_chars=_SCORE_ONE_DESC_CHARS)
+    else:
+        intro, heading = _SCORE_BATCH_INTRO, "JOB POSTINGS"
+        blocks = "\n".join(
+            _posting_block(pos, number=i, max_desc_chars=_SCORE_BATCH_DESC_CHARS)
+            for i, pos in enumerate(positions, 1)
+        )
     return (
-        "Score every numbered posting independently against the same resume and "
-        "candidate requirements. Return JSON with a top-level `results` array. "
-        "Each result must include the posting's 1-based `id` and the same verdict "
-        "fields requested by the schema. Do not omit postings.\n\n"
-        "## CANDIDATE REQUIREMENTS\n" + ("\n".join(reqs) or "(none specified)") + "\n\n"
+        intro + "\n\n"
+        "## CANDIDATE REQUIREMENTS\n" + _requirement_lines(interest) + "\n\n"
         "## RESUME\n" + resume.content_text[:_RESUME_CHARS] + "\n\n"
-        "## JOB POSTINGS\n" + "\n".join(blocks) + "\n"
+        f"## {heading}\n" + blocks + "\n"
     )
 
 
@@ -379,6 +450,7 @@ def _persist_error_marker(
         db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=message[:1000], strengths=None, gaps=None,
+        score_breakdown=None,
         model=ERROR_MODEL, attempts=prior + 1,
     )
 
@@ -393,7 +465,8 @@ def _persist_filter_reject(
         db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning=(reason or "Screened out as not a match.")[:1000],
-        strengths=json.dumps([]), gaps=json.dumps([]), model=filter_model, attempts=0,
+        strengths=json.dumps([]), gaps=json.dumps([]), score_breakdown=json.dumps([]),
+        model=filter_model, attempts=0,
     )
 
 
@@ -406,7 +479,8 @@ def _persist_exclude_reject(
         db, user, resume, interest, pos,
         passed_filter=False, match_score=0, win_probability=0,
         reasoning="Dropped by an interest exclude keyword.",
-        strengths=json.dumps([]), gaps=json.dumps([]), model=EXCLUDED_MODEL, attempts=0,
+        strengths=json.dumps([]), gaps=json.dumps([]), score_breakdown=json.dumps([]),
+        model=EXCLUDED_MODEL, attempts=0,
     )
 
 
@@ -451,6 +525,7 @@ def _persist_score_result(
         reasoning=verdict.reasoning,
         strengths=json.dumps(verdict.strengths),
         gaps=json.dumps(verdict.gaps),
+        score_breakdown=json.dumps([s.model_dump() for s in verdict.score_breakdown]),
         model=model, attempts=0,
     )
 
@@ -596,75 +671,108 @@ def _reconcile_removals(
         pos.removed_at = now
 
 
-def _score_batch(
+def _parse_score_response(
+    data, positions: list[Position], *, single: bool
+) -> list[tuple[Position, MatchVerdict | None]]:
+    """Map a scoring response onto its postings as an ordered ``(posting, verdict|None)``
+    list (None ⇒ the model returned nothing usable for that posting). The single-object
+    protocol yields the one verdict directly; the batch protocol keys the ``results``
+    array by 1-based id. Both go through ``_loose_verdict``, so a model that drifts from
+    the schema degrades to a usable score instead of dropping the posting."""
+    if single:
+        return [(positions[0], _loose_verdict(data))]
+    raw_results = data.get("results") if isinstance(data, dict) else None
+    by_id: dict[int, dict] = {}
+    for raw in raw_results or []:
+        rid = raw.get("id") if isinstance(raw, dict) else None
+        if isinstance(rid, int) and not isinstance(rid, bool):
+            by_id.setdefault(rid, raw)  # first wins on a duplicate id
+    return [(pos, _loose_verdict(by_id.get(idx))) for idx, pos in enumerate(positions, 1)]
+
+
+def _score_postings(
     client: OllamaClient,
     db: Session,
     user: User,
     resume: Resume,
     interest: Interest,
     positions: list[Position],
+    *,
+    single: bool,
+    write_markers: bool,
 ) -> tuple[list[int], str | None]:
-    """Call the scoring model once for a batch of postings and persist one
-    MatchResult per posting. This is the main request-count reducer: after the
-    cheap relevance filter, survivors are scored N-at-a-time instead of one call
-    per posting."""
+    """Score ``positions`` against one interest in ONE scoring-model call and persist a
+    MatchResult per posting — the single source of truth for both the batched backlog
+    drain and the interactive per-posting re-score, which differ only in two flags rather
+    than in a parallel code path:
+
+    ``single`` picks the model-facing protocol (see ``_build_score_prompt`` /
+    ``_parse_score_response``): a NUMBERED batch whose ``results`` array is keyed back to
+    each posting by id (the drain's request-count reducer — N postings, one call), or ONE
+    bare verdict object with no array/id to mis-number and more of the JD in context (the
+    re-score). Either response is parsed leniently, so schema drift still yields a score.
+
+    ``write_markers`` picks the failure policy: the drain records an error-marker for any
+    posting the model omits or garbles (so the pair isn't re-billed every run but is
+    retried up to the limit), while the re-score writes nothing and lets its caller roll
+    back to keep the user's prior score. Returns ``(persisted match ids, error or None)``;
+    raises ``OllamaBudgetError`` so the caller can stop cleanly without poisoning rows."""
     if not positions:
         return [], None
 
-    prompt = _build_score_batch_prompt(resume, interest, positions)
+    prompt = _build_score_prompt(resume, interest, positions, single=single)
+    schema = SCORE_ONE_SCHEMA if single else MATCH_BATCH_SCHEMA
     try:
-        data = client.chat_json(SYSTEM_PROMPT, prompt, MATCH_BATCH_SCHEMA)
+        # Deterministic sampling (temperature 0 + fixed seed) so the same posting doesn't
+        # swing between identical calls; the headline score is further stabilized by
+        # deriving it from the rubric sub-scores in _loose_verdict.
+        data = client.chat_json(
+            SYSTEM_PROMPT, prompt, schema,
+            temperature=settings.score_temperature, seed=settings.score_seed,
+        )
     except OllamaBudgetError:
-        # Recoverable — don't write error-markers, or these postings would be
-        # skipped until clear_failed_markers runs even after the user tops up.
-        # Propagate so the run loop stops and reports it once.
+        # Recoverable — don't write error-markers, or these postings would be skipped
+        # until clear_failed_markers runs even after the user tops up. Propagate so the
+        # caller stops the run / keeps the prior score and reports it once.
         raise
     except OllamaError as exc:
-        log.warning("batch scoring failed for %d postings: %s", len(positions), exc)
+        log.warning("scoring failed for %d posting(s): %s", len(positions), exc)
         message = f"Scoring failed: {exc}"
-        for pos in positions:
-            _persist_error_marker(db, user, resume, interest, pos, message)
-        return [], f"Scoring failed: {exc}"
-
-    raw_results = data.get("results") if isinstance(data, dict) else None
-    if not isinstance(raw_results, list):
-        message = "Scoring failed: model returned an invalid batch result"
-        log.warning("batch scoring returned invalid top-level payload for %d postings", len(positions))
-        for pos in positions:
-            _persist_error_marker(db, user, resume, interest, pos, message)
+        if write_markers:
+            for pos in positions:
+                _persist_error_marker(db, user, resume, interest, pos, message)
         return [], message
 
-    verdicts: dict[int, BatchMatchVerdict] = {}
-    invalid = 0
-    for raw in raw_results:
-        try:
-            verdict = BatchMatchVerdict.model_validate(raw)
-        except ValidationError:
-            invalid += 1
-            continue
-        if verdict.id > len(positions) or verdict.id in verdicts:
-            invalid += 1
-            continue
-        verdicts[verdict.id] = verdict
-
     match_ids: list[int] = []
-    missing = 0
-    marker_message = "Scoring failed: model omitted or invalidated this posting in the batch"
-    for idx, pos in enumerate(positions, 1):
-        verdict = verdicts.get(idx)
+    failed = 0
+    for pos, verdict in _parse_score_response(data, positions, single=single):
         if verdict is None:
-            missing += 1
-            _persist_error_marker(db, user, resume, interest, pos, marker_message)
+            failed += 1
+            if single:  # the forced single-object schema makes an empty reply worth a look
+                snippet = json.dumps(data)[:300] if isinstance(data, (dict, list)) else str(data)[:300]
+                log.warning("re-score: unparseable verdict for position %s: %s", pos.id, snippet)
+            if write_markers:
+                _persist_error_marker(
+                    db, user, resume, interest, pos,
+                    "Scoring failed: model omitted or invalidated this posting in the batch",
+                )
             continue
+        if single and isinstance(data, dict):
+            # A field the schema forces that still parsed empty: log the RAW value so we
+            # can tell "the model omitted it" from "our parser dropped an unrecognized
+            # key". Cheap and only fires on the unhappy path.
+            if not (verdict.strengths or verdict.gaps):
+                log.warning("re-score: position %s scored but no strengths/gaps; raw keys=%s",
+                            pos.id, sorted(data.keys()))
+            if not verdict.score_breakdown:
+                log.warning("re-score: position %s scored but breakdown empty; raw score_breakdown=%s",
+                            pos.id, json.dumps(data.get("score_breakdown"))[:400])
         match_id = _persist_score_result(db, user, resume, interest, pos, verdict, client.model)
         if match_id is not None:  # None ⇒ a concurrent drain already scored this pair
             match_ids.append(match_id)
 
-    if invalid or missing:
-        return (
-            match_ids,
-            f"Scoring failed for {invalid + missing} posting(s): model returned an incomplete batch result",
-        )
+    if failed:
+        return match_ids, f"Scoring failed for {failed} posting(s): the model returned an incomplete result"
     return match_ids, None
 
 
@@ -932,7 +1040,10 @@ def _score_locked(
                 # Stage 2 — expensive resume<->role scoring for survivors only.
                 for start in range(0, len(survivors), score_batch_size):
                     score_batch = survivors[start : start + score_batch_size]
-                    match_ids, serr = _score_batch(score_client, db, user, resume, interest, score_batch)
+                    match_ids, serr = _score_postings(
+                        score_client, db, user, resume, interest, score_batch,
+                        single=False, write_markers=True,
+                    )
                     res.scored += len(match_ids)
                     res.match_ids.extend(match_ids)
                     if serr is not None:
@@ -967,6 +1078,254 @@ def _score_locked(
                 f"{excluded} posting(s) were dropped by your interest's exclude "
                 "keywords before scoring. Loosen the exclude list if that's too broad."
             )
+
+
+def _clamp_score(value, default: int | None = 0) -> int | None:
+    """A 0-100 int from a loose value ("91", "91%", 91.0); ``default`` when unparseable."""
+    if isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value)
+        value = m.group(0) if m else None
+    try:
+        return max(0, min(100, int(float(value))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_list(value) -> list[str]:
+    """Non-empty trimmed strings from a loose list (drops non-strings / blanks)."""
+    if not isinstance(value, list):
+        return []
+    return [s.strip() for s in value if isinstance(s, str) and s.strip()]
+
+
+# Key-name drift these models show in score_breakdown items (e.g. "aspect"/"name"
+# instead of "label"). Accept the common synonyms so a renamed key doesn't drop the
+# whole breakdown and fall back to the synthetic "Estimated…" note.
+_BREAKDOWN_LABEL_KEYS = ("label", "aspect", "name", "category", "dimension", "criterion", "area")
+_BREAKDOWN_SCORE_KEYS = ("score", "value", "rating", "points", "out_of_100")
+_BREAKDOWN_RATIONALE_KEYS = (
+    "rationale", "reason", "reasoning", "explanation", "note", "notes", "detail", "comment"
+)
+
+
+def _first_key(item: dict, keys: tuple[str, ...]):
+    """First present, non-empty value among ``keys`` (tolerates the model's key drift)."""
+    for k in keys:
+        v = item.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _loose_breakdown(value) -> list[MatchSubScore]:
+    """Sanitize score_breakdown ITEM BY ITEM — keep each well-formed aspect, clamp its
+    score, accept synonym keys, and silently drop a malformed one. Crucially this isolates
+    a bad subscore so it can't sink the whole verdict (the previous all-or-nothing validate
+    dropped strengths/gaps too, leaving Winning/Risks empty). Also normalizes the two
+    common non-list shapes these models emit — an object keyed by aspect name
+    ({"Vertical experience": {...}} or {"Skills": 80}) — into a list first."""
+    if isinstance(value, dict):
+        normalized = []
+        for key, val in value.items():
+            if isinstance(val, dict):
+                item = dict(val)
+                item.setdefault("label", key)
+                normalized.append(item)
+            elif isinstance(val, (int, float, str)):
+                normalized.append({"label": key, "score": val})
+        value = normalized
+    out: list[MatchSubScore] = []
+    if not isinstance(value, list):
+        return out
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = str(_first_key(item, _BREAKDOWN_LABEL_KEYS) or "").strip()
+        if not label:
+            continue
+        out.append(MatchSubScore(
+            label=label[:80],
+            score=_clamp_score(_first_key(item, _BREAKDOWN_SCORE_KEYS), 0),
+            rationale=str(_first_key(item, _BREAKDOWN_RATIONALE_KEYS) or "").strip()[:240],
+        ))
+    return out[:5]
+
+
+# Headline match_score is computed from the five rubric sub-scores with these fixed
+# weights (sum to 1.0), in the rubric's stated order of importance — vertical experience
+# weighed most. Deriving the number this way instead of trusting the model's free-form
+# match_score is the core stability fix: a narrow per-aspect judgment is far steadier
+# call-to-call than a single holistic gestalt, and the weighted aggregation is itself
+# deterministic. The model's own match_score is kept only as a fallback (see below).
+_ASPECT_WEIGHTS = {
+    "vertical": 0.35,
+    "skills": 0.25,
+    "seniority": 0.20,
+    "location": 0.10,
+    "preferences": 0.10,
+}
+# Derive only when the breakdown covers most of the rubric (>= this many of the five
+# aspects). A sparse breakdown (one or two aspects) can't carry a trustworthy weighted
+# score, so we fall back to the model's holistic number rather than extrapolate from it.
+_MIN_DERIVE_ASPECTS = 4
+# A hard-requirement violation (wrong location/seniority/excluded keyword → the model set
+# matches_requirements=False) caps the headline, so a disqualified role can't show a high
+# green score even when its skill/experience aspects rate well.
+_HARD_FAIL_CAP = 40
+
+
+def _aspect_key(label: str) -> str | None:
+    """Map a (possibly drifting) breakdown label to one of the five canonical rubric
+    aspects, or None if it matches none. Checked most-specific first so 'Vertical
+    experience' lands on ``vertical`` rather than a generic bucket."""
+    low = label.lower()
+    if "vertical" in low:
+        return "vertical"
+    if "skill" in low:
+        return "skills"
+    if "senior" in low or "level" in low:
+        return "seniority"
+    if "location" in low or "geograph" in low or "eligib" in low or "remote" in low:
+        return "location"
+    if "preference" in low or "note" in low:
+        return "preferences"
+    return None
+
+
+def _derive_match_score(
+    breakdown: list[MatchSubScore], fallback: int, matches_requirements: bool
+) -> int:
+    """The headline match_score as a fixed weighted average of the rubric sub-scores —
+    the variance-reducer at the heart of this change. Falls back to the model's own
+    ``fallback`` score when the breakdown maps fewer than ``_MIN_DERIVE_ASPECTS`` aspects
+    (too sparse to trust). A hard-requirement violation caps the result at ``_HARD_FAIL_CAP``
+    so a disqualified role never shows a high score. Weights are renormalized over the
+    aspects actually present, so one missing aspect doesn't deflate the whole score."""
+    by_aspect: dict[str, int] = {}
+    for sub in breakdown:
+        key = _aspect_key(sub.label)
+        if key is not None:
+            by_aspect.setdefault(key, sub.score)  # first wins on a duplicate aspect
+    if len(by_aspect) < _MIN_DERIVE_ASPECTS:
+        score = fallback
+    else:
+        total_w = sum(_ASPECT_WEIGHTS[k] for k in by_aspect)
+        score = round(sum(_ASPECT_WEIGHTS[k] * by_aspect[k] for k in by_aspect) / total_w)
+    if not matches_requirements:
+        score = min(score, _HARD_FAIL_CAP)
+    return max(0, min(100, score))
+
+
+def _loose_verdict(data) -> MatchVerdict | None:
+    """Best-effort MatchVerdict from a loose model response, built FIELD BY FIELD so one
+    drifting field never discards a good one. These models drift from the schema even
+    under ``format`` (the matcher uses a free-text relevance filter for the same reason —
+    see the scoring memory): they skip ``strengths``/``gaps``, return a stray subscore,
+    or omit ``matches_requirements``. We sanitize each field independently rather than
+    validating the whole object strictly. Returns None only when there's no usable score
+    at all, so the caller keeps the prior result instead of persisting a hollow zero."""
+    if not isinstance(data, dict):
+        return None
+    raw_score = _clamp_score(data.get("match_score"), None)
+    if raw_score is None:  # no real score -> the model didn't actually score this posting
+        return None
+    mr = data.get("matches_requirements")
+    if not isinstance(mr, bool):
+        mr = raw_score > 0  # infer the verdict flag from the score when the model omits it
+    reasoning = data.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = "Re-scored against this posting."
+    breakdown = _loose_breakdown(data.get("score_breakdown"))
+    # Headline = deterministic weighted average of the rubric aspects when the breakdown is
+    # complete enough to trust; otherwise the model's own (volatile) number. This is what
+    # keeps the same posting from swinging 30+ points between identical scoring calls.
+    score = _derive_match_score(breakdown, raw_score, mr)
+    try:
+        return MatchVerdict(
+            matches_requirements=mr,
+            match_score=score,
+            win_probability=_clamp_score(data.get("win_probability"), 0),
+            reasoning=reasoning.strip(),
+            strengths=_str_list(data.get("strengths")),
+            gaps=_str_list(data.get("gaps")),
+            score_breakdown=breakdown,
+            # MatchVerdict's own field validators coerce these (or null them), so pass through.
+            salary_min=data.get("salary_min"),
+            salary_max=data.get("salary_max"),
+            salary_currency=data.get("salary_currency"),
+            salary_period=data.get("salary_period"),
+        )
+    except ValidationError:
+        return None
+
+
+def rescore_position(
+    db: Session,
+    user: User,
+    position: Position,
+    *,
+    client: OllamaClient | None = None,
+) -> RunResult:
+    """Re-score a SINGLE position on demand (the detail page's "Re-evaluate" button),
+    overwriting the stored MatchResult(s) so the score, reasoning, strengths/gaps and
+    aspect breakdown all refresh. Scores the posting against every active interest
+    (the detail page then surfaces the best), reusing the same batched scoring call and
+    upsert as the backlog drain — so a fresh verdict replaces the existing row in place.
+
+    Unlike ``score_to_completion`` this deliberately skips the cheap relevance
+    pre-filter: the user is explicitly asking to (re)score THIS posting, so it always
+    runs the expensive scoring model, even for a posting a prior filter rejected.
+
+    All-or-nothing: nothing is committed until every interest scores cleanly, and on
+    any failure the whole attempt is rolled back. That's the key difference from the
+    drain — a transient LLM error here must NOT persist an error-marker over the
+    existing good result (which would flip the detail page to "not a match"); the user
+    keeps their previous score and simply retries.
+
+    No per-user score lock is taken: the target pair already has a settled MatchResult,
+    which a concurrent backlog drain skips (it only scores unsettled pairs), and the
+    upsert is an in-place update — so this can't double-score, and needn't stall behind
+    a multi-minute full drain."""
+    res = RunResult()
+    resume, interests, _companies = _active_inputs(db, user)
+    if not resume:
+        res.add_error("No active resume uploaded — cannot score.")
+    if not interests:
+        res.add_error("No active interests configured — nothing to match against.")
+    if not resume or not interests:
+        return res
+    if not (position.description or "").strip():
+        res.add_error("This posting has no scraped description to evaluate.")
+        return res
+
+    score_client = client or llm.clients_for_user(db, user)[0]
+    try:
+        for interest in interests:
+            match_ids, serr = _score_postings(
+                score_client, db, user, resume, interest, [position],
+                single=True, write_markers=False,
+            )
+            if serr is not None:
+                # Discard rather than persist a partial/failed result over the existing
+                # good row — an interactive re-score must leave the prior score intact on
+                # failure (nothing was committed yet, so rollback restores it).
+                db.rollback()
+                res.add_error(serr)
+                res.finalize_errors()
+                return res
+            res.scored += len(match_ids)  # 0 or 1: empty ⇒ a concurrent drain scored the pair
+            res.match_ids.extend(match_ids)
+        db.commit()
+    except OllamaBudgetError as exc:
+        db.rollback()
+        res.budget_exhausted = True
+        res.add_error(
+            "Ollama budget/quota appears to be exhausted, so the re-evaluation couldn't "
+            f"finish — your previous score is unchanged. Try again once your account has "
+            f"quota. (Ollama said: {exc})"
+        )
+    res.finalize_errors()
+    return res
 
 
 def run_for_user(

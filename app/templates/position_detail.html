@@ -3,49 +3,123 @@
 {% block body %}
 <style>
   :root {
-    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
-    --muted:#68746e; --line:#d8e0dc; --accent:#0f766e; --accent-ink:#f5fffd;
-    --amber:#b76b00; --danger:#b42318; --good:#157347;
+    --page:var(--bg-page); --surface:var(--bg-surface); --surface-soft:var(--bg-tag); --ink:var(--text-heading);
+    --muted:var(--text-secondary); --line:var(--border-default); --accent:var(--brand-primary); --accent-ink:var(--text-on-primary);
+    --amber:var(--text-warning); --danger:var(--text-error); --good:var(--text-success);
   }
-  body { background:var(--page); color:var(--ink); }
-  a { color:var(--accent); }
+  body { background:var(--page); color:var(--text-body); }
+  a { color:var(--text-link); }
   header { display:none; }
-  button { background:var(--accent); color:var(--accent-ink); border-radius:8px;
-    border:0; padding:9px 16px; font-weight:600; cursor:pointer; }
-  button:disabled { opacity:.55; cursor:not-allowed; }
-  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button { background:var(--interactive-primary-bg); color:var(--accent-ink); border-radius:8px; }
+  button.ghost { background:transparent; color:var(--text-secondary); border:1px solid var(--line); }
   main.detail { max-width:920px; margin:0 auto; padding:26px clamp(16px, 3vw, 32px); }
   .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
-  .brand-mark { font-size:20px; font-weight:800; }
+  .top-actions { display:flex; align-items:center; justify-content:flex-end; gap:12px; }
+  .brand-mark { color:var(--brand-primary); font-size:20px; font-weight:800; text-decoration:none; }
   .back { font-size:14px; }
   .surface {
-    background:var(--surface); border:1px solid var(--line); border-radius:10px;
-    padding:20px; margin-bottom:16px;
+    background:var(--surface); border:1px solid var(--line); border-radius:16px;
+    padding:24px; margin-bottom:16px; box-shadow:var(--shadow-sm);
   }
   h1 { margin:0 0 6px; font-size:23px; line-height:1.25; }
   h2 { margin:0 0 12px; font-size:17px; }
   h3 { margin:0 0 6px; font-size:15px; }
   .muted { color:var(--muted); font-size:13px; }
   .meta { color:var(--muted); font-size:14px; }
-  .score { color:var(--good); font-weight:800; font-size:18px; white-space:nowrap; }
+  .score { color:var(--text-score-primary); font-weight:700; font-size:18px; white-space:nowrap; }
+  .score-block { text-align:right; white-space:nowrap; }
+  .score-number { color:var(--text-score-primary); font-size:28px; line-height:32px; font-weight:700; }
+  .score-suffix { color:var(--text-secondary); font-size:16px; font-weight:500; }
+  .score-win {
+    display:inline-flex; align-items:center; margin-top:4px; padding:2px 8px;
+    border-radius:999px; background:var(--bg-badge-success); color:var(--text-score-secondary);
+    font-size:13px; line-height:16px; font-weight:600;
+  }
+  .breakdown-grid {
+    display:grid; grid-template-columns:180px minmax(0, 1fr); gap:24px; align-items:center;
+    margin-bottom:18px;
+  }
+  .score-orb {
+    width:160px; height:160px; border-radius:50%; display:grid; place-items:center;
+    justify-self:center; background:conic-gradient(var(--brand-primary) var(--score-pct), var(--bg-input-hover) 0);
+    position:relative; box-shadow:var(--shadow-sm);
+  }
+  .score-orb::before {
+    content:""; position:absolute; inset:14px; border-radius:50%; background:var(--bg-surface);
+    border:1px solid var(--border-default);
+  }
+  .score-orb-inner { position:relative; z-index:1; display:grid; justify-items:center; line-height:1; }
+  .score-orb-score { color:var(--text-score-primary); font-size:36px; font-weight:800; }
+  .score-orb-label { color:var(--text-secondary); font-size:12px; font-weight:700; margin-top:6px; }
+  .subscore-list { display:grid; gap:12px; }
+  .subscore-row { display:grid; gap:6px; }
+  .subscore-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .subscore-label { color:var(--text-heading); font-size:13px; font-weight:700; }
+  .subscore-value { color:var(--text-score-primary); font-size:13px; font-weight:800; white-space:nowrap; }
+  .subscore-track { height:8px; border-radius:999px; background:var(--bg-input-hover); overflow:hidden; }
+  .subscore-fill { height:100%; width:var(--subscore-pct); border-radius:inherit; background:var(--brand-primary); }
+  .subscore-note { color:var(--text-secondary); font-size:12px; line-height:18px; }
+  .fit-summary {
+    margin-top:16px; padding:14px 16px; border:1px solid var(--border-default);
+    border-radius:12px; background:var(--bg-input); color:var(--text-body);
+  }
+  .fit-columns { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:16px; }
+  .fit-card {
+    border:1px solid var(--border-default); border-radius:12px; padding:16px;
+    background:var(--bg-surface-raised);
+  }
+  .fit-card.is-winning { border-color:color-mix(in srgb, var(--text-success) 34%, var(--border-default)); }
+  .fit-card.is-risk { border-color:color-mix(in srgb, var(--text-warning) 38%, var(--border-default)); }
+  .fit-card h3 {
+    display:flex; align-items:center; gap:8px; margin:0 0 10px;
+    font-size:14px; line-height:20px;
+  }
+  .fit-card h3::before {
+    content:""; width:9px; height:9px; border-radius:50%; background:var(--brand-primary);
+  }
+  .fit-card.is-winning h3::before { background:var(--text-success); }
+  .fit-card.is-risk h3::before { background:var(--text-warning); }
+  .fit-card ul { margin:0; padding-left:18px; }
+  .fit-card li { margin:6px 0; }
+  .fit-empty { color:var(--text-secondary); font-size:13px; line-height:20px; margin:0; }
   .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+  .job-main { display:flex; align-items:flex-start; gap:14px; min-width:0; }
+  .company-mark {
+    width:48px; height:48px; flex:0 0 48px; border-radius:10px;
+    display:grid; place-items:center; background:var(--bg-tag); color:var(--brand-primary);
+    font-size:20px; line-height:1; font-weight:800; border:1px solid var(--border-default);
+  }
   /* Score + pay range stack on the right of the header, right-aligned. */
   .head-right { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; }
   .pay { color:var(--ink); font-size:14px; font-weight:650; white-space:nowrap; }
+  /* "How you line up" section header: title on the left, the "Re-evaluate" button
+     (re-runs AI scoring for just this posting) on the right. */
+  .fit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }
+  .fit-head h2 { margin:0; }
+  .reeval-wrap { display:flex; flex-direction:column; align-items:flex-end; gap:4px; flex-shrink:0; }
+  .reeval-btn {
+    background:transparent; color:var(--text-link); border:1px solid var(--line);
+    border-radius:8px; padding:5px 11px; font-size:12.5px; font-weight:600;
+    cursor:pointer; white-space:nowrap;
+  }
+  .reeval-btn:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .reeval-btn:disabled { opacity:.6; cursor:default; }
+  .reeval-status { color:var(--text-secondary); font-size:12px; line-height:16px; max-width:220px; text-align:right; }
   .actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:16px; }
   .apply-btn {
-    background:transparent; color:var(--ink); border:1px solid var(--line);
+    background:transparent; color:var(--interactive-outline-text); border:1.5px solid var(--interactive-outline-border);
     border-radius:8px; padding:8px 14px; font-size:14px; font-weight:600; cursor:pointer;
   }
-  .apply-btn:hover:not(.applied):not(:disabled) { border-color:var(--accent); color:var(--accent); }
-  .apply-btn.applied { background:var(--good); color:#fff; border-color:var(--good); }
+  .apply-btn:hover:not(.applied):not(:disabled) { background:var(--interactive-outline-hover-bg); color:var(--interactive-outline-text); }
+  .apply-btn.applied { background:var(--bg-badge-success); color:var(--text-success); border-color:transparent; }
   .apply-btn:disabled { opacity:.6; cursor:default; }
   .pill {
     display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px;
-    font-size:12px; background:#eef7f5; color:var(--accent);
+    font-size:12px; font-weight:600; background:var(--bg-tag); color:var(--brand-primary);
   }
-  .pill.warn { background:#fff4df; color:var(--amber); }
-  .pill.bad { background:#f6e4e4; color:var(--danger); }
+  .pill.warn { background:var(--bg-badge-warning); color:var(--text-warning); }
+  .pill.bad { background:var(--bg-badge-error); color:var(--text-error); }
+  .pill.neutral { background:var(--bg-badge-neutral); color:var(--text-secondary); }
   ul.tight { margin:6px 0; padding-left:20px; }
   ul.tight li { margin:3px 0; }
   .kit-controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
@@ -54,7 +128,7 @@
   .qa .q { font-weight:700; }
   .qa .advice { color:var(--muted); font-size:13px; margin:6px 0; }
   .doc {
-    background:#fbfdfc; border:1px solid var(--line); border-radius:8px;
+    background:var(--bg-input); border:1px solid var(--line); border-radius:8px;
     padding:10px 14px 14px; margin-top:8px;
   }
   /* The Copy button lives in its own right-aligned bar above the text, so it can
@@ -65,7 +139,7 @@
   }
   .doc .copy {
     font-size:12px; padding:5px 10px; border-radius:6px;
-    background:transparent; color:var(--ink); border:1px solid var(--line);
+    background:transparent; color:var(--text-secondary); border:1px solid var(--line);
   }
   .doc .copy:hover { border-color:var(--accent); color:var(--accent); }
   .spinner {
@@ -74,20 +148,20 @@
     vertical-align:-2px; margin-right:7px;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:#fbfdfc; }
-  .errbox { border:1px solid var(--danger); background:#fdecea; color:var(--danger); border-radius:8px; padding:12px 14px; }
+  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:var(--bg-input); }
+  .errbox { border:1px solid var(--border-error); background:var(--bg-badge-error); color:var(--text-error); border-radius:8px; padding:12px 14px; }
   .section-gap { margin-top:18px; }
   /* Rendered (formatted) resume — Markdown turned into real headings/lists, and
      the element the "Download PDF" print view isolates. */
   .resume-rendered {
-    --resume-accent:#0f766e; --resume-ink:#17211d; --resume-muted:#58635e;
-    --resume-line:#d6e0dc; --resume-soft:#eef7f5;
+    --resume-accent:var(--brand-primary); --resume-ink:#111827; --resume-muted:#6B7280;
+    --resume-line:#E5E7EB; --resume-soft:#F3F4F6;
     background:#fff; color:var(--resume-ink); font:13.5px/1.48 inherit;
     padding:28px 34px; border-radius:6px; box-shadow:0 1px 0 rgba(16,34,29,.04);
     max-width:780px; margin:0 auto;
   }
   .resume-rendered h1 {
-    font-size:30px; line-height:1.08; margin:0; color:#10221d;
+    font-size:30px; line-height:1.08; margin:0; color:#111827;
     text-align:center; font-weight:850; letter-spacing:.02em;
   }
   .resume-rendered h1 + p {
@@ -106,10 +180,10 @@
   /* Each entry's company is a ### heading; the role title is the bold line under
      it (body size), so the company never renders smaller than the position. */
   .resume-rendered h3 {
-    font-size:15.5px; font-weight:800; margin:13px 0 1px; color:#13251f;
+    font-size:15.5px; font-weight:800; margin:13px 0 1px; color:#111827;
   }
   .resume-rendered h3 + p { margin-top:0; color:var(--resume-muted); }
-  .resume-rendered h3 + p strong { color:#27352f; font-weight:750; }
+  .resume-rendered h3 + p strong { color:#374151; font-weight:750; }
   .resume-rendered p { margin:4px 0; }
   .resume-rendered ul, .resume-rendered ol { margin:6px 0 8px; padding-left:0; list-style:none; }
   .resume-rendered li {
@@ -138,12 +212,22 @@
     }
     #printRoot .resume-rendered h2, #printRoot .resume-rendered h3 { break-after:avoid; }
   }
+  @media (max-width: 640px) {
+    .breakdown-grid { grid-template-columns:1fr; }
+    .fit-columns { grid-template-columns:1fr; }
+    .score-orb { width:140px; height:140px; }
+  }
 </style>
 
 <main class="detail">
   <div class="topbar">
-    <div class="brand-mark">JobScout</div>
-    <a class="back" href="/#jobs">← Back to job list</a>
+    <a class="brand-mark" href="/#jobs">JobScout</a>
+    <div class="top-actions">
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
+      <a class="back" href="/#jobs">← Back to job list</a>
+    </div>
   </div>
 
   <div id="content">
@@ -169,8 +253,84 @@ function fmtListed(value){
   return `Listed ${d.toLocaleDateString([], {dateStyle:"medium"})}`;
 }
 
+function companyInitial(name){
+  const trimmed = (name || "").trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() : "?";
+}
+
+function companyMark(name){
+  return `<div class="company-mark" aria-hidden="true">${esc(companyInitial(name))}</div>`;
+}
+
+function clampScore(value){
+  const n = Number.parseInt(value, 10);
+  if(Number.isNaN(n)){ return 0; }
+  return Math.max(0, Math.min(100, n));
+}
+
+function scoreBreakdownSection(m){
+  const items = m.score_breakdown || [];
+  if(m.non_matching || !items.length || m.match_score == null){ return ""; }
+  const total = clampScore(m.match_score);
+  return `<div class="breakdown-grid">
+    <div class="score-orb" style="--score-pct:${total}%;">
+      <div class="score-orb-inner">
+        <div class="score-orb-score">${total}</div>
+        <div class="score-orb-label">match score</div>
+      </div>
+    </div>
+    <div class="subscore-list">
+      ${items.map(item => {
+        const score = clampScore(item.score);
+        return `<div class="subscore-row">
+          <div class="subscore-head">
+            <div class="subscore-label">${esc(item.label || "Aspect")}</div>
+            <div class="subscore-value">${score}/100</div>
+          </div>
+          <div class="subscore-track"><div class="subscore-fill" style="--subscore-pct:${score}%;"></div></div>
+          ${item.rationale ? `<div class="subscore-note">${esc(item.rationale)}</div>` : ""}
+        </div>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+
+function fitList(items, emptyText){
+  if(!items.length){ return `<p class="fit-empty">${esc(emptyText)}</p>`; }
+  return `<ul>${items.map(item => `<li>${esc(item)}</li>`).join("")}</ul>`;
+}
+
+function fitOutcomeSection(strengths, gaps){
+  return `<div class="fit-columns">
+    <section class="fit-card is-winning">
+      <h3>Winning</h3>
+      ${fitList(strengths, "No clear winning signals were identified yet.")}
+    </section>
+    <section class="fit-card is-risk">
+      <h3>Risks</h3>
+      ${fitList(gaps, "No major risk areas were identified.")}
+    </section>
+  </div>`;
+}
+
+// The "Re-evaluate" button in the "How you line up" header: re-runs AI scoring for
+// just this posting, refreshing the score, the breakdown, and the Winning/Risks
+// columns. Disabled for a closed posting (the server rejects it too).
+function reevalControl(m){
+  const disabled = m.removed ? " disabled" : "";
+  const title = m.removed
+    ? "This posting is no longer listed — re-evaluation is disabled."
+    : "Re-run the AI scoring for this posting";
+  return `<div class="reeval-wrap">
+    <button type="button" id="reevalBtn" class="reeval-btn"${disabled}
+            title="${esc(title)}" onclick="reevaluate()">↻ Re-evaluate</button>
+    <span id="reevalStatus" class="reeval-status"></span>
+  </div>`;
+}
+
 let detail = null;        // last loaded detail payload
 let kitPolling = false;
+let reevalPolling = false;
 
 async function loadDetail(){
   let r;
@@ -192,30 +352,46 @@ function renderDetail(){
   const metaBits = [m.company, m.location, m.department, listed].filter(Boolean).map(esc).join(" · ");
   const head = m.non_matching
     ? `<span class="pill bad">not a match</span>`
-    : `<div class="score">${m.match_score}/100<div class="muted" style="text-align:right;">win ${m.win_probability}%</div></div>`;
+    : `<div class="score-block">
+        <div class="score-number">${m.match_score}<span class="score-suffix">/100</span></div>
+        <div class="score-win">win ${m.win_probability}%</div>
+      </div>`;
   // Pay range (when the posting disclosed one), under the score on the right.
   const salary = m.salary_display ? `<div class="pay">${esc(m.salary_display)}</div>` : "";
 
   const strengths = m.strengths || [];
   const gaps = m.gaps || [];
-  const fit = (m.reasoning || strengths.length || gaps.length) ? `
+  const breakdown = scoreBreakdownSection(m);
+  const hasFit = breakdown || m.reasoning || strengths.length || gaps.length;
+  // "How you line up" always renders so its "Re-evaluate" button is always available
+  // (incl. for a posting that isn't currently a match — re-scoring is how you give it
+  // another look). The body falls back to a short prompt when there's no fit yet.
+  const fit = `
     <div class="surface">
-      <h2>How you line up</h2>
-      ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
-      ${strengths.length ? `<div class="section-gap"><h3>Your strengths</h3><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
-      ${gaps.length ? `<div class="section-gap"><h3>Your weak spots</h3><ul class="tight">${gaps.map(s=>`<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}
-    </div>` : "";
+      <div class="fit-head">
+        <h2>How you line up</h2>
+        ${reevalControl(m)}
+      </div>
+      ${hasFit ? `
+        ${breakdown}
+        ${m.reasoning ? `<div class="fit-summary">${esc(m.reasoning)}</div>` : ""}
+        ${fitOutcomeSection(strengths, gaps)}`
+      : `<p class="fit-empty">No fit breakdown yet — re-evaluate to score this posting.</p>`}
+    </div>`;
 
   document.getElementById("content").innerHTML = `
     <div class="surface">
       <div class="head-row">
-        <div>
-          <h1>${esc(m.title)}</h1>
-          <div class="meta">${metaBits}</div>
+        <div class="job-main">
+          ${companyMark(m.company)}
+          <div>
+            <h1>${esc(m.title)}</h1>
+            <div class="meta">${metaBits}</div>
+          </div>
         </div>
         <div class="head-right">${head}${salary}</div>
       </div>
-      ${m.removed ? `<div class="pill" style="background:#eceff1; color:var(--muted); margin-top:8px;">✕ No longer listed — this posting has been removed from the company's board. Your application record is kept.</div>` : ""}
+      ${m.removed ? `<div class="pill neutral" style="margin-top:8px;">No longer listed — this posting has been removed from the company's board. Your application record is kept.</div>` : ""}
       <div class="actions">
         <button type="button" id="applyBtn" class="apply-btn${m.applied ? " applied" : ""}"
                 aria-pressed="${m.applied ? "true" : "false"}" onclick="toggleApplied(this)">
@@ -412,6 +588,49 @@ async function pollKit(){
   }
   if(kit){ renderKit(kit); }   // refresh partial progress, keeps kitPolling truthy
   setTimeout(pollKit, 4000);
+}
+
+async function reevaluate(){
+  if(detail && detail.removed){ return; }  // closed posting — server rejects too
+  const btn = document.getElementById("reevalBtn");
+  const statusEl = document.getElementById("reevalStatus");
+  if(btn){ btn.disabled = true; }
+  if(statusEl){ statusEl.textContent = ""; }
+  let r;
+  try { r = await api(`/api/positions/${POSITION_ID}/rescore`, {method:"POST"}); }
+  catch(e){ r = null; }
+  if(!r || !r.ok){
+    const d = r ? await r.json().catch(()=>({})) : {};
+    if(statusEl){ statusEl.textContent = d.detail || "Could not start re-evaluation."; }
+    if(btn){ btn.disabled = false; }
+    return;
+  }
+  if(statusEl){ statusEl.innerHTML = `<span class="spinner"></span>Re-evaluating…`; }
+  startReevalPolling();
+}
+
+function startReevalPolling(){
+  if(reevalPolling){ return; }
+  reevalPolling = true;
+  setTimeout(pollReeval, 3000);
+}
+
+async function pollReeval(){
+  let st = null;
+  try { const r = await api(`/api/positions/${POSITION_ID}/rescore`); if(r.ok){ st = await r.json(); } } catch(e){}
+  if(st && !st.in_progress){
+    reevalPolling = false;
+    if(st.error){
+      const statusEl = document.getElementById("reevalStatus");
+      const btn = document.getElementById("reevalBtn");
+      if(statusEl){ statusEl.textContent = st.error; }
+      if(btn){ btn.disabled = false; }
+      return;
+    }
+    await loadDetail();   // refetch + re-render with the refreshed score / fit
+    return;
+  }
+  setTimeout(pollReeval, 3000);
 }
 
 async function toggleApplied(btn){

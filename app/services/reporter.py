@@ -36,6 +36,50 @@ def _loads(value: str | None) -> list[str]:
         return []
 
 
+def _loads_score_breakdown(value: str | None, match: MatchResult, pos: Position) -> list[dict]:
+    """Load stored aspect scores. Older rows predate this field, so synthesize a
+    conservative breakdown from the top-level score; each synthetic rationale says
+    it is estimated until the role is rescored with the expanded rubric."""
+    if value:
+        try:
+            items = json.loads(value)
+        except json.JSONDecodeError:
+            items = []
+        if isinstance(items, list):
+            out = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or "").strip()
+                if not label:
+                    continue
+                try:
+                    score = int(item.get("score", 0))
+                except (TypeError, ValueError):
+                    score = 0
+                out.append({
+                    "label": label[:80],
+                    "score": max(0, min(100, score)),
+                    "rationale": str(item.get("rationale") or "").strip()[:240],
+                })
+            if out:
+                return out[:5]
+    if not match.passed_filter:
+        return []
+    overall = max(0, min(100, int(match.match_score or 0)))
+    win = max(0, min(100, int(match.win_probability or 0)))
+    has_strengths = bool(_loads(match.strengths))
+    location_score = min(100, overall + 10) if pos.location else overall
+    estimated = "Estimated from the existing overall score; rescore this role for model-provided detail."
+    return [
+        {"label": "Vertical experience", "score": max(0, min(100, round(overall * 0.95))), "rationale": estimated},
+        {"label": "Skills overlap", "score": max(0, min(100, overall + (8 if has_strengths else 0))), "rationale": estimated},
+        {"label": "Seniority fit", "score": max(0, min(100, round((overall + win) / 2) + 5)), "rationale": estimated},
+        {"label": "Location fit", "score": max(0, min(100, location_score)), "rationale": estimated},
+        {"label": "Preferences", "score": max(0, min(100, round(overall * 0.9))), "rationale": estimated},
+    ]
+
+
 def _listed_at(pos: Position) -> datetime | None:
     """The job's effective 'listed' date: the ATS-reported post date when we have
     one, else when our crawler first saw it (so undated sources still get a date)."""
@@ -406,6 +450,7 @@ def build_position_detail(db: Session, user: User, position_id: int) -> dict | N
         "reasoning": match.reasoning,
         "strengths": _loads(match.strengths),
         "gaps": _loads(match.gaps),
+        "score_breakdown": _loads_score_breakdown(match.score_breakdown, match, pos),
         "non_matching": not match.passed_filter,
         "removed": pos.removed_at is not None,
         "applied": False,

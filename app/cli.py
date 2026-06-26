@@ -16,7 +16,7 @@ Commands:
   health           Check DB + Ollama connectivity.
   token <email>    Mint a bearer token for a user (for MCP / API clients).
   invite           Mint / list / revoke registration invite codes
-                   (e.g. `jobscout invite mint --max-uses 5 --expires-days 30`).
+                   (e.g. `jobscout invite mint --count 1 --max-uses 1 --expiry 24h`).
   backfill-descriptions
                    Fetch missing job descriptions for eightfold boards (e.g. NVIDIA),
                    whose search API returns none, so older postings become scoreable.
@@ -412,26 +412,54 @@ def cmd_migrate_db(args: argparse.Namespace) -> int:
 
 def cmd_invite(args: argparse.Namespace) -> int:
     """Mint / list / revoke registration invite codes (see app/invites.py)."""
+    from datetime import timedelta
+
     from sqlalchemy import select
 
     from . import invites
+    from .config import settings
     from .db import init_db, session_scope
     from .models import InviteCode
+    from .timeutil import parse_duration
 
     init_db()
     with session_scope() as db:
         if args.invite_command == "mint":
+            # --expiry (a unit duration like 24h/30m/7d) wins over the whole-day
+            # --expires-days shorthand; neither = a non-expiring code.
+            expires_in: timedelta | None = None
+            expiry_label = "never"
+            if args.expiry:
+                try:
+                    expires_in = parse_duration(args.expiry)
+                except ValueError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 2
+                expiry_label = args.expiry
+            elif args.expires_days:
+                expires_in = timedelta(days=args.expires_days)
+                expiry_label = f"{args.expires_days}d"
+
+            # A code is the HMAC of the app secret, so minting with the built-in dev
+            # default produces codes the real deployment can't validate (and writes to
+            # the default local SQLite, not prod). Warn loudly so a console session that
+            # forgot JOBSCOUT_SECRET_KEY / JOBSCOUT_DATABASE_URL is immediately obvious.
+            if settings.secret_is_default:
+                print("warning: JOBSCOUT_SECRET_KEY is the built-in dev default — codes "
+                      "minted here will NOT be valid for a deployment with a real key. "
+                      "Run from the deployed console (where the env is set) or export it.",
+                      file=sys.stderr)
+
             codes = invites.mint(
                 db,
                 max_uses=args.max_uses,
-                expires_in_days=args.expires_days,
+                expires_in=expires_in,
                 note=args.note,
                 count=args.count,
             )
             # Printed once — only the HMAC is stored, so a code can't be recovered later.
             print(f"Minted {len(codes)} code(s) "
-                  f"(max_uses={max(1, args.max_uses)}, "
-                  f"expires={'in ' + str(args.expires_days) + 'd' if args.expires_days else 'never'}):")
+                  f"(max_uses={max(1, args.max_uses)}, expires={expiry_label}):")
             for code in codes:
                 print(f"  {code}")
             return 0
@@ -559,8 +587,11 @@ def main() -> None:
     isub = p.add_subparsers(dest="invite_command", required=True)
     m = isub.add_parser("mint", help="Mint new invite code(s); prints them once")
     m.add_argument("--max-uses", type=int, default=1, help="How many times each code can be used")
+    m.add_argument("--expiry", default=None,
+                   help="Time until each code expires as a unit duration: 30m, 24h, 7d, "
+                        "2w, or compound 1d12h (omit = never expires). Wins over --expires-days.")
     m.add_argument("--expires-days", type=int, default=None,
-                   help="Days until each code expires (omit = never expires)")
+                   help="Whole-day expiry shorthand (omit = never); prefer --expiry for sub-day")
     m.add_argument("--count", type=int, default=1, help="How many codes to mint")
     m.add_argument("--note", default=None, help="Optional label stored with the code(s)")
     isub.add_parser("list", help="List all invite codes and their state")

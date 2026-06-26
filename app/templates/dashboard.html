@@ -3,63 +3,59 @@
 {% block body %}
 <style>
   :root {
-    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1;
-    --surface-raised:#fbfdfc; --ink:#17211d; --muted:#68746e;
-    --line:#d8e0dc; --line-strong:#b9c8c1; --sidebar:#10221d;
-    --sidebar-ink:#f6fbf8; --accent:#0f766e; --accent-ink:#f5fffd;
-    --action:#0f766e; --action-ink:#f5fffd; --amber:#b76b00;
-    --danger:#b42318; --good:#147343;
-    --shadow:0 14px 34px rgba(16, 34, 29, .08);
+    --page:var(--bg-page); --surface:var(--bg-surface); --surface-soft:var(--bg-tag);
+    --surface-raised:var(--bg-surface-raised); --ink:var(--text-heading); --muted:var(--text-secondary);
+    --line:var(--border-default); --line-strong:var(--border-strong); --sidebar:var(--bg-sidebar);
+    --sidebar-ink:var(--text-body); --accent:var(--brand-primary); --accent-ink:var(--text-on-primary);
+    --action:var(--interactive-primary-bg); --action-ink:var(--text-on-primary); --amber:var(--text-warning);
+    --danger:var(--text-error); --good:var(--text-success); --shadow:var(--shadow-sm);
   }
-  body { background:var(--page); color:var(--ink); }
-  a { color:var(--accent); }
+  body { background:var(--page); color:var(--text-body); }
+  a { color:var(--text-link); }
   header { display:none; }
   button {
     background:var(--action); color:var(--action-ink); border-radius:8px;
-    min-height:38px; padding:8px 14px;
+    min-height:40px; padding:10px 18px;
   }
-  button:disabled { opacity:.55; cursor:not-allowed; }
-  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
-  button.ghost:hover:not(:disabled) { border-color:var(--line-strong); background:#f5f7f6; }
+  button.ghost { background:transparent; color:var(--text-secondary); border:1px solid var(--line); }
+  button.ghost:hover:not(:disabled) { border-color:var(--line-strong); background:var(--bg-input-hover); color:var(--ink); }
   input, textarea, select {
-    background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
+    background:var(--bg-input); border:1.5px solid var(--line-strong); border-radius:8px; color:var(--text-body);
   }
   input:disabled, textarea:disabled, select:disabled {
-    background:#eef1f0; color:var(--muted); cursor:not-allowed; opacity:.7;
-  }
-  input:focus, textarea:focus, select:focus, button:focus-visible {
-    outline:2px solid rgba(15, 118, 110, .28); outline-offset:2px;
+    background:var(--surface); color:var(--text-disabled); cursor:not-allowed; opacity:.7;
   }
   label { color:var(--muted); }
   main.dashboard {
     max-width:none; min-height:100vh; margin:0; padding:0;
-    display:grid; grid-template-columns:264px minmax(0, 1fr);
+    display:grid; grid-template-columns:240px minmax(0, 1fr);
   }
   .sidebar {
     background:var(--sidebar); color:var(--sidebar-ink);
-    border-right:1px solid #18342d;
+    border-right:1px solid var(--line);
     height:100vh; position:sticky; top:0; align-self:start; overflow-y:auto;
-    padding:22px 16px; display:flex; flex-direction:column; gap:22px;
+    padding:16px 12px; display:flex; flex-direction:column; gap:22px;
   }
   .sidebar-top {
     display:flex; align-items:flex-start; justify-content:space-between; gap:14px;
-    padding:0 4px 18px; border-bottom:1px solid #24443c;
+    padding:0 4px 18px; border-bottom:1px solid var(--line);
   }
-  .brand-mark { font-size:22px; font-weight:800; letter-spacing:0; }
-  .account { color:#b9c8c1; font-size:13px; word-break:break-word; }
+  .brand-mark { color:var(--brand-primary); font-size:18px; line-height:28px; font-weight:700; letter-spacing:0; }
+  .account { color:var(--muted); font-size:11px; line-height:16px; word-break:break-word; }
+  .sidebar .theme-toggle { margin-top:1px; }
   .nav-stack { display:grid; gap:18px; }
   .nav-section { display:grid; gap:6px; }
   .nav-section-title {
-    color:#8fb0a4; font-size:11px; font-weight:750; text-transform:uppercase;
-    letter-spacing:.08em; padding:0 10px 2px;
+    color:var(--text-sidebar-section); font-size:11px; line-height:16px; font-weight:600; text-transform:uppercase;
+    letter-spacing:.08em; padding:12px 16px 4px;
   }
   .nav-section-toggle {
-    width:100%; min-height:28px; padding:0 10px 2px; border:0; border-radius:6px;
-    background:transparent; color:#8fb0a4; display:flex; align-items:center;
-    justify-content:space-between; font-size:11px; font-weight:750;
+    width:100%; min-height:32px; padding:8px 16px 4px; border:0; border-radius:8px;
+    background:transparent; color:var(--text-sidebar-section); display:flex; align-items:center;
+    justify-content:space-between; font-size:11px; line-height:16px; font-weight:600;
     text-transform:uppercase; letter-spacing:.08em;
   }
-  .nav-section-toggle:hover { background:#18342d; color:#cde0d8; }
+  .nav-section-toggle:hover { background:var(--bg-input-hover); color:var(--text-heading); }
   .nav-section-toggle::after {
     content:""; width:7px; height:7px; border-right:2px solid currentColor;
     border-bottom:2px solid currentColor; transform:rotate(45deg); margin-left:8px;
@@ -70,36 +66,36 @@
   .nav-section.collapsed .nav-section-body { display:none; }
   .nav-button {
     position:relative; width:100%; text-align:left; background:transparent;
-    color:#dce8e3; border:1px solid transparent;
-    padding:9px 10px 9px 14px; font-weight:650; min-height:38px;
+    color:var(--text-sidebar-inactive); border:0; border-radius:0 8px 8px 0;
+    padding:8px 14px 8px 16px; font-size:14px; font-weight:500; min-height:36px; justify-content:flex-start;
   }
   .nav-button:hover, .nav-button[aria-current="page"] {
-    background:#1d3932; border-color:#2a5148; color:#ffffff;
+    background:var(--bg-sidebar-active); color:var(--text-sidebar-active);
   }
   .nav-button[aria-current="page"]::before {
-    content:""; position:absolute; left:5px; top:9px; bottom:9px; width:3px;
-    border-radius:999px; background:var(--accent);
+    content:""; position:absolute; left:0; top:0; bottom:0; width:3px;
+    background:var(--border-sidebar-active);
   }
   button.logout {
-    margin-top:auto; color:#f7fbf9; border-color:#31554d; width:100%;
+    margin-top:auto; width:100%; justify-content:flex-start;
   }
-  .sidebar button.ghost:hover:not(:disabled) { background:#1d3932; border-color:#2a5148; }
-  .workspace { padding:28px clamp(18px, 3vw, 42px); min-width:0; }
+  .workspace { padding:32px clamp(20px, 3vw, 42px); min-width:0; }
   .view-header {
-    max-width:1180px; margin:0 auto 20px;
+    max-width:1200px; margin:0 auto 24px;
     display:flex; align-items:flex-start; justify-content:space-between; gap:18px;
-    border-bottom:1px solid var(--line); padding-bottom:18px;
+    border-bottom:1px solid var(--line); padding-bottom:20px;
   }
-  h1 { margin:0; font-size:27px; line-height:1.18; letter-spacing:0; }
-  h2 { margin:0 0 12px; font-size:17px; line-height:1.3; letter-spacing:0; }
+  h1 { margin:0; font-size:30px; line-height:36px; letter-spacing:0; font-weight:700; }
+  h2 { margin:0 0 16px; font-size:18px; line-height:28px; letter-spacing:0; font-weight:600; }
   .muted { color:var(--muted); font-size:13px; }
-  .panel { display:none; max-width:1180px; margin:0 auto; }
+  .panel { display:none; max-width:1200px; margin:0 auto; }
   .panel.active { display:block; }
   .surface {
-    background:var(--surface); border:1px solid var(--line); border-radius:8px;
-    padding:18px; margin-bottom:16px; box-shadow:var(--shadow);
+    background:var(--surface); border:1px solid var(--line); border-radius:16px;
+    padding:24px; margin-bottom:16px; box-shadow:var(--shadow);
   }
-  .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .job-list-shell { margin-top:16px; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
   .toolbar .grow { flex:1 1 220px; }
   /* Keep the run button pinned to the top-right; let its long status line ("…
      evaluating N in the background…") stack underneath instead of widening the
@@ -138,52 +134,73 @@
   #jobCompany { width:170px; max-width:170px; text-overflow:ellipsis; }
   /* Job-list view switcher: a 3-way segmented control whose highlighted segment
      always names the list currently shown (top 5 / all matches / all jobs). */
-  .segmented { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .segmented { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; min-height:40px; }
   .segmented .seg {
-    background:transparent; color:var(--ink); border:0; border-left:1px solid var(--line);
-    border-radius:0; padding:8px 14px; font-size:13px; cursor:pointer;
+    background:transparent; color:var(--text-secondary); border:0; border-left:1px solid var(--line);
+    border-radius:0; padding:8px 14px; font-size:13px; cursor:pointer; min-height:38px;
   }
   .segmented .seg:first-child { border-left:0; }
   .segmented .seg:hover:not(.active) { color:var(--accent); }
-  .segmented .seg.active { background:var(--accent); color:var(--accent-ink); cursor:default; }
+  .segmented .seg.active { background:var(--bg-sidebar-active); color:var(--text-sidebar-active); cursor:default; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   .inline-editor {
     background:var(--surface-raised); border:1px solid var(--line);
-    border-radius:8px; padding:12px; margin-bottom:12px;
+    border-radius:12px; padding:16px; margin-bottom:12px;
   }
-  .list-item, .job-row {
-    border-top:1px solid var(--line); padding:14px 0;
+  .list-item { border-top:1px solid var(--line); padding:14px 0; }
+  .list-item:first-child { border-top:0; }
+  #jobList { display:grid; gap:16px; }
+  .job-row {
+    display:grid; gap:12px; background:var(--surface); border:1px solid var(--line);
+    border-left-width:4px; border-left-color:transparent; border-radius:16px; padding:20px;
+    box-shadow:var(--shadow-xs); transition:box-shadow 150ms ease, border-color 150ms ease;
   }
-  .list-item:first-child, .job-row:first-child { border-top:0; }
-  .job-row { display:grid; gap:9px; }
+  .job-row:hover { border-left-color:var(--brand-primary); box-shadow:var(--shadow-md); }
   .job-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
-  .job-title { font-weight:750; font-size:16px; }
+  .job-main { display:flex; align-items:flex-start; gap:14px; min-width:0; }
+  .company-mark {
+    width:44px; height:44px; flex:0 0 44px; border-radius:10px;
+    display:grid; place-items:center; background:var(--bg-tag); color:var(--brand-primary);
+    font-size:18px; line-height:1; font-weight:800; border:1px solid var(--border-default);
+  }
+  .job-title { font-weight:700; font-size:16px; line-height:24px; }
   .job-title a { color:var(--ink); text-decoration:none; }
   .job-title a:hover { color:var(--accent); text-decoration:underline; }
   .job-meta { color:var(--muted); font-size:13px; }
-  .score { color:var(--good); font-weight:800; white-space:nowrap; }
+  .score { color:var(--text-score-primary); font-weight:700; white-space:nowrap; }
+  .score-block { text-align:right; white-space:nowrap; }
+  .score-number { color:var(--text-score-primary); font-size:28px; line-height:32px; font-weight:700; }
+  .score-suffix { color:var(--text-secondary); font-size:16px; font-weight:500; }
+  .score-win {
+    display:inline-flex; align-items:center; margin-top:4px; padding:2px 8px;
+    border-radius:999px; background:var(--bg-badge-success); color:var(--text-score-secondary);
+    font-size:13px; line-height:16px; font-weight:600;
+  }
   /* Score + pay range stack on the right of a job row, right-aligned. */
-  .job-head-right { display:flex; flex-direction:column; align-items:flex-end; gap:3px; flex-shrink:0; }
+  .job-head-right { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; }
   .salary { color:var(--ink); font-size:13px; font-weight:650; white-space:nowrap; }
   /* Per-job footer: the application toggle + the posting link on one baseline,
      with the application-kit status icon pushed to the bottom-right. */
   .job-actions { display:flex; align-items:center; gap:14px; margin-top:2px; }
   .kit-icon { margin-left:auto; font-size:15px; cursor:default; line-height:1; }
   .apply-btn {
-    background:transparent; color:var(--ink); border:1px solid var(--line);
-    border-radius:8px; padding:6px 12px; font-size:13px;
+    background:transparent; color:var(--interactive-outline-text); border:1.5px solid var(--interactive-outline-border);
+    border-radius:8px; padding:8px 14px; font-size:13px; min-height:36px;
   }
-  .apply-btn:hover:not(.applied):not(:disabled) { border-color:var(--accent); color:var(--accent); }
-  .apply-btn.applied { background:var(--good); color:#fff; border-color:var(--good); }
-  .apply-btn:disabled { opacity:.6; cursor:default; }
+  .apply-btn:hover:not(.applied):not(:disabled) { background:var(--interactive-outline-hover-bg); color:var(--interactive-outline-text); }
+  .apply-btn.applied { background:var(--bg-badge-success); color:var(--text-success); border-color:transparent; }
   .pill {
-    display:inline-flex; align-items:center; min-height:22px; padding:2px 8px;
-    border-radius:999px; font-size:12px; background:#eef7f5; color:var(--accent);
+    display:inline-flex; align-items:center; min-height:22px; padding:3px 10px;
+    border-radius:999px; font-size:12px; line-height:16px; font-weight:600;
+    background:var(--bg-tag); color:var(--brand-primary);
     /* A chip is a single label — never let a long job title/location next to it in
        .job-head squeeze it into wrapping (e.g. "not a match" over two lines). */
     white-space:nowrap; flex-shrink:0;
   }
-  .pill.warn { background:#fff4df; color:var(--amber); }
+  .pill.warn { background:var(--bg-badge-warning); color:var(--text-warning); }
+  .pill.good { background:var(--bg-badge-success); color:var(--text-success); }
+  .pill.bad { background:var(--bg-badge-error); color:var(--text-error); }
+  .pill.neutral { background:var(--bg-badge-neutral); color:var(--text-secondary); }
   /* Always-visible info badge (e.g. next to a section heading); hover/focus for
      the native tooltip. */
   .info-dot {
@@ -192,23 +209,23 @@
     border-radius:50%; background:var(--accent); color:var(--accent-ink);
     font-size:12px; font-style:italic; font-weight:700; cursor:help; user-select:none;
   }
-  .info-dot:focus { outline:2px solid var(--accent); outline-offset:2px; }
+  .info-dot:focus { outline:0; box-shadow:var(--shadow-glow-primary); }
   .empty {
     border:1px dashed var(--line); border-radius:8px; padding:20px; color:var(--muted);
     background:var(--surface-raised);
   }
   .warning-box {
-    border:1px solid #f0cf9b; background:#fff8eb; color:#6b4300;
+    border:1px solid var(--bg-badge-warning); background:var(--bg-badge-warning); color:var(--text-warning);
     border-radius:8px; padding:12px 14px; margin:12px 0;
   }
   .stat-line { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
   .stat {
-    display:inline-flex; padding:5px 9px; border-radius:8px; background:var(--surface-soft);
-    color:#2a3a34; font-size:13px;
+    display:inline-flex; padding:5px 9px; border-radius:999px; background:var(--surface-soft);
+    color:var(--text-secondary); font-size:12px; line-height:16px; font-weight:600;
   }
   .flex { display:flex; gap:8px; align-items:center; }
   ul.tight { margin:6px 0; padding-left:18px; }
-  code { background:#edf4f1; color:#12251f; }
+  code { background:var(--bg-input); color:var(--text-heading); }
   .err { color:var(--danger); font-size:13px; }
   @media (max-width: 860px) {
     main.dashboard { grid-template-columns:1fr; }
@@ -235,6 +252,9 @@
         <div class="brand-mark">JobScout</div>
         <div class="account">{{ user.email }}</div>
       </div>
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
     </div>
     <nav class="nav-stack" aria-label="Dashboard">
       <div class="nav-section">
@@ -341,15 +361,15 @@
         </div>
         <div id="runGate" class="muted" style="margin-top:8px;"></div>
         <div id="evalBanner" style="display:none; margin-top:12px; padding:10px 12px;
-             border:1px solid var(--line); background:var(--surface-soft); color:#2a3a34;
+             border:1px solid var(--line); background:var(--bg-tag); color:var(--text-secondary);
              border-radius:8px; font-size:13px;"></div>
         <div id="llmErrorBanner" style="display:none; margin-top:12px; padding:10px 12px;
-             border:1px solid var(--danger); background:#fdecea; color:var(--danger);
+             border:1px solid var(--border-error); background:var(--bg-badge-error); color:var(--text-error);
              border-radius:8px; font-size:13px;"></div>
         <div id="jobMeta" class="stat-line" style="margin-top:14px;"></div>
         <div id="jobWarnings"></div>
       </div>
-      <div class="surface">
+      <div class="job-list-shell">
         <div id="jobList"></div>
         <div id="pager" class="pager" style="display:none;">
           <button id="prevPage" class="ghost page-num" onclick="prevPage()">‹ Prev</button>
@@ -807,6 +827,15 @@ function fmtListed(value){
   return `Listed ${d.toLocaleDateString([], {dateStyle:"medium"})}`;
 }
 
+function companyInitial(name){
+  const trimmed = (name || "").trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() : "?";
+}
+
+function companyMark(name){
+  return `<div class="company-mark" aria-hidden="true">${esc(companyInitial(name))}</div>`;
+}
+
 async function logout(){ await api("/api/auth/logout",{method:"POST"}); window.location="/login"; }
 
 // ── Account (change password) ──
@@ -982,14 +1011,14 @@ async function toggleResumePreview(id){
   const name = ((activeResume && activeResume.filename) || "").toLowerCase();
   if(name.endsWith(".pdf")){
     box.innerHTML = `<iframe title="Resume preview" src="/api/resumes/${id}/file"
-      style="width:100%; height:78vh; border:1px solid var(--line); border-radius:8px; background:#fff;"></iframe>`;
+      style="width:100%; height:78vh; border:1px solid var(--line); border-radius:8px; background:var(--bg-surface);"></iframe>`;
     return;
   }
   box.innerHTML = '<div class="muted">Loading preview…</div>';
   const r = await api(`/api/resumes/${id}/content`);
   if(!r.ok){ box.innerHTML = '<div class="empty">Could not load a preview.</div>'; return; }
   const data = await r.json();
-  box.innerHTML = `<pre style="white-space:pre-wrap; word-wrap:break-word; background:#fbfdfc;
+  box.innerHTML = `<pre style="white-space:pre-wrap; word-wrap:break-word; background:var(--bg-input);
     border:1px solid var(--line); border-radius:8px; padding:14px; max-height:78vh; overflow:auto;">${esc(data.content_text || "")}</pre>`;
 }
 
@@ -1075,7 +1104,7 @@ async function addCompany(){
 function accountTag(x){
   if(!x.requires_account){ return ""; }
   return x.account_attached
-    ? '<span class="pill" style="background:#e6f4ec; color:var(--good);">account attached</span>'
+    ? '<span class="pill good">account attached</span>'
     : '<span class="pill warn">account needed</span>';
 }
 
@@ -1105,16 +1134,29 @@ function interestBody(){
     min_score:parseInt(val("iMin")||"70")};
 }
 
+// Fields that change *what the LLM matches against* (mirrors the API's _SCORING_FIELDS).
+// Editing only the report threshold (min_score) or label doesn't — it just re-filters
+// the existing results, so it must not trigger a scrape/re-score.
+const SCORING_INTEREST_FIELDS = ["title_keywords", "locations", "seniority", "exclude_keywords", "notes"];
+
 async function saveInterest(){
   const body = interestBody();
   if(!body.label){ alert("Give the interest a label."); return; }
+  const prev = editingInterestId ? interestsById[editingInterestId] : null;
   const r = editingInterestId
     ? await api(`/api/interests/${editingInterestId}`,{method:"PATCH", body:JSON.stringify(body)})
     : await api("/api/interests",{method:"POST", body:JSON.stringify(body)});
   if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Failed"); return; }
   resetInterestForm();
   await loadInterests();
-  markRescorePending();
+  const criteriaChanged = !prev || SCORING_INTEREST_FIELDS.some(f => (body[f]||"") !== (prev[f]||""));
+  if(criteriaChanged){
+    markRescorePending();
+  } else {
+    // Only the threshold/label changed: re-filter the already-scored results against the
+    // new min_score (the server applies it live when building the list) — no scan needed.
+    loadJobList();
+  }
 }
 
 function editInterest(id){
@@ -1439,21 +1481,27 @@ function renderJobList(data){
     const strengths = m.strengths || [];
     const gaps = m.gaps || [];
     const head = m.non_matching
-      ? '<span class="pill" style="background:#f6e4e4; color:var(--danger);">not a match</span>'
-      : `<div class="score">${m.match_score}/100 · win ${m.win_probability}%</div>`;
+      ? '<span class="pill bad">not a match</span>'
+      : `<div class="score-block">
+          <div class="score-number">${m.match_score}<span class="score-suffix">/100</span></div>
+          <div class="score-win">win ${m.win_probability}%</div>
+        </div>`;
     // Pay range (when the posting disclosed one) sits under the score on the right, so
     // the meta line stays short and the two "numbers about this job" read together.
     const salary = m.salary_display ? `<div class="salary">${esc(m.salary_display)}</div>` : "";
     const listed = fmtListed(m.listed_at);
     return `<article class="job-row">
       <div class="job-head">
-        <div>
-          <div class="job-title"><a href="/positions/${m.position_id}">${esc(m.title)}</a></div>
-          <div class="job-meta">${esc(m.company)}${m.location?` · ${esc(m.location)}`:""}${listed?` · ${esc(listed)}`:""}</div>
+        <div class="job-main">
+          ${companyMark(m.company)}
+          <div>
+            <div class="job-title"><a href="/positions/${m.position_id}">${esc(m.title)}</a></div>
+            <div class="job-meta">${esc(m.company)}${m.location?` · ${esc(m.location)}`:""}${listed?` · ${esc(listed)}`:""}</div>
+          </div>
         </div>
         <div class="job-head-right">${head}${salary}</div>
       </div>
-      ${m.removed ? '<span class="pill" style="background:#eceff1; color:var(--muted);">✕ Closed — no longer listed</span>' : ""}
+      ${m.removed ? '<span class="pill neutral">Closed — no longer listed</span>' : ""}
       ${(!m.non_matching && m.below_threshold) ? '<span class="pill warn">below threshold</span>' : ""}
       ${m.reasoning ? `<div>${esc(m.reasoning)}</div>` : ""}
       ${strengths.length ? `<div class="muted">Strengths</div><ul class="tight">${strengths.map(s=>`<li>${esc(s)}</li>`).join("")}</ul>` : ""}

@@ -27,7 +27,7 @@ class GoodClient:
         self.score = score
         self.calls = 0
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         self.calls += 1
         if "results" in schema.get("properties", {}):
             n = user.count("### Posting ")
@@ -463,6 +463,62 @@ def test_delete_interest_with_matches_cascades():
         db.delete(db.scalar(matcher.select(models.Interest)))  # must not raise
     with session_scope() as db:
         assert db.scalar(matcher.select(models.MatchResult)) is None
+
+
+def test_interest_min_score_change_keeps_matches_and_skips_rescore(monkeypatch):
+    """Editing only the report threshold (min_score) must not drop the interest's
+    matches or kick a re-evaluation: the new threshold is applied live when the list /
+    report is built, so existing results just get re-filtered. The edit form re-sends
+    every field, so this also proves presence-in-payload alone doesn't count as a change."""
+    from app.routers.interests import update_interest
+    from app.schemas import InterestUpdate
+
+    kicked: list[int] = []
+    monkeypatch.setattr("app.routers.interests.evaluator.ensure_running", lambda uid: kicked.append(uid))
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:
+        interest = db.scalar(matcher.select(models.Interest))
+        assert db.scalar(matcher.select(models.MatchResult)) is not None
+        # Re-send the whole form (as the UI does), nudging only min_score.
+        update_interest(interest.id, InterestUpdate(
+            label=interest.label, title_keywords=interest.title_keywords,
+            locations=interest.locations, seniority=interest.seniority,
+            employment_type=interest.employment_type, exclude_keywords=interest.exclude_keywords,
+            notes=interest.notes, min_score=interest.min_score + 5,
+        ), user=db.get(models.User, uid), db=db)
+    with session_scope() as db:
+        assert db.scalar(matcher.select(models.MatchResult)) is not None  # not dropped
+        assert db.scalar(matcher.select(models.Interest)).min_score == 75  # threshold updated
+    assert kicked == []  # no re-evaluation kicked
+
+
+def test_interest_criteria_change_drops_matches_and_kicks_rescore(monkeypatch):
+    """Editing a scoring field (here title_keywords) drops the interest's matches so
+    every posting is re-screened against the new criteria, and kicks the re-evaluation."""
+    from app.routers.interests import update_interest
+    from app.schemas import InterestUpdate
+
+    kicked: list[int] = []
+    monkeypatch.setattr("app.routers.interests.evaluator.ensure_running", lambda uid: kicked.append(uid))
+
+    with session_scope() as db:
+        uid = _seed_user(db)
+    with session_scope() as db:
+        matcher.run_for_user(db, db.get(models.User, uid), client=GoodClient(), filter_client=FilterPass())
+    with session_scope() as db:
+        interest = db.scalar(matcher.select(models.Interest))
+        assert db.scalar(matcher.select(models.MatchResult)) is not None
+        update_interest(interest.id, InterestUpdate(
+            label=interest.label, title_keywords="frontend",  # was "backend"
+            locations=interest.locations, min_score=interest.min_score,
+        ), user=db.get(models.User, uid), db=db)
+    with session_scope() as db:
+        assert db.scalar(matcher.select(models.MatchResult)) is None  # dropped for re-screen
+    assert kicked == [uid]  # re-evaluation kicked
 
 
 def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
@@ -2331,6 +2387,49 @@ def test_crawl_presets_populates_shared_positions(monkeypatch):
         assert all(db.get(models.Company, p.company_id).is_preset for p in positions)
 
 
+def test_crawl_presets_spreads_companies_over_window(monkeypatch):
+    """The crawl paces companies across scrape_preset_spread_minutes instead of firing
+    every board at once: the first crawls immediately, then an even gap between each."""
+    from app.company_presets import PRESETS
+    from app.config import settings
+    from app.db import seed_presets
+    from app.services import crawler
+
+    n = len(PRESETS)
+    monkeypatch.setattr(settings, "scrape_preset_spread_minutes", n - 1)  # 60s/gap
+    monkeypatch.setattr(settings, "scrape_preset_spread_jitter", 0.0)     # exact spacing
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: [])
+    gaps: list[float] = []
+    monkeypatch.setattr(crawler._stop, "wait", lambda t: gaps.append(t) or False)
+    with session_scope() as db:
+        seed_presets(db)
+
+    crawler.crawl_presets()
+
+    # One gap between each consecutive pair (first immediate, last unpaced), all even.
+    assert len(gaps) == n - 1
+    assert all(abs(g - 60.0) < 1e-6 for g in gaps)
+
+
+def test_crawl_presets_stops_pacing_on_shutdown(monkeypatch):
+    """A set _stop (shutdown) breaks the inter-company wait so the crawl ends promptly
+    instead of sleeping out the rest of the window."""
+    from app.config import settings
+    from app.db import seed_presets
+    from app.services import crawler
+
+    monkeypatch.setattr(settings, "scrape_preset_spread_minutes", 30)
+    monkeypatch.setattr(matcher.scraper, "scrape_company", lambda c: [])
+    monkeypatch.setattr(crawler._stop, "wait", lambda t: True)  # shutdown signalled
+    with session_scope() as db:
+        seed_presets(db)
+
+    summary = crawler.crawl_presets()
+
+    # Broke out after the first company's gap; the rest were skipped.
+    assert summary["interrupted"] is True and summary["companies"] == 1
+
+
 def test_user_scan_does_not_crawl_presets(monkeypatch):
     from app.db import seed_presets
 
@@ -2556,7 +2655,7 @@ class KitClient:
         self.json_calls = 0
         self.text_calls = 0
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         self.json_calls += 1
         if "resume_markdown" in schema.get("properties", {}):
             return {"resume_markdown": "# Jane Doe\n\n## Experience\n- Built Python APIs",
@@ -2679,6 +2778,9 @@ def test_position_detail_endpoint_returns_best_match(monkeypatch):
         assert d["position_id"] == pid and d["title"] == "Backend Engineer"
         assert d["match_score"] == 88 and d["non_matching"] is False
         assert d["strengths"] == ["Python"] and d["applied"] is False
+        assert [x["label"] for x in d["score_breakdown"]] == [
+            "Vertical experience", "Skills overlap", "Seniority fit", "Location fit", "Preferences"
+        ]
         assert d["kit"] is None  # nothing generated yet
 
 

@@ -57,12 +57,18 @@ def mint(
     *,
     max_uses: int = 1,
     expires_in_days: int | None = None,
+    expires_in: timedelta | None = None,
     note: str | None = None,
     count: int = 1,
 ) -> list[str]:
     """Create ``count`` invite codes and return their plaintext (shown once — they
-    can't be recovered later). ``expires_in_days=None`` mints non-expiring codes."""
-    expires_at = utcnow() + timedelta(days=expires_in_days) if expires_in_days else None
+    can't be recovered later). Pass ``expires_in`` (a ``timedelta``, e.g. from
+    ``timeutil.parse_duration("24h")``) for sub-day precision, or ``expires_in_days``
+    for the whole-day shorthand; ``expires_in`` wins if both are given. Neither (the
+    default) mints non-expiring codes."""
+    if expires_in is None and expires_in_days:
+        expires_in = timedelta(days=expires_in_days)
+    expires_at = utcnow() + expires_in if expires_in else None
     codes: list[str] = []
     for _ in range(max(1, count)):
         plaintext, code_hash = generate()

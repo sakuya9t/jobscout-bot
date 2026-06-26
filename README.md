@@ -108,10 +108,15 @@ Registration is **invite-gated** by default (`JOBSCOUT_REQUIRE_INVITE=1`). Mint 
 from the CLI — only an HMAC of each code is stored (derived from `JOBSCOUT_SECRET_KEY`),
 so the DB never holds a usable code or the key:
 ```bash
-jobscout invite mint --max-uses 5 --expires-days 30 --count 3   # prints codes once
+jobscout invite mint --count 1 --max-uses 1 --expiry 24h        # single-use, 24h
+jobscout invite mint --count 3 --max-uses 5 --expiry 30d        # also: 30m, 7d, 2w, 1d12h
 jobscout invite list                                            # uses/expiry/state
 jobscout invite revoke <id|code>
 ```
+`--expiry` takes a unit duration (`30m`/`24h`/`7d`/`2w`/compound `1d12h`); the older
+`--expires-days N` whole-day form still works. On the deployed server, run these from the
+repo root via the bundled wrapper — `./jobscout invite mint …` — which needs no venv
+activation and reuses the console's injected env (see [docs/DEPLOY.md](docs/DEPLOY.md#admin-commands-on-the-deployed-console)).
 Set `JOBSCOUT_REQUIRE_INVITE=0` for open registration (local dev). The app also applies
 in-process per-IP **rate limits** (a global blanket plus stricter caps on login/register)
 to blunt brute-force and DoS. On DigitalOcean App Platform there's no edge WAF in front,

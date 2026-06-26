@@ -2,6 +2,38 @@
 
 Project-level infrastructure history, newest first. Concise by design — see git for detail.
 
+## 2026-06 — Admin CLI ergonomics for the deployed console
+- Added a committed, executable `./jobscout` wrapper that execs `python -m app.cli` from
+  the repo root — so admin commands run on the DigitalOcean App Platform console (or
+  locally) with no venv activation and no `jobscout`-on-PATH install. The console already
+  carries the app's env vars, so `./jobscout invite mint …` hits the real Postgres and
+  mints valid codes with nothing to export (see docs/DEPLOY.md).
+- `invite mint` gained `--expiry` accepting unit durations (`30m`/`24h`/`7d`/`2w`/compound
+  `1d12h`) for sub-day precision; the whole-day `--expires-days` still works. `invites.mint`
+  takes an `expires_in: timedelta` alongside the back-compat `expires_in_days`.
+- `invite mint` now warns on stderr when it's about to mint with the built-in dev secret —
+  catching the footgun of running it without `JOBSCOUT_SECRET_KEY` (codes that the real
+  deployment can't validate). New `timeutil.parse_duration` helper + tests.
+
+## 2026-06 — Stabilize match scoring (deterministic + derived headline)
+- The same posting could swing 30+ points between identical scoring calls. Two fixes:
+  (1) the scoring call now runs at `temperature=0` with a fixed `JOBSCOUT_SCORE_SEED`
+  (default 11) so a single sample is reproducible — cover-letter/résumé generation is
+  deliberately left stochastic; (2) the headline `match_score` is now derived in code as
+  a fixed weighted average of the five rubric sub-scores (vertical 0.35 / skills 0.25 /
+  seniority 0.20 / location 0.10 / preferences 0.10) instead of trusting the model's
+  volatile free-form number — see `matcher._derive_match_score`.
+- The model's own number is kept only as a fallback when the breakdown maps fewer than 4
+  of the 5 aspects, and a `matches_requirements=False` verdict caps the headline at 40.
+
+## 2026-06 — Decouple deploy from reconcile; load-balance the preset crawl
+- Startup scoring resume (`scoring_queue.reconcile`) now runs on a background thread
+  instead of inline in the app lifespan, so a push no longer blocks readiness on a full
+  queue reconcile — deploy and reconcile are independent.
+- The shared preset crawl is spread across `JOBSCOUT_SCRAPE_PRESET_SPREAD_MINUTES`
+  (default 30) with `_JITTER` (default 0.3) rather than hitting every board back-to-back;
+  the burst stays bounded as the preset list grows.
+
 ## 2026-06 — Database: Supabase → DigitalOcean Managed Postgres
 - Production DB moved to DigitalOcean Managed Postgres, attached to the App Platform app
   (`JOBSCOUT_DATABASE_URL=${db.DATABASE_URL}`). App is DB-agnostic (SQLAlchemy/psycopg2),

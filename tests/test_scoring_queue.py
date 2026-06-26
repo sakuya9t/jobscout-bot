@@ -21,7 +21,7 @@ from app.timeutil import utcnow
 class GoodClient:
     model = "fake-good"
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         n = user.count("### Posting ")
         return {
             "results": [
@@ -46,7 +46,7 @@ class IncompleteScore:
     each pair gets an error-marker (the incomplete-batch failure mode)."""
     model = "fake-incomplete"
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         return {"results": []}
 
 

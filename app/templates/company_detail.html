@@ -3,30 +3,29 @@
 {% block body %}
 <style>
   :root {
-    --page:#f3f6f5; --surface:#ffffff; --surface-soft:#edf4f1; --ink:#17211d;
-    --muted:#68746e; --line:#d8e0dc; --accent:#0f766e; --accent-ink:#f5fffd;
-    --amber:#b76b00; --danger:#b42318; --good:#157347;
+    --page:var(--bg-page); --surface:var(--bg-surface); --surface-soft:var(--bg-tag); --ink:var(--text-heading);
+    --muted:var(--text-secondary); --line:var(--border-default); --accent:var(--brand-primary); --accent-ink:var(--text-on-primary);
+    --amber:var(--text-warning); --danger:var(--text-error); --good:var(--text-success);
   }
-  body { background:var(--page); color:var(--ink); }
-  a { color:var(--accent); }
+  body { background:var(--page); color:var(--text-body); }
+  a { color:var(--text-link); }
   header { display:none; }
-  button { background:var(--accent); color:var(--accent-ink); border-radius:8px;
-    border:0; padding:9px 16px; font-weight:600; cursor:pointer; }
-  button:disabled { opacity:.55; cursor:not-allowed; }
-  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
-  button.danger { background:transparent; color:var(--danger); border:1px solid #e7c3bf; }
+  button { background:var(--interactive-primary-bg); color:var(--accent-ink); border-radius:8px; }
+  button.ghost { background:transparent; color:var(--text-secondary); border:1px solid var(--line); }
+  button.danger { background:transparent; color:var(--danger); border:1px solid var(--border-error); }
   input, textarea {
-    background:#fbfdfc; border:1px solid var(--line); border-radius:8px; color:var(--ink);
+    background:var(--bg-input); border:1.5px solid var(--border-strong); border-radius:8px; color:var(--text-body);
     width:100%; padding:9px 11px; font:inherit; box-sizing:border-box;
   }
   label { color:var(--muted); display:block; font-size:13px; margin-bottom:5px; }
   main.detail { max-width:760px; margin:0 auto; padding:26px clamp(16px, 3vw, 32px); }
   .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
-  .brand-mark { font-size:20px; font-weight:800; }
+  .top-actions { display:flex; align-items:center; justify-content:flex-end; gap:12px; }
+  .brand-mark { color:var(--brand-primary); font-size:20px; font-weight:800; }
   .back { font-size:14px; }
   .surface {
-    background:var(--surface); border:1px solid var(--line); border-radius:10px;
-    padding:20px; margin-bottom:16px;
+    background:var(--surface); border:1px solid var(--line); border-radius:16px;
+    padding:24px; margin-bottom:16px; box-shadow:var(--shadow-sm);
   }
   h1 { margin:0 0 6px; font-size:23px; line-height:1.25; }
   h2 { margin:0 0 4px; font-size:17px; }
@@ -35,10 +34,10 @@
   .head-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
   .pill {
     display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px;
-    font-size:12px; background:#eef7f5; color:var(--accent);
+    font-size:12px; font-weight:600; background:var(--bg-tag); color:var(--brand-primary);
   }
-  .pill.warn { background:#fff4df; color:var(--amber); }
-  .pill.good { background:#e6f4ec; color:var(--good); }
+  .pill.warn { background:var(--bg-badge-warning); color:var(--text-warning); }
+  .pill.good { background:var(--bg-badge-success); color:var(--text-success); }
   .field { margin-bottom:14px; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
   .actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:6px; }
@@ -48,16 +47,21 @@
     vertical-align:-2px; margin-right:7px;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:#fbfdfc; }
-  .errbox { border:1px solid var(--danger); background:#fdecea; color:var(--danger); border-radius:8px; padding:12px 14px; }
-  .note { background:var(--surface-soft); border-radius:8px; padding:12px 14px; color:#2a3a34; font-size:14px; }
+  .empty { border:1px dashed var(--line); border-radius:8px; padding:18px; color:var(--muted); background:var(--bg-input); }
+  .errbox { border:1px solid var(--border-error); background:var(--bg-badge-error); color:var(--text-error); border-radius:8px; padding:12px 14px; }
+  .note { background:var(--surface-soft); border-radius:8px; padding:12px 14px; color:var(--text-body); font-size:14px; }
   @media (max-width: 560px) { .row { grid-template-columns:1fr; } }
 </style>
 
 <main class="detail">
   <div class="topbar">
     <div class="brand-mark">JobScout</div>
-    <a class="back" href="/#companies">← Back to watchlist</a>
+    <div class="top-actions">
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
+      <a class="back" href="/#companies">← Back to watchlist</a>
+    </div>
   </div>
 
   <div id="content">

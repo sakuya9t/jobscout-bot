@@ -1,0 +1,417 @@
+{% extends "base.html" %}
+{% block title %}JobScout · AI-Powered Job Scout{% endblock %}
+{% block body %}
+<style>
+  .landing-shell {
+    min-height:100vh;
+    background:var(--bg-page);
+    overflow:hidden;
+  }
+  .landing-nav {
+    position:sticky; top:0; z-index:20; height:64px; display:flex; align-items:center;
+    justify-content:space-between; max-width:1200px; margin:0 auto; padding:0 24px;
+    background:color-mix(in srgb, var(--bg-page) 88%, transparent);
+    backdrop-filter:blur(14px);
+  }
+  .landing-brand { color:var(--brand-primary); font-size:20px; font-weight:800; text-decoration:none; }
+  .landing-links { display:flex; align-items:center; gap:28px; font-size:13px; font-weight:500; }
+  .landing-actions { display:flex; align-items:center; gap:12px; }
+  .landing-actions .ghost { border:0; padding-inline:10px; }
+  .landing-hero {
+    position:relative; min-height:calc(100svh - 132px); display:grid; align-items:center;
+    padding:56px 24px 48px; isolation:isolate;
+  }
+  .landing-hero::before {
+    content:""; position:absolute; inset:0; z-index:-3;
+    background:
+      linear-gradient(90deg, var(--bg-page) 0%, color-mix(in srgb, var(--bg-page) 86%, transparent) 39%, color-mix(in srgb, var(--bg-page) 34%, transparent) 100%),
+      var(--bg-page);
+  }
+  .landing-hero::after {
+    content:""; position:absolute; inset:auto -12% -34% -12%; height:42%;
+    z-index:-1; background:linear-gradient(180deg, transparent, var(--bg-page) 74%);
+  }
+  .hero-scene {
+    position:absolute; z-index:-2; top:28px; left:calc(50vw - 20px);
+    width:min(780px, 54vw); height:min(600px, calc(100svh - 170px));
+    min-width:680px; opacity:.96;
+  }
+  .hero-copy { max-width:1200px; width:100%; margin:0 auto; }
+  .hero-copy-inner { width:min(560px, 100%); }
+  .eyebrow {
+    display:inline-flex; align-items:center; min-height:28px; padding:4px 10px;
+    border-radius:999px; background:var(--bg-tag); color:var(--brand-primary);
+    font-size:12px; line-height:16px; font-weight:700; margin-bottom:18px;
+  }
+  .hero-copy h1 {
+    margin:0; max-width:560px; color:var(--text-heading);
+    font-size:56px; line-height:62px; font-weight:800;
+  }
+  .hero-copy p {
+    max-width:520px; margin:18px 0 0; color:var(--text-secondary);
+    font-size:16px; line-height:28px;
+  }
+  .hero-actions { display:flex; flex-wrap:wrap; gap:14px; margin-top:28px; }
+  .hero-actions button, .hero-actions a { min-width:144px; min-height:44px; }
+  .outline-link {
+    display:inline-flex; align-items:center; justify-content:center; padding:11px 22px;
+    border:1.5px solid var(--interactive-outline-border); border-radius:8px;
+    color:var(--interactive-outline-text); font-weight:600; font-size:14px;
+  }
+  .outline-link:hover { background:var(--interactive-outline-hover-bg); text-decoration:none; }
+  .hero-mini-proof {
+    display:flex; flex-wrap:wrap; gap:14px; margin-top:32px; color:var(--text-secondary);
+    font-size:12px; line-height:18px;
+  }
+  .hero-mini-proof span {
+    display:inline-flex; align-items:center; gap:7px; padding:7px 9px;
+    border:1px solid var(--border-default); border-radius:999px; background:var(--bg-surface);
+  }
+  .hero-mini-proof span::before {
+    content:""; width:7px; height:7px; border-radius:50%; background:var(--brand-primary);
+  }
+  .product-frame {
+    height:100%; min-height:440px;
+    border:1px solid var(--border-default); border-radius:18px; overflow:hidden;
+    background:var(--bg-surface); box-shadow:var(--shadow-xl);
+    transform:perspective(1200px) rotateY(-8deg) rotateX(2deg);
+    transform-origin:left center;
+  }
+  [data-theme="dark"] .product-frame {
+    box-shadow:0 0 0 1px rgba(129,140,248,.18), 0 24px 60px rgba(0,0,0,.62);
+  }
+  .browser-bar {
+    height:36px; display:grid; grid-template-columns:auto 1fr auto; align-items:center;
+    gap:18px; padding:0 12px; border-bottom:1px solid var(--border-default);
+    background:var(--bg-surface-raised);
+  }
+  .browser-dots { display:flex; gap:6px; }
+  .browser-dots span { width:8px; height:8px; border-radius:50%; display:block; }
+  .browser-dots span:nth-child(1) { background:#F87171; }
+  .browser-dots span:nth-child(2) { background:#FBBF24; }
+  .browser-dots span:nth-child(3) { background:#34D399; }
+  .browser-url {
+    justify-self:center; width:min(300px, 70%); height:18px; border-radius:999px;
+    background:var(--bg-input); color:var(--text-secondary); font-size:10px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .preview-app { display:grid; grid-template-columns:160px 1fr; min-height:calc(100% - 36px); }
+  .preview-side {
+    border-right:1px solid var(--border-default); padding:20px 14px; background:var(--bg-sidebar);
+  }
+  .preview-logo { color:var(--brand-primary); font-size:14px; font-weight:800; margin-bottom:6px; }
+  .preview-email { color:var(--text-secondary); font-size:10px; margin-bottom:20px; overflow:hidden; text-overflow:ellipsis; }
+  .preview-section { color:var(--text-sidebar-section); font-size:9px; font-weight:700; text-transform:uppercase; margin:16px 8px 7px; }
+  .preview-nav { display:grid; gap:6px; }
+  .preview-nav span {
+    height:28px; display:flex; align-items:center; padding:0 9px; border-radius:0 8px 8px 0;
+    color:var(--text-sidebar-inactive); font-size:11px;
+  }
+  .preview-nav span:first-child {
+    background:var(--bg-sidebar-active); color:var(--text-sidebar-active);
+    box-shadow:inset 3px 0 0 var(--border-sidebar-active);
+  }
+  .preview-main { padding:20px; min-width:0; }
+  .preview-top {
+    display:flex; align-items:flex-start; justify-content:space-between; gap:16px;
+    border-bottom:1px solid var(--border-default); padding-bottom:16px; margin-bottom:16px;
+  }
+  .preview-title { color:var(--text-heading); font-size:18px; font-weight:800; }
+  .preview-subtitle { color:var(--text-secondary); font-size:11px; margin-top:2px; }
+  .preview-run {
+    min-height:32px; padding:7px 12px; border-radius:8px; background:var(--interactive-primary-bg);
+    color:var(--text-on-primary); font-size:11px; font-weight:700; white-space:nowrap;
+  }
+  .preview-filters {
+    display:grid; grid-template-columns:repeat(4, 1fr); gap:10px;
+    margin-bottom:14px;
+  }
+  .preview-filter {
+    min-height:44px; border:1px solid var(--border-default); border-radius:10px;
+    padding:8px 10px; background:var(--bg-input);
+  }
+  .preview-filter small { display:block; color:var(--text-secondary); font-size:9px; }
+  .preview-filter b { display:block; color:var(--text-heading); font-size:11px; margin-top:2px; }
+  .preview-stats { display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin-bottom:14px; }
+  .preview-stat {
+    border:1px solid var(--border-default); border-radius:10px; padding:10px;
+    background:var(--bg-surface-raised);
+  }
+  .preview-stat b { display:block; color:var(--text-heading); font-size:17px; }
+  .preview-stat small { color:var(--text-secondary); font-size:10px; }
+  .preview-list { display:grid; gap:12px; }
+  .preview-job {
+    display:grid; grid-template-columns:42px 1fr auto; gap:12px; align-items:center;
+    border:1px solid var(--border-default); border-left:4px solid transparent;
+    border-radius:14px; padding:13px; background:var(--bg-surface);
+    box-shadow:var(--shadow-xs);
+  }
+  .preview-job:first-child { border-left-color:var(--brand-primary); }
+  .preview-mark {
+    width:42px; height:42px; border-radius:10px; display:grid; place-items:center;
+    background:var(--bg-tag); color:var(--brand-primary); font-weight:800;
+  }
+  .preview-job b { display:block; color:var(--text-heading); font-size:13px; }
+  .preview-job small { color:var(--text-secondary); font-size:10px; }
+  .preview-job-score { text-align:right; }
+  .preview-job-score b { color:var(--text-score-primary); font-size:22px; }
+  .preview-job-score small { display:block; color:var(--text-score-secondary); font-weight:700; }
+  .proof-band {
+    max-width:1200px; margin:0 auto; padding:0 24px 52px;
+    display:grid; grid-template-columns:repeat(4, 1fr); gap:12px;
+  }
+  .proof-item {
+    border:1px solid var(--border-default); border-radius:14px; padding:16px;
+    background:var(--bg-surface); box-shadow:var(--shadow-xs);
+  }
+  .proof-item b { display:block; color:var(--text-heading); font-size:20px; line-height:28px; }
+  .proof-item span { color:var(--text-secondary); font-size:12px; line-height:18px; }
+  .section {
+    max-width:1200px; margin:0 auto; padding:48px 24px;
+  }
+  .section-head { max-width:650px; margin-bottom:22px; }
+  .section-head h2 { margin:0; font-size:30px; line-height:38px; }
+  .section-head p { margin:10px 0 0; color:var(--text-secondary); font-size:14px; line-height:24px; }
+  .workflow {
+    display:grid; grid-template-columns:repeat(3, 1fr); gap:16px;
+  }
+  .workflow-step {
+    position:relative; border:1px solid var(--border-default); border-radius:16px;
+    padding:22px; background:var(--bg-surface); box-shadow:var(--shadow-sm);
+  }
+  .step-number {
+    width:32px; height:32px; border-radius:10px; display:grid; place-items:center;
+    background:var(--bg-tag); color:var(--brand-primary); font-weight:800; margin-bottom:18px;
+  }
+  .workflow-step h3, .feature-card h3 { margin:0 0 8px; color:var(--text-heading); font-size:17px; line-height:24px; }
+  .workflow-step p, .feature-card p { margin:0; color:var(--text-secondary); font-size:13px; line-height:22px; }
+  .feature-grid {
+    display:grid; grid-template-columns:repeat(3, 1fr); gap:16px;
+  }
+  .feature-card {
+    background:var(--bg-surface); border:1px solid var(--border-default);
+    border-radius:16px; padding:22px; box-shadow:var(--shadow-sm);
+  }
+  .feature-icon {
+    width:38px; height:38px; border-radius:11px; display:grid; place-items:center;
+    background:var(--bg-tag); color:var(--brand-primary); font-weight:800; margin-bottom:16px;
+  }
+  .cta-band {
+    max-width:1200px; margin:42px auto 0; padding:42px 24px 64px;
+  }
+  .cta-panel {
+    border:1px solid var(--border-default); border-radius:18px; padding:34px;
+    background:var(--brand-primary); color:#fff; display:flex; align-items:center;
+    justify-content:space-between; gap:24px; box-shadow:var(--shadow-lg);
+  }
+  .cta-panel h2 { margin:0; color:#fff; font-size:28px; line-height:36px; }
+  .cta-panel p { margin:8px 0 0; color:rgba(255,255,255,.82); font-size:14px; line-height:24px; }
+  .cta-panel button {
+    background:#fff; color:#4338CA; flex:0 0 auto;
+  }
+  .landing-footer {
+    max-width:1200px; margin:0 auto; padding:22px 24px 34px;
+    display:flex; justify-content:space-between; gap:16px;
+    color:var(--text-secondary); font-size:12px; border-top:1px solid var(--border-default);
+  }
+  @media (max-width: 1000px) {
+    .landing-links { display:none; }
+    .landing-hero { min-height:auto; padding-top:40px; }
+    .hero-scene { position:relative; inset:auto; min-width:0; margin:34px auto 0; width:min(100%, 760px); }
+    .landing-hero::before { background:var(--bg-page); }
+    .product-frame { height:auto; min-height:0; transform:none; }
+    .hero-copy h1 { font-size:44px; line-height:52px; }
+    .proof-band, .workflow, .feature-grid { grid-template-columns:1fr 1fr; }
+  }
+  @media (max-width: 680px) {
+    .landing-nav { padding:0 16px; }
+    .landing-actions .ghost, .landing-links { display:none; }
+    .landing-actions button:not(.theme-toggle) { display:none; }
+    .landing-hero { padding:28px 16px 34px; }
+    .hero-copy h1 { font-size:36px; line-height:42px; }
+    .hero-actions a, .hero-actions button { width:100%; }
+    .hero-mini-proof { display:none; }
+    .hero-scene { height:260px; margin-top:28px; overflow:hidden; }
+    .product-frame { height:260px; }
+    .preview-app { grid-template-columns:1fr; }
+    .preview-side { display:none; }
+    .preview-top, .preview-job { grid-template-columns:1fr; display:grid; }
+    .preview-filters, .preview-stats, .proof-band, .workflow, .feature-grid { grid-template-columns:1fr; }
+    .section, .proof-band, .cta-band, .landing-footer { padding-left:16px; padding-right:16px; }
+    .section { padding-top:36px; padding-bottom:36px; }
+    .cta-panel { display:grid; padding:26px; }
+    .cta-panel button { width:100%; }
+    .landing-footer { display:grid; }
+  }
+</style>
+<div class="landing-shell">
+  <nav class="landing-nav" aria-label="Landing">
+    <a class="landing-brand" href="/">JobScout</a>
+    <div class="landing-links">
+      <a href="#workflow">How it works</a>
+      <a href="#features">Features</a>
+    </div>
+    <div class="landing-actions">
+      <button class="ghost" type="button" onclick="location.href='/login'">Log in</button>
+      <button type="button" onclick="location.href='/register'">Get Started Free</button>
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
+    </div>
+  </nav>
+
+  <main class="landing-hero">
+    <section class="hero-copy">
+      <div class="hero-copy-inner">
+        <div class="eyebrow">Private job search workspace</div>
+        <h1>AI-Powered Job Scout</h1>
+        <p>
+          JobScout scans company career pages, scores every role against your resume,
+          and turns the strongest matches into application-ready next steps.
+        </p>
+        <div class="hero-actions">
+          <button type="button" onclick="location.href='/register'">Start for free</button>
+          <a class="outline-link" href="#workflow">See the workflow</a>
+        </div>
+        <div class="hero-mini-proof" aria-label="Highlights">
+          <span>Bring your own LLM key</span>
+          <span>Ranked job lists</span>
+          <span>Tailored application kits</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="hero-scene" aria-label="JobScout dashboard preview">
+      <div class="product-frame">
+        <div class="browser-bar">
+          <div class="browser-dots"><span></span><span></span><span></span></div>
+          <div class="browser-url">jobscout.app</div>
+          <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+            <span class="sun">☀</span><span class="moon">☾</span>
+          </button>
+        </div>
+        <div class="preview-app">
+          <aside class="preview-side">
+            <div class="preview-logo">JobScout</div>
+            <div class="preview-email">you@example.com</div>
+            <div class="preview-section">Workspace</div>
+            <div class="preview-nav">
+              <span>Job lists</span><span>Resume</span><span>Companies</span><span>Interests</span>
+            </div>
+            <div class="preview-section">Settings</div>
+            <div class="preview-nav"><span>LLM provider</span><span>Telegram</span></div>
+          </aside>
+          <div class="preview-main">
+            <div class="preview-top">
+              <div>
+                <div class="preview-title">Job lists</div>
+                <div class="preview-subtitle">Latest ranked positions from your scans</div>
+              </div>
+              <div class="preview-run">Recalculate matching scores</div>
+            </div>
+            <div class="preview-filters">
+              <div class="preview-filter"><small>Saved list</small><b>Latest</b></div>
+              <div class="preview-filter"><small>Posted within</small><b>7 days</b></div>
+              <div class="preview-filter"><small>Company</small><b>All companies</b></div>
+              <div class="preview-filter"><small>Sort by</small><b>Best match</b></div>
+            </div>
+            <div class="preview-stats">
+              <div class="preview-stat"><b>17</b><small>new roles</small></div>
+              <div class="preview-stat"><b>94</b><small>model-scored</small></div>
+              <div class="preview-stat"><b>5</b><small>top matches</small></div>
+              <div class="preview-stat"><b>2</b><small>watch-outs</small></div>
+            </div>
+            <div class="preview-list">
+              <div class="preview-job">
+                <div class="preview-mark">N</div>
+                <div><b>ML and Agentic Systems Engineer</b><small>NVIDIA · Santa Clara · 3 days ago</small></div>
+                <div class="preview-job-score"><b>98/100</b><small>win 90%</small></div>
+              </div>
+              <div class="preview-job">
+                <div class="preview-mark">A</div>
+                <div><b>Senior LLM Release Engineer</b><small>Apple · Seattle · 2 days ago</small></div>
+                <div class="preview-job-score"><b>92/100</b><small>win 82%</small></div>
+              </div>
+              <div class="preview-job">
+                <div class="preview-mark">S</div>
+                <div><b>Staff Backend Engineer</b><small>Stripe · Remote · today</small></div>
+                <div class="preview-job-score"><b>86/100</b><small>win 72%</small></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section class="proof-band" aria-label="JobScout outcomes">
+    <div class="proof-item"><b>Scan</b><span>Watch company boards without manually checking every careers page.</span></div>
+    <div class="proof-item"><b>Score</b><span>Compare roles against your resume, seniority, location, and preferences.</span></div>
+    <div class="proof-item"><b>Rank</b><span>Keep a focused shortlist instead of another noisy spreadsheet.</span></div>
+    <div class="proof-item"><b>Apply</b><span>Generate role-specific materials when a job is worth your time.</span></div>
+  </section>
+
+  <section id="workflow" class="section">
+    <div class="section-head">
+      <h2>From watchlist to shortlist in one loop</h2>
+      <p>JobScout keeps the repetitive parts quiet so you can spend your attention on the roles with real upside.</p>
+    </div>
+    <div class="workflow">
+      <article class="workflow-step">
+        <div class="step-number">1</div>
+        <h3>Add your source of truth</h3>
+        <p>Upload a resume, choose companies to watch, and describe the roles you actually want.</p>
+      </article>
+      <article class="workflow-step">
+        <div class="step-number">2</div>
+        <h3>Run a ranked scan</h3>
+        <p>New postings are screened, scored, and grouped by fit so the strongest options surface first.</p>
+      </article>
+      <article class="workflow-step">
+        <div class="step-number">3</div>
+        <h3>Open the match</h3>
+        <p>Review the score breakdown, winning signals, risks, and generate a tailored application kit.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="features" class="section">
+    <div class="section-head">
+      <h2>Built for deliberate job hunting</h2>
+      <p>Everything in the dashboard is designed for repeated use: compact, scannable, and grounded in your own profile.</p>
+    </div>
+    <div class="feature-grid">
+      <article class="feature-card">
+        <div class="feature-icon">AI</div>
+        <h3>Match scoring</h3>
+        <p>See an overall score plus sub-scores for vertical experience, skills, seniority, location, and preferences.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">CV</div>
+        <h3>Application kits</h3>
+        <p>Generate cover letters, revised resumes, and draft answers based on the role and your resume.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">HQ</div>
+        <h3>Company watchlists</h3>
+        <p>Follow preset or custom companies and keep fresh postings in a single ranked workspace.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="cta-band">
+    <div class="cta-panel">
+      <div>
+        <h2>Start with one resume and one company list.</h2>
+        <p>JobScout will turn the next scan into a ranked set of roles worth reviewing.</p>
+      </div>
+      <button type="button" onclick="location.href='/register'">Get Started Free</button>
+    </div>
+  </section>
+
+  <footer class="landing-footer">
+    <div>JobScout</div>
+    <div>Private by default. Your keys, resume, and job lists stay in your workspace.</div>
+  </footer>
+</div>
+{% endblock %}
