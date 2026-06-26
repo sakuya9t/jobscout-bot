@@ -66,7 +66,7 @@ class FakeLLM:
             "gaps": [],
         }
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         props = schema.get("properties", {})
         if "results" in props:  # batched scoring: one verdict per "### Posting N" block
             n = user.count("### Posting ")

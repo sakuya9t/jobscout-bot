@@ -206,8 +206,14 @@ class OllamaClient:
         user: str,
         schema: dict[str, Any],
         temperature: float = 0.2,
+        seed: int | None = None,
     ) -> dict[str, Any]:
-        """Send a chat request constrained to ``schema`` and return parsed JSON."""
+        """Send a chat request constrained to ``schema`` and return parsed JSON. Pass
+        ``seed`` (with ``temperature=0``) to make the sample reproducible — the scoring
+        path does, so the same posting scores the same way run to run."""
+        options: dict[str, Any] = {"temperature": temperature}
+        if seed is not None:
+            options["seed"] = seed
         payload = self._send({
             "model": self.model,
             "messages": [
@@ -216,7 +222,7 @@ class OllamaClient:
             ],
             "stream": False,
             "format": schema,
-            "options": {"temperature": temperature},
+            "options": options,
         })
         content = payload.get("message", {}).get("content", "")
         try:

@@ -2,6 +2,17 @@
 
 Project-level infrastructure history, newest first. Concise by design — see git for detail.
 
+## 2026-06 — Stabilize match scoring (deterministic + derived headline)
+- The same posting could swing 30+ points between identical scoring calls. Two fixes:
+  (1) the scoring call now runs at `temperature=0` with a fixed `JOBSCOUT_SCORE_SEED`
+  (default 11) so a single sample is reproducible — cover-letter/résumé generation is
+  deliberately left stochastic; (2) the headline `match_score` is now derived in code as
+  a fixed weighted average of the five rubric sub-scores (vertical 0.35 / skills 0.25 /
+  seniority 0.20 / location 0.10 / preferences 0.10) instead of trusting the model's
+  volatile free-form number — see `matcher._derive_match_score`.
+- The model's own number is kept only as a fallback when the breakdown maps fewer than 4
+  of the 5 aspects, and a `matches_requirements=False` verdict caps the headline at 40.
+
 ## 2026-06 — Decouple deploy from reconcile; load-balance the preset crawl
 - Startup scoring resume (`scoring_queue.reconcile`) now runs on a background thread
   instead of inline in the app lifespan, so a push no longer blocks readiness on a full

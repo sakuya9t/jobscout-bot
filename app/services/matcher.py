@@ -723,7 +723,13 @@ def _score_postings(
     prompt = _build_score_prompt(resume, interest, positions, single=single)
     schema = SCORE_ONE_SCHEMA if single else MATCH_BATCH_SCHEMA
     try:
-        data = client.chat_json(SYSTEM_PROMPT, prompt, schema)
+        # Deterministic sampling (temperature 0 + fixed seed) so the same posting doesn't
+        # swing between identical calls; the headline score is further stabilized by
+        # deriving it from the rubric sub-scores in _loose_verdict.
+        data = client.chat_json(
+            SYSTEM_PROMPT, prompt, schema,
+            temperature=settings.score_temperature, seed=settings.score_seed,
+        )
     except OllamaBudgetError:
         # Recoverable — don't write error-markers, or these postings would be skipped
         # until clear_failed_markers runs even after the user tops up. Propagate so the
@@ -1145,6 +1151,71 @@ def _loose_breakdown(value) -> list[MatchSubScore]:
     return out[:5]
 
 
+# Headline match_score is computed from the five rubric sub-scores with these fixed
+# weights (sum to 1.0), in the rubric's stated order of importance — vertical experience
+# weighed most. Deriving the number this way instead of trusting the model's free-form
+# match_score is the core stability fix: a narrow per-aspect judgment is far steadier
+# call-to-call than a single holistic gestalt, and the weighted aggregation is itself
+# deterministic. The model's own match_score is kept only as a fallback (see below).
+_ASPECT_WEIGHTS = {
+    "vertical": 0.35,
+    "skills": 0.25,
+    "seniority": 0.20,
+    "location": 0.10,
+    "preferences": 0.10,
+}
+# Derive only when the breakdown covers most of the rubric (>= this many of the five
+# aspects). A sparse breakdown (one or two aspects) can't carry a trustworthy weighted
+# score, so we fall back to the model's holistic number rather than extrapolate from it.
+_MIN_DERIVE_ASPECTS = 4
+# A hard-requirement violation (wrong location/seniority/excluded keyword → the model set
+# matches_requirements=False) caps the headline, so a disqualified role can't show a high
+# green score even when its skill/experience aspects rate well.
+_HARD_FAIL_CAP = 40
+
+
+def _aspect_key(label: str) -> str | None:
+    """Map a (possibly drifting) breakdown label to one of the five canonical rubric
+    aspects, or None if it matches none. Checked most-specific first so 'Vertical
+    experience' lands on ``vertical`` rather than a generic bucket."""
+    low = label.lower()
+    if "vertical" in low:
+        return "vertical"
+    if "skill" in low:
+        return "skills"
+    if "senior" in low or "level" in low:
+        return "seniority"
+    if "location" in low or "geograph" in low or "eligib" in low or "remote" in low:
+        return "location"
+    if "preference" in low or "note" in low:
+        return "preferences"
+    return None
+
+
+def _derive_match_score(
+    breakdown: list[MatchSubScore], fallback: int, matches_requirements: bool
+) -> int:
+    """The headline match_score as a fixed weighted average of the rubric sub-scores —
+    the variance-reducer at the heart of this change. Falls back to the model's own
+    ``fallback`` score when the breakdown maps fewer than ``_MIN_DERIVE_ASPECTS`` aspects
+    (too sparse to trust). A hard-requirement violation caps the result at ``_HARD_FAIL_CAP``
+    so a disqualified role never shows a high score. Weights are renormalized over the
+    aspects actually present, so one missing aspect doesn't deflate the whole score."""
+    by_aspect: dict[str, int] = {}
+    for sub in breakdown:
+        key = _aspect_key(sub.label)
+        if key is not None:
+            by_aspect.setdefault(key, sub.score)  # first wins on a duplicate aspect
+    if len(by_aspect) < _MIN_DERIVE_ASPECTS:
+        score = fallback
+    else:
+        total_w = sum(_ASPECT_WEIGHTS[k] for k in by_aspect)
+        score = round(sum(_ASPECT_WEIGHTS[k] * by_aspect[k] for k in by_aspect) / total_w)
+    if not matches_requirements:
+        score = min(score, _HARD_FAIL_CAP)
+    return max(0, min(100, score))
+
+
 def _loose_verdict(data) -> MatchVerdict | None:
     """Best-effort MatchVerdict from a loose model response, built FIELD BY FIELD so one
     drifting field never discards a good one. These models drift from the schema even
@@ -1155,15 +1226,20 @@ def _loose_verdict(data) -> MatchVerdict | None:
     at all, so the caller keeps the prior result instead of persisting a hollow zero."""
     if not isinstance(data, dict):
         return None
-    score = _clamp_score(data.get("match_score"), None)
-    if score is None:  # no real score -> the model didn't actually score this posting
+    raw_score = _clamp_score(data.get("match_score"), None)
+    if raw_score is None:  # no real score -> the model didn't actually score this posting
         return None
     mr = data.get("matches_requirements")
     if not isinstance(mr, bool):
-        mr = score > 0  # infer the verdict flag from the score when the model omits it
+        mr = raw_score > 0  # infer the verdict flag from the score when the model omits it
     reasoning = data.get("reasoning")
     if not isinstance(reasoning, str) or not reasoning.strip():
         reasoning = "Re-scored against this posting."
+    breakdown = _loose_breakdown(data.get("score_breakdown"))
+    # Headline = deterministic weighted average of the rubric aspects when the breakdown is
+    # complete enough to trust; otherwise the model's own (volatile) number. This is what
+    # keeps the same posting from swinging 30+ points between identical scoring calls.
+    score = _derive_match_score(breakdown, raw_score, mr)
     try:
         return MatchVerdict(
             matches_requirements=mr,
@@ -1172,7 +1248,7 @@ def _loose_verdict(data) -> MatchVerdict | None:
             reasoning=reasoning.strip(),
             strengths=_str_list(data.get("strengths")),
             gaps=_str_list(data.get("gaps")),
-            score_breakdown=_loose_breakdown(data.get("score_breakdown")),
+            score_breakdown=breakdown,
             # MatchVerdict's own field validators coerce these (or null them), so pass through.
             salary_min=data.get("salary_min"),
             salary_max=data.get("salary_max"),

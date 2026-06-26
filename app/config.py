@@ -155,6 +155,15 @@ class Settings(BaseSettings):
     # Stage-2 scoring is also batched: after the cheap filter passes postings,
     # one expensive request scores this many postings against the resume.
     score_batch_size: int = 10
+    # Scoring determinism. The same (resume, posting) pair used to swing 30+ points
+    # between identical calls because the scoring model sampled stochastically. Run it
+    # at temperature 0 with a fixed seed so a single sample is reproducible; the headline
+    # match_score is additionally derived from the rubric sub-scores in code (see
+    # matcher._derive_match_score), which damps the residual variance a cloud backend
+    # can't fully pin down. These are deliberately NOT applied to cover-letter / résumé
+    # generation, which want some variety.
+    score_temperature: float = 0.0
+    score_seed: int = 11
     # A single (posting, interest) pair can fail to score — a transient provider error,
     # or the model returning an incomplete/invalid batch that omits it. Rather than mark
     # it permanently failed on the first miss, retry it on later runs up to this many

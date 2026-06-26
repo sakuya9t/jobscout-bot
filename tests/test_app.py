@@ -27,7 +27,7 @@ class GoodClient:
         self.score = score
         self.calls = 0
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         self.calls += 1
         if "results" in schema.get("properties", {}):
             n = user.count("### Posting ")
@@ -2599,7 +2599,7 @@ class KitClient:
         self.json_calls = 0
         self.text_calls = 0
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         self.json_calls += 1
         if "resume_markdown" in schema.get("properties", {}):
             return {"resume_markdown": "# Jane Doe\n\n## Experience\n- Built Python APIs",

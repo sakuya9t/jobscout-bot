@@ -24,7 +24,7 @@ class GoodClient:
     def __init__(self, score: int = 99):
         self.score = score
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         return {
             "matches_requirements": True, "match_score": self.score,
             "win_probability": 70, "reasoning": "Re-scored fit.",
@@ -65,7 +65,7 @@ class DriftClient:
 
     model = "fake-drift"
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         return {
             "match_score": 91, "win_probability": 60, "reasoning": "Strong overlap.",
             "strengths": ["Python"], "gaps": [],
@@ -79,7 +79,7 @@ class EmptyClient:
 
     model = "fake-empty"
 
-    def chat_json(self, system, user, schema, temperature=0.2):
+    def chat_json(self, system, user, schema, temperature=0.2, seed=None):
         return {"reasoning": "hmm"}
 
 
@@ -147,6 +147,89 @@ def test_loose_verdict_tolerates_drift_and_rejects_empty():
     assert matcher._loose_verdict({}) is None
     assert matcher._loose_verdict({"reasoning": "no score"}) is None
     assert matcher._loose_verdict("not a dict") is None
+
+
+def _full_breakdown(vertical, skills, seniority, location, preferences):
+    return [
+        {"label": "Vertical experience", "score": vertical},
+        {"label": "Skills overlap", "score": skills},
+        {"label": "Seniority fit", "score": seniority},
+        {"label": "Location fit", "score": location},
+        {"label": "Preferences", "score": preferences},
+    ]
+
+
+def test_match_score_derived_from_full_breakdown_ignores_volatile_gestalt():
+    """With a complete rubric breakdown, the headline is the fixed weighted average of the
+    aspects — NOT the model's free-form match_score — so the same posting stops swinging
+    between identical calls. Here every aspect is 80, so the headline is 80 regardless of
+    the stray 35 the model emitted as its holistic number."""
+    v = matcher._loose_verdict({
+        "matches_requirements": True, "match_score": 35, "win_probability": 50,
+        "reasoning": "ok", "score_breakdown": _full_breakdown(80, 80, 80, 80, 80),
+    })
+    assert v is not None and v.match_score == 80
+
+
+def test_match_score_weights_vertical_experience_most():
+    """The weighted average leans on vertical experience (0.35): vertical=100 with every
+    other aspect 0 yields 35, confirming the rubric ordering is honored."""
+    v = matcher._loose_verdict({
+        "matches_requirements": True, "match_score": 99, "win_probability": 50,
+        "reasoning": "ok", "score_breakdown": _full_breakdown(100, 0, 0, 0, 0),
+    })
+    assert v is not None and v.match_score == 35
+
+
+def test_match_score_falls_back_when_breakdown_too_sparse():
+    """One or two aspects can't carry a trustworthy weighted score, so the model's own
+    number is kept rather than extrapolated from a fragment of the rubric."""
+    v = matcher._loose_verdict({
+        "matches_requirements": True, "match_score": 72, "win_probability": 40,
+        "reasoning": "ok",
+        "score_breakdown": [
+            {"label": "Skills overlap", "score": 90},
+            {"label": "Seniority fit", "score": 90},
+        ],
+    })
+    assert v is not None and v.match_score == 72
+
+
+def test_hard_requirement_violation_caps_derived_score():
+    """A wrong-location role whose skill/experience aspects rate high must not surface a
+    high green headline — matches_requirements=False caps it at _HARD_FAIL_CAP."""
+    v = matcher._loose_verdict({
+        "matches_requirements": False, "match_score": 88, "win_probability": 10,
+        "reasoning": "Wrong location.", "score_breakdown": _full_breakdown(90, 90, 90, 0, 90),
+    })
+    assert v is not None and v.matches_requirements is False
+    assert v.match_score <= matcher._HARD_FAIL_CAP
+
+
+def test_scoring_call_uses_deterministic_options():
+    """The scoring call runs at temperature 0 with the configured fixed seed so a single
+    sample is reproducible — the other half of the headline-swing fix."""
+    captured: dict = {}
+
+    class CaptureClient:
+        model = "fake-capture"
+
+        def chat_json(self, system, user, schema, temperature=0.2, seed=None):
+            captured["temperature"] = temperature
+            captured["seed"] = seed
+            return {
+                "matches_requirements": True, "match_score": 80, "win_probability": 50,
+                "reasoning": "ok", "strengths": ["Py"], "gaps": [],
+            }
+
+    with session_scope() as db:
+        uid, pid = _seed(db, score=40)
+    with session_scope() as db:
+        matcher.rescore_position(
+            db, db.get(models.User, uid), db.get(models.Position, pid), client=CaptureClient()
+        )
+    assert captured["temperature"] == matcher.settings.score_temperature == 0.0
+    assert captured["seed"] == matcher.settings.score_seed
 
 
 def _seed(db, *, score: int = 88, passed: bool = True, model: str = "fake-old") -> tuple[int, int]:
