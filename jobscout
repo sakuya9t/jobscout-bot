@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Admin entrypoint for JobScout CLI commands on a deployed server console (e.g.
+# DigitalOcean App Platform's "Console" tab) or locally — WITHOUT activating the venv
+# or installing the `jobscout` console-script onto PATH.
+#
+# It execs `python -m app.cli` from the repo root (the same module the Procfile runs),
+# so it works anywhere the app code + deps are present: the deployed buildpack
+# container, or a local checkout. On App Platform the runtime env vars
+# (JOBSCOUT_SECRET_KEY, JOBSCOUT_DATABASE_URL, …) are already injected into the console
+# session, so commands hit the real database and mint codes valid for the running app
+# with nothing to export. Locally, a `.env` in the repo root is picked up automatically
+# (pydantic-settings), so `./jobscout invite mint …` works the same way.
+#
+# Usage (from the repo root):
+#   ./jobscout invite mint --count 1 --max-uses 1 --expiry 24h
+#   ./jobscout invite list
+#   ./jobscout health
+# If the executable bit was lost, run it via bash:  bash jobscout invite list
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$here"
+
+# Prefer the project venv's interpreter for a local checkout; otherwise fall back to the
+# platform python (the deployed container installs deps against python3/python).
+if [[ -x "$here/.venv/bin/python" ]]; then
+  py="$here/.venv/bin/python"
+else
+  py="$(command -v python3 || command -v python)"
+fi
+
+exec "$py" -m app.cli "$@"

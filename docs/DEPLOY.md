@@ -48,6 +48,34 @@ scrape and drains the scoring queue in-process.
 - The `/api/cron/*` endpoints remain as optional authenticated manual triggers (and
   `jobscout run-scoring` as an out-of-process drain). There is no GitHub Actions cron.
 
+## Admin commands on the deployed console
+
+One-off admin tasks (minting invite codes, checking health, backfills) run from the App
+Platform **Console** tab, which opens an interactive shell inside the running web
+container. Two things make that shell convenient:
+
+- **The runtime env is already there.** `JOBSCOUT_SECRET_KEY`, `JOBSCOUT_DATABASE_URL`,
+  etc. are injected into the console session, so commands hit the **real** Managed
+  Postgres and mint codes valid for the running app — **nothing to export**.
+- **Use the bundled `./jobscout` wrapper**, not the `jobscout` console-script. The buildpack
+  installs from `requirements.txt` (which doesn't `pip install` this package), so there's no
+  `jobscout` on `PATH` and the venv isn't activated. `./jobscout` execs `python -m app.cli`
+  (the same module the Procfile runs) from the repo root, so it works with no setup:
+
+  ```bash
+  ./jobscout invite mint --count 1 --max-uses 1 --expiry 24h   # single-use, expires in 24h
+  ./jobscout invite list
+  ./jobscout health                                            # DB + (per-user) Ollama
+  ```
+
+  If the executable bit didn't survive checkout, run `bash jobscout …`. The `--expiry` flag
+  accepts unit durations (`30m`/`24h`/`7d`/`2w`/compound `1d12h`).
+
+> Running these **from your laptop** instead targets your local SQLite with the dev
+> secret unless you first export the prod `JOBSCOUT_DATABASE_URL` + `JOBSCOUT_SECRET_KEY`
+> — `invite mint` prints a stderr warning when it detects the built-in default key, so a
+> code that would be invalid for prod is obvious. Prefer the deployed console.
+
 ## Caveats
 
 - **Resume file storage is ephemeral.** Uploaded resumes land on the instance disk and

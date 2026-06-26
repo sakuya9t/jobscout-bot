@@ -2,6 +2,19 @@
 
 Project-level infrastructure history, newest first. Concise by design — see git for detail.
 
+## 2026-06 — Admin CLI ergonomics for the deployed console
+- Added a committed, executable `./jobscout` wrapper that execs `python -m app.cli` from
+  the repo root — so admin commands run on the DigitalOcean App Platform console (or
+  locally) with no venv activation and no `jobscout`-on-PATH install. The console already
+  carries the app's env vars, so `./jobscout invite mint …` hits the real Postgres and
+  mints valid codes with nothing to export (see docs/DEPLOY.md).
+- `invite mint` gained `--expiry` accepting unit durations (`30m`/`24h`/`7d`/`2w`/compound
+  `1d12h`) for sub-day precision; the whole-day `--expires-days` still works. `invites.mint`
+  takes an `expires_in: timedelta` alongside the back-compat `expires_in_days`.
+- `invite mint` now warns on stderr when it's about to mint with the built-in dev secret —
+  catching the footgun of running it without `JOBSCOUT_SECRET_KEY` (codes that the real
+  deployment can't validate). New `timeutil.parse_duration` helper + tests.
+
 ## 2026-06 — Stabilize match scoring (deterministic + derived headline)
 - The same posting could swing 30+ points between identical scoring calls. Two fixes:
   (1) the scoring call now runs at `temperature=0` with a fixed `JOBSCOUT_SCORE_SEED`
