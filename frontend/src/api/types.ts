@@ -131,6 +131,71 @@ export interface InterestIn {
   min_score?: number;
 }
 
+/** app/schemas.py :: ProfileEducationOut / ProfileExperienceOut — repeating profile rows. */
+export interface ProfileEducation {
+  id?: number | null;
+  school: string | null;
+  degree: string | null;
+  field_of_study: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  gpa: string | null;
+  location: string | null;
+  description: string | null;
+}
+
+export interface ProfileExperience {
+  id?: number | null;
+  company: string | null;
+  title: string | null;
+  location: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  is_current: boolean;
+  description: string | null;
+}
+
+/** app/schemas.py :: ApplicantProfileOut / ApplicantProfileIn — the reusable application
+ *  profile. All scalars optional; the three work-auth flags are tri-state (null = unset).
+ *  The same shape is sent back on PUT (ids on the rows are ignored on input). */
+export interface ApplicantProfileOut {
+  first_name: string | null;
+  last_name: string | null;
+  preferred_name: string | null;
+  pronouns: string | null;
+  email: string | null;
+  phone: string | null;
+  address_line1: string | null;
+  address_line2: string | null;
+  city: string | null;
+  state_region: string | null;
+  postal_code: string | null;
+  country: string | null;
+  linkedin_url: string | null;
+  github_url: string | null;
+  portfolio_url: string | null;
+  other_url: string | null;
+  work_authorization: string | null;
+  authorized_to_work: boolean | null;
+  requires_sponsorship: boolean | null;
+  open_to_relocation: boolean | null;
+  desired_salary: string | null;
+  salary_currency: string | null;
+  remote_preference: string | null;
+  preferred_locations: string | null;
+  earliest_start_date: string | null;
+  notice_period: string | null;
+  gender: string | null;
+  race_ethnicity: string | null;
+  hispanic_latino: string | null;
+  veteran_status: string | null;
+  disability_status: string | null;
+  education: ProfileEducation[];
+  experience: ProfileExperience[];
+}
+
+export type ApplicantProfileIn = ApplicantProfileOut;
+
 /** app/schemas.py :: JobListRunOut — a saved snapshot for the version dropdown. */
 export interface JobListRunOut {
   id: number;
