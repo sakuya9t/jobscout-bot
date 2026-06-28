@@ -7,6 +7,7 @@ import AccountView from "@/views/AccountView.vue";
 import LlmView from "@/views/LlmView.vue";
 import TelegramView from "@/views/TelegramView.vue";
 import ResumeView from "@/views/ResumeView.vue";
+import InterestsView from "@/views/InterestsView.vue";
 import PlaceholderView from "@/views/PlaceholderView.vue";
 
 // Pass 1: the SPA owns only /app/*. The dashboard's old hash panels (#jobs, #resume, …)
@@ -24,7 +25,7 @@ const routes: RouteRecordRaw[] = [
       { path: "resume", component: ResumeView, meta: { title: "Resume", subtitle: "Current resume used for matching" } },
       { path: "profile", component: PlaceholderView, meta: { title: "Profile", subtitle: "Coming soon" } },
       { path: "companies", component: PlaceholderView, meta: { title: "Companies", subtitle: "Coming soon" } },
-      { path: "interests", component: PlaceholderView, meta: { title: "Interests", subtitle: "Coming soon" } },
+      { path: "interests", component: InterestsView, meta: { title: "Interests", subtitle: "Role preferences and scoring thresholds" } },
       { path: "llm", component: LlmView, meta: { title: "LLM provider", subtitle: "Model provider, API key, and models used for scoring" } },
       { path: "telegram", component: TelegramView, meta: { title: "Telegram", subtitle: "Daily report delivery" } },
       { path: "account", component: AccountView, meta: { title: "Account", subtitle: "Change your login password" } },

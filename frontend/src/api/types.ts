@@ -106,6 +106,31 @@ export interface TelegramActionResult {
   detail: string;
 }
 
+/** app/schemas.py :: InterestOut — one role-preference / scoring profile. */
+export interface InterestOut {
+  id: number;
+  label: string;
+  title_keywords: string | null;
+  locations: string | null;
+  seniority: string | null;
+  employment_type: string | null;
+  exclude_keywords: string | null;
+  notes: string | null;
+  min_score: number;
+  is_active: boolean;
+}
+
+/** app/schemas.py :: InterestIn / InterestUpdate — create/update payload. */
+export interface InterestIn {
+  label: string;
+  title_keywords?: string;
+  locations?: string;
+  seniority?: string;
+  exclude_keywords?: string;
+  notes?: string;
+  min_score?: number;
+}
+
 /** app/schemas.py :: JobListRunOut — a saved snapshot for the version dropdown. */
 export interface JobListRunOut {
   id: number;

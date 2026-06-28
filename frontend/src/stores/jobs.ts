@@ -169,6 +169,23 @@ export const useJobsStore = defineStore("jobs", () => {
     return api.get<PositionLookupOut>(`/api/positions/lookup?url=${encodeURIComponent(url)}`);
   }
 
+  // Editing the watch-list/interests changes what gets scraped/scored. Rather than
+  // re-scoring on every add/remove, the settings views mark it pending and one scan is
+  // fired when the user leaves the settings area or the page — see
+  // composables/useRescoreOnLeave. Mirrors the classic dashboard's markRescorePending/
+  // flushRescore.
+  const pendingRescore = ref(false);
+  function markRescorePending(): void {
+    pendingRescore.value = true;
+  }
+  /** Run the pending re-score, if any. Scoring needs a resume and we don't stack onto an
+   *  in-flight run; if gated out, the flag is kept so the next leave/unload retries. */
+  async function flushRescore(): Promise<void> {
+    if (!pendingRescore.value || !hasActiveResume.value || runInProgress.value) return;
+    pendingRescore.value = false;
+    await run();
+  }
+
   /** One eval-status poll tick. Returns the ms until the next tick, or null to stop.
    *  Reloads the live list as matches get scored, only when viewing "latest" (the
    *  busy→idle transition also refreshes the saved-runs dropdown). */
@@ -189,5 +206,6 @@ export const useJobsStore = defineStore("jobs", () => {
     runStatus, items, total, paged, hasSavedList,
     loadJobList, loadRuns, loadCompanyOptions, loadResumeGate, setMode, applyFilterChange,
     goToPage, selectSnapshot, run, markApplied, lookupByUrl, pollEvaluationTick,
+    pendingRescore, markRescorePending, flushRescore,
   };
 });
