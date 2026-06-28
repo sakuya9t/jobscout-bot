@@ -152,8 +152,16 @@ export interface CompanyOption {
   name: string;
 }
 
-/** Subset of app/schemas.py :: ResumeOut used for the scan-gate. */
+/** app/schemas.py :: ResumeOut — one uploaded resume (one per account). */
 export interface ResumeOut {
   id: number;
+  filename: string;
   is_active: boolean;
+  created_at: string;
+}
+
+/** app/schemas.py :: ResumeContentOut — the resume's extracted plain text (preview fallback). */
+export interface ResumeContentOut {
+  filename: string;
+  content_text: string;
 }

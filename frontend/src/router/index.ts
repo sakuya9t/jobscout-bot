@@ -6,6 +6,7 @@ import SearchView from "@/views/SearchView.vue";
 import AccountView from "@/views/AccountView.vue";
 import LlmView from "@/views/LlmView.vue";
 import TelegramView from "@/views/TelegramView.vue";
+import ResumeView from "@/views/ResumeView.vue";
 import PlaceholderView from "@/views/PlaceholderView.vue";
 
 // Pass 1: the SPA owns only /app/*. The dashboard's old hash panels (#jobs, #resume, …)
@@ -20,7 +21,7 @@ const routes: RouteRecordRaw[] = [
       { path: "", redirect: "/app/jobs" },
       { path: "jobs", component: JobsView, meta: { title: "Job lists", subtitle: "Latest ranked positions from your scans" } },
       { path: "search", component: SearchView, meta: { title: "Search for Job", subtitle: "Look up a posting by its URL in your job list" } },
-      { path: "resume", component: PlaceholderView, meta: { title: "Resume", subtitle: "Coming soon" } },
+      { path: "resume", component: ResumeView, meta: { title: "Resume", subtitle: "Current resume used for matching" } },
       { path: "profile", component: PlaceholderView, meta: { title: "Profile", subtitle: "Coming soon" } },
       { path: "companies", component: PlaceholderView, meta: { title: "Companies", subtitle: "Coming soon" } },
       { path: "interests", component: PlaceholderView, meta: { title: "Interests", subtitle: "Coming soon" } },
