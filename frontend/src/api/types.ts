@@ -87,6 +87,25 @@ export interface LlmTestResult {
   results: LlmModelTest[];
 }
 
+/** app/schemas.py :: TelegramConfigOut / TelegramConfigIn / TelegramActionResult — the
+ *  Telegram delivery settings. The bot token is never returned (only `has_token`). */
+export interface TelegramConfigOut {
+  has_token: boolean;
+  linked: boolean;
+  chat_id: string | null;
+  link_code: string | null;
+}
+
+export interface TelegramConfigIn {
+  // Omit/blank to keep the saved token; a non-empty value replaces it.
+  bot_token?: string | null;
+}
+
+export interface TelegramActionResult {
+  ok: boolean;
+  detail: string;
+}
+
 /** app/schemas.py :: JobListRunOut — a saved snapshot for the version dropdown. */
 export interface JobListRunOut {
   id: number;
