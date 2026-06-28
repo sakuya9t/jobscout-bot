@@ -49,6 +49,44 @@ export interface PositionLookupOut {
   kit_status: KitStatus;
 }
 
+/** app/schemas.py :: LlmProviderOut / LlmConfigOut / LlmConfigIn / LlmTestResult — the
+ *  LLM-provider settings view. The API key is never returned (only `has_api_key`). */
+export interface LlmProviderOut {
+  key: string;
+  label: string;
+  base_url: string;
+}
+
+export interface LlmConfigOut {
+  provider: string;
+  base_url: string;
+  main_model: string;
+  light_model: string;
+  has_api_key: boolean;
+  providers: LlmProviderOut[];
+}
+
+export interface LlmConfigIn {
+  provider: string;
+  main_model: string;
+  light_model: string;
+  // Omit/blank to keep the saved key; a non-empty value replaces it.
+  api_key?: string | null;
+}
+
+export interface LlmModelTest {
+  role: string; // "main" | "light"
+  model: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  detail: string;
+  results: LlmModelTest[];
+}
+
 /** app/schemas.py :: JobListRunOut — a saved snapshot for the version dropdown. */
 export interface JobListRunOut {
   id: number;
