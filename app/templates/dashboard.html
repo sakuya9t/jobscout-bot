@@ -276,6 +276,7 @@
       <div class="nav-section">
         <div class="nav-section-title">Workspace</div>
         <button class="nav-button" data-view="jobs" onclick="showView('jobs')">Job lists</button>
+        <button class="nav-button" data-view="search" onclick="showView('search')">Search for Job</button>
       </div>
       <div class="nav-section collapsed" data-nav-section="application">
         <button class="nav-section-toggle" type="button" aria-expanded="false"
@@ -740,6 +741,23 @@
         </div>
       </div>
     </section>
+
+    <section id="view-search" class="panel">
+      <div class="surface">
+        <h2>Search for Job</h2>
+        <p class="muted">Paste a job posting URL to find it in your scored job list — see whether
+          you've already applied, then open it to mark applied or generate an application kit.
+          Lookup-only: it searches your existing list and never starts a new scan.</p>
+        <div class="toolbar" style="margin-top:12px; flex-wrap:wrap; gap:10px;">
+          <input id="searchUrl" type="url" inputmode="url" autocomplete="off"
+                 placeholder="Paste a job URL to find it in your list…"
+                 style="flex:1 1 280px; min-width:0;"
+                 onkeydown="if(event.key==='Enter'){ event.preventDefault(); lookupJobByUrl(); }" />
+          <button onclick="lookupJobByUrl()">Find</button>
+        </div>
+        <p id="searchResult" class="muted" style="margin-top:12px;"></p>
+      </div>
+    </section>
   </section>
 </main>
 
@@ -762,6 +780,7 @@ const val = id => document.getElementById(id).value.trim();
 const detailText = d => Array.isArray(d) ? d.map(e => e.msg).filter(Boolean).join("; ") : (d || "");
 const viewCopy = {
   jobs: ["Job lists", "Latest ranked positions from your scans"],
+  search: ["Search for Job", "Look up a posting by its URL in your job list"],
   resume: ["Resume", "Current resume used for matching"],
   profile: ["Profile", "Reusable application details"],
   companies: ["Companies", "Career sites included in each scan"],
@@ -883,6 +902,30 @@ async function changePassword(){
   }
   s.textContent = "Password changed.";
   ["curPass","newPass","newPass2"].forEach(id => { document.getElementById(id).value = ""; });
+}
+
+// Search-for-Job view: resolve a pasted posting URL to a position already in the user's
+// job list (lookup-only — never scrapes). Mirrors the SPA's JobUrlLookup component.
+async function lookupJobByUrl(){
+  const out = document.getElementById("searchResult");
+  const url = document.getElementById("searchUrl").value.trim();
+  if(!url){ return; }
+  out.className = "muted"; out.textContent = "Checking…";
+  let r;
+  try { r = await api("/api/positions/lookup?url=" + encodeURIComponent(url)); }
+  catch(e){ out.textContent = "Could not check that URL."; return; }
+  const d = await r.json().catch(() => ({}));
+  if(!r.ok){ out.textContent = detailText(d.detail) || "Could not check that URL."; return; }
+  if(!d.matched){
+    out.textContent = "Not in your job list. If you follow its company, run a scan to score it; "
+      + "otherwise open the posting directly.";
+    return;
+  }
+  const badge = d.applied ? "✓ Already applied" : "In your job list";
+  const score = (!d.applied && d.match_score != null) ? ` · score ${d.match_score}` : "";
+  const closed = d.removed ? " · closed" : "";
+  out.innerHTML = `<b>${esc(badge)}</b> — <a href="/positions/${d.position_id}">${esc(d.title)}</a>`
+    + ` · ${esc(d.company)}${esc(score)}${esc(closed)}`;
 }
 
 // ── Telegram settings (per-user bot token + linked chat) ──

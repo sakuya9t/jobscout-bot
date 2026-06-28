@@ -34,6 +34,21 @@ export interface MatchOut {
   kit_status: KitStatus;
 }
 
+/** app/schemas.py :: PositionLookupOut — resolve a pasted posting URL to a job-list row.
+ *  All fields but `matched` are null when the URL isn't in the user's list. */
+export interface PositionLookupOut {
+  matched: boolean;
+  position_id: number | null;
+  company: string | null;
+  title: string | null;
+  location: string | null;
+  applied: boolean | null;
+  removed: boolean | null;
+  match_score: number | null;
+  win_probability: number | null;
+  kit_status: KitStatus;
+}
+
 /** app/schemas.py :: JobListRunOut — a saved snapshot for the version dropdown. */
 export interface JobListRunOut {
   id: number;

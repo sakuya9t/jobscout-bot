@@ -6,6 +6,7 @@ import type {
   EvaluationStatus,
   JobListOut,
   JobListRunOut,
+  PositionLookupOut,
   ResumeOut,
   RunSummary,
 } from "@/api/types";
@@ -162,6 +163,12 @@ export const useJobsStore = defineStore("jobs", () => {
     }
   }
 
+  /** Resolve a pasted posting URL to a position in the user's job list (lookup-only —
+   *  never scrapes). Throws ApiError(422) when the URL is unparseable. */
+  async function lookupByUrl(url: string): Promise<PositionLookupOut> {
+    return api.get<PositionLookupOut>(`/api/positions/lookup?url=${encodeURIComponent(url)}`);
+  }
+
   /** One eval-status poll tick. Returns the ms until the next tick, or null to stop.
    *  Reloads the live list as matches get scored, only when viewing "latest" (the
    *  busy→idle transition also refreshes the saved-runs dropdown). */
@@ -181,6 +188,6 @@ export const useJobsStore = defineStore("jobs", () => {
     selectedSnapshotId, data, loading, runs, companyOptions, runInProgress, hasActiveResume,
     runStatus, items, total, paged, hasSavedList,
     loadJobList, loadRuns, loadCompanyOptions, loadResumeGate, setMode, applyFilterChange,
-    goToPage, selectSnapshot, run, markApplied, pollEvaluationTick,
+    goToPage, selectSnapshot, run, markApplied, lookupByUrl, pollEvaluationTick,
   };
 });

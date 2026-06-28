@@ -437,6 +437,23 @@ class MatchOut(BaseModel):
     kit_status: str | None = None
 
 
+class PositionLookupOut(BaseModel):
+    """Result of resolving a pasted posting URL to a position in the user's job list.
+    ``matched`` is false (and the rest null) when the URL isn't in their list or can't
+    be parsed; otherwise the fields summarize the matched row for the lookup box."""
+
+    matched: bool
+    position_id: int | None = None
+    company: str | None = None
+    title: str | None = None
+    location: str | None = None
+    applied: bool | None = None
+    removed: bool | None = None
+    match_score: int | None = None
+    win_probability: int | None = None
+    kit_status: str | None = None
+
+
 class ApplicationOut(_ORM):
     position_id: int
     status: str
