@@ -177,6 +177,41 @@ export interface CompanyOption {
   name: string;
 }
 
+/** app/schemas.py :: CompanyPresetOut — a built-in one-click company option. */
+export interface CompanyPresetOut {
+  key: string;
+  name: string;
+  careers_url: string;
+  ats_type: string;
+  ats_token: string | null;
+  location_hint: string | null;
+}
+
+/** app/schemas.py :: CompanyOut — a watch-list company (custom or subscribed preset). */
+export interface CompanyOut {
+  id: number;
+  name: string;
+  careers_url: string | null;
+  ats_type: string;
+  ats_token: string | null;
+  location_hint: string | null;
+  is_active: boolean;
+  last_scraped_at: string | null;
+  is_preset: boolean;
+  requires_account: boolean;
+  account_attached: boolean;
+}
+
+/** app/schemas.py :: CompanyIn — add a company (preset_key subscribes to a shared preset). */
+export interface CompanyIn {
+  name: string;
+  careers_url?: string | null;
+  ats_type?: string;
+  ats_token?: string | null;
+  location_hint?: string | null;
+  preset_key?: string | null;
+}
+
 /** app/schemas.py :: ResumeOut — one uploaded resume (one per account). */
 export interface ResumeOut {
   id: number;
