@@ -34,5 +34,14 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  return { user, status, ensureAuth };
+  // Change the login password. Throws ApiError on failure (wrong current password, weak
+  // or reused new password) for the caller to surface; the session stays valid.
+  async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    await api.post("/api/auth/change-password", {
+      current_password: currentPassword,
+      new_password: newPassword,
+    });
+  }
+
+  return { user, status, ensureAuth, changePassword };
 });

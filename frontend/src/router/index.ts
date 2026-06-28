@@ -3,6 +3,7 @@ import { useAuthStore } from "@/stores/auth";
 import AppShell from "@/layouts/AppShell.vue";
 import JobsView from "@/views/JobsView.vue";
 import SearchView from "@/views/SearchView.vue";
+import AccountView from "@/views/AccountView.vue";
 import PlaceholderView from "@/views/PlaceholderView.vue";
 
 // Pass 1: the SPA owns only /app/*. The dashboard's old hash panels (#jobs, #resume, …)
@@ -23,7 +24,7 @@ const routes: RouteRecordRaw[] = [
       { path: "interests", component: PlaceholderView, meta: { title: "Interests", subtitle: "Coming soon" } },
       { path: "llm", component: PlaceholderView, meta: { title: "LLM provider", subtitle: "Coming soon" } },
       { path: "telegram", component: PlaceholderView, meta: { title: "Telegram", subtitle: "Coming soon" } },
-      { path: "account", component: PlaceholderView, meta: { title: "Account", subtitle: "Coming soon" } },
+      { path: "account", component: AccountView, meta: { title: "Account", subtitle: "Change your login password" } },
     ],
   },
   // Any other in-SPA path lands on the jobs view.
