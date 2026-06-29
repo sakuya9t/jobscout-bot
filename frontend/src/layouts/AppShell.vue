@@ -85,7 +85,7 @@ async function logout(): Promise<void> {
   try {
     await api.post("/api/auth/logout");
   } finally {
-    window.location.assign("/login");
+    window.location.assign("/app/login");
   }
 }
 </script>

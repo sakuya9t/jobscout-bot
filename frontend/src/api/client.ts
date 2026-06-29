@@ -30,14 +30,14 @@ function goToLogin(): void {
   if (redirectingToLogin) return;
   redirectingToLogin = true;
   const next = encodeURIComponent(window.location.pathname + window.location.search);
-  window.location.assign(`/login?next=${next}`);
+  window.location.assign(`/app/login?next=${next}`);
 }
 
 let redirectingToReset = false;
 function goToSetNewPassword(): void {
   if (redirectingToReset) return;
   redirectingToReset = true;
-  window.location.assign("/set-new-password");
+  window.location.assign("/app/set-new-password");
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {

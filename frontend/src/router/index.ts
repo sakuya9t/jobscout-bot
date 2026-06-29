@@ -12,6 +12,9 @@ import CompaniesView from "@/views/CompaniesView.vue";
 import ProfileView from "@/views/ProfileView.vue";
 import PositionDetailView from "@/views/PositionDetailView.vue";
 import CompanyDetailView from "@/views/CompanyDetailView.vue";
+import AuthView from "@/views/auth/AuthView.vue";
+import ForgotPasswordView from "@/views/auth/ForgotPasswordView.vue";
+import SetNewPasswordView from "@/views/auth/SetNewPasswordView.vue";
 
 // Pass 1: the SPA owns only /app/*. The dashboard's old hash panels (#jobs, #resume, …)
 // become child routes here; the other panels are placeholders until later passes.
@@ -38,6 +41,11 @@ const routes: RouteRecordRaw[] = [
   // pages and keep print-to-PDF isolation simple; auth-guarded like the rest of /app.
   { path: "/app/positions/:id", component: PositionDetailView, meta: { requiresAuth: true } },
   { path: "/app/companies/:id", component: CompanyDetailView, meta: { requiresAuth: true } },
+  // Auth screens — standalone, no auth guard (set-new-password redirects on a 401 itself).
+  { path: "/app/login", component: AuthView, meta: { mode: "login" } },
+  { path: "/app/register", component: AuthView, meta: { mode: "register" } },
+  { path: "/app/forgot-password", component: ForgotPasswordView },
+  { path: "/app/set-new-password", component: SetNewPasswordView },
   // Any other in-SPA path lands on the jobs view.
   { path: "/:pathMatch(.*)*", redirect: "/app/jobs" },
 ];
@@ -55,7 +63,7 @@ router.beforeEach(async (to) => {
     const auth = useAuthStore();
     const ok = await auth.ensureAuth();
     if (!ok) {
-      window.location.assign(`/login?next=${encodeURIComponent(to.fullPath)}`);
+      window.location.assign(`/app/login?next=${encodeURIComponent(to.fullPath)}`);
       return false;
     }
   }

@@ -20,7 +20,7 @@ export const useAuthStore = defineStore("auth", () => {
       // the one authed route that isn't gated, so we catch it here rather than via the
       // client's 403 handler.)
       if (user.value?.must_change_password) {
-        window.location.assign("/set-new-password");
+        window.location.assign("/app/set-new-password");
         return false;
       }
       status.value = "authed";
