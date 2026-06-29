@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     require_invite: bool = True
     invite_secret: str = ""
 
+    # Forgot-password: how long a mailed (Telegram-delivered) temporary password stays
+    # valid before the login route rejects it. Short on purpose — it's a single-use
+    # credential sitting in a chat log. JOBSCOUT_PASSWORD_RESET_TTL_MINUTES.
+    password_reset_ttl_minutes: int = 30
+
     # Rate limiting (see app/ratelimit.py). In-process per-IP limits: a global blanket
     # plus stricter caps on login/register. Disable for tests/dev with
     # JOBSCOUT_RATE_LIMIT_ENABLED=0. Behind a multi-instance deploy these are per-instance

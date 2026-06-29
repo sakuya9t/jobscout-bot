@@ -27,6 +27,7 @@ _Last reviewed: 2026-06-18._
 | Anthropic | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
 | OpenAI | `ashby` | ✅ | full | ✅ | ✅ | no | Easy — Ashby form, no account. |
 | xAI | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
+| **Perplexity** | `ashby` | ✅ | full | ✅ | ✅ | no | Easy — Ashby form, no account. (74 live roles.) |
 | Airbnb | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
 | Databricks | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. |
 | **Jane Street** | `greenhouse` | ✅ | full | ✅ | ✅ | no | Easy — Greenhouse form, no account. (209 live roles.) |

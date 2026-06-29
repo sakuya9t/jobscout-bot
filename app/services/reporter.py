@@ -22,6 +22,7 @@ from ..models import (
 from ..timeutil import utcnow
 from . import salary
 from .matcher import ERROR_MODEL
+from .urlmatch import normalize_posting_url
 
 
 JOB_LIST_SNAPSHOT_LIMIT = 500
@@ -410,6 +411,61 @@ def position_visible(db: Session, user: User, position_id: int) -> bool:
         .where(_followed_companies_clause(user))
         .limit(1)
     ) is not None
+
+
+def lookup_position_by_url(db: Session, user: User, raw_url: str | None) -> dict | None:
+    """Resolve a pasted posting URL to a position in *this user's* job list. Matches on
+    a normalized key (see ``urlmatch``), scoped by the same visibility gate as
+    ``position_visible`` / ``build_position_detail`` so a URL not in the user's list (or
+    unparseable) returns None. Returns a light summary with live ``applied`` /
+    ``kit_status`` overlays, suitable for the job-list URL lookup box."""
+    key = normalize_posting_url(raw_url)
+    if key is None:
+        return None
+    rows = db.execute(
+        select(
+            Position.id,
+            Position.url,
+            Position.title,
+            Position.location,
+            Position.removed_at,
+            Company.name,
+        )
+        .join(MatchResult, MatchResult.position_id == Position.id)
+        .join(Company, Position.company_id == Company.id)
+        .where(MatchResult.user_id == user.id, Position.url.is_not(None))
+        .where(_visible_positions_clause(user))
+        .where(_followed_companies_clause(user))
+        .distinct()
+    ).all()
+    row = next((r for r in rows if normalize_posting_url(r.url) == key), None)
+    if row is None:
+        return None
+    # The position's best stored match, ranked like build_position_detail.
+    best = db.execute(
+        select(MatchResult.match_score, MatchResult.win_probability)
+        .where(MatchResult.user_id == user.id, MatchResult.position_id == row.id)
+        .order_by(
+            MatchResult.passed_filter.desc(),
+            MatchResult.match_score.desc(),
+            MatchResult.win_probability.desc(),
+        )
+        .limit(1)
+    ).first()
+    item = {
+        "position_id": row.id,
+        "company": row.name,
+        "title": row.title,
+        "location": row.location,
+        "removed": row.removed_at is not None,
+        "match_score": best.match_score if best else None,
+        "win_probability": best.win_probability if best else None,
+        "applied": False,
+        "kit_status": None,
+    }
+    tag_applied(db, user, [item])
+    tag_kit_status(db, user, [item])
+    return item
 
 
 def build_position_detail(db: Session, user: User, position_id: int) -> dict | None:

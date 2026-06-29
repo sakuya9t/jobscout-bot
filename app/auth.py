@@ -52,6 +52,13 @@ def new_link_code() -> str:
     return secrets.token_hex(4)
 
 
+def new_temp_password() -> str:
+    """A single-use temporary password for the forgot-password flow. URL-safe so it's
+    easy to copy out of a Telegram message; ~12 chars of entropy is plenty for a
+    credential that lives at most a few minutes and is invalidated on first use."""
+    return secrets.token_urlsafe(9)
+
+
 def _extract_token(authorization: str | None, access_token: str | None) -> str | None:
     """Accept either a Bearer header (API/MCP clients) or a cookie (browser)."""
     if authorization and authorization.lower().startswith("bearer "):
@@ -59,10 +66,8 @@ def _extract_token(authorization: str | None, access_token: str | None) -> str |
     return access_token
 
 
-def get_current_user(
-    authorization: str | None = Header(default=None),
-    access_token: str | None = Cookie(default=None),
-    db: Session = Depends(get_db),
+def _resolve_user(
+    authorization: str | None, access_token: str | None, db: Session
 ) -> User:
     token = _extract_token(authorization, access_token)
     user_id = decode_token(token) if token else None
@@ -70,6 +75,34 @@ def get_current_user(
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
     return user
+
+
+def get_current_user(
+    authorization: str | None = Header(default=None),
+    access_token: str | None = Cookie(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    user = _resolve_user(authorization, access_token, db)
+    # A user who logged in with a temporary password (forgot-password flow) is held at
+    # the door until they pick a real one: every protected route depends on this, so the
+    # whole app is gated by the one check. The bypass routes (/me, /set-new-password,
+    # /logout) use get_user_for_password_change instead so the user can read their state
+    # and clear the flag. The 403 detail is a stable code the SPA/login JS keys off to
+    # redirect to the set-new-password screen.
+    if user.must_change_password:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "password_change_required")
+    return user
+
+
+def get_user_for_password_change(
+    authorization: str | None = Header(default=None),
+    access_token: str | None = Cookie(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    """Like get_current_user but WITHOUT the must-change-password gate — for the handful
+    of routes that must stay reachable while the flag is set (so it doesn't deadlock the
+    very endpoint that clears it)."""
+    return _resolve_user(authorization, access_token, db)
 
 
 def get_optional_user(

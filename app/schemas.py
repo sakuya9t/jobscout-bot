@@ -124,6 +124,27 @@ class PasswordChange(BaseModel):
         return _require_password_complexity(v)
 
 
+class ForgotPassword(BaseModel):
+    """Request a temporary password. Only the account identifier (email) is supplied;
+    delivery goes to the user's linked Telegram channel, and the route always returns a
+    generic success so this can't be used to probe which emails are registered."""
+
+    email: EmailStr
+
+
+class NewPassword(BaseModel):
+    """Set a fresh password while ``must_change_password`` is in force (after logging in
+    with a temporary password). The session already proves identity, so no current
+    password is supplied; the new one must meet the registration complexity rule."""
+
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_complexity(cls, v: str) -> str:
+        return _require_password_complexity(v)
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -134,6 +155,9 @@ class UserOut(_ORM):
     email: str
     telegram_chat_id: str | None = None
     telegram_link_code: str | None = None
+    # True only between logging in with a temporary password and choosing a real one.
+    # The frontend uses it to funnel the user to the set-new-password screen.
+    must_change_password: bool = False
 
 
 # ── LLM provider config ──────────────────────────────────────────────────────
@@ -410,6 +434,23 @@ class MatchOut(BaseModel):
     # Application-kit status for this position, overlaid live like ``applied``:
     # None (no kit requested) | "generating" | "ok" | "error". Drives the job-list
     # row's kit-status icon.
+    kit_status: str | None = None
+
+
+class PositionLookupOut(BaseModel):
+    """Result of resolving a pasted posting URL to a position in the user's job list.
+    ``matched`` is false (and the rest null) when the URL isn't in their list or can't
+    be parsed; otherwise the fields summarize the matched row for the lookup box."""
+
+    matched: bool
+    position_id: int | None = None
+    company: str | None = None
+    title: str | None = None
+    location: str | None = None
+    applied: bool | None = None
+    removed: bool | None = None
+    match_score: int | None = None
+    win_probability: int | None = None
     kit_status: str | None = None
 
 

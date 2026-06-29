@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from . import ratelimit
@@ -88,8 +90,11 @@ app = FastAPI(title="JobScout", version="0.1.0", lifespan=lifespan)
 async def rate_limit_middleware(request: Request, call_next):
     """Per-IP blanket limit on every request as a coarse DoS brake. The auth routes
     carry their own stricter per-route limits on top of this. ``/health`` is exempt so
-    uptime checks aren't throttled. No-op when JOBSCOUT_RATE_LIMIT_ENABLED is off."""
-    if request.url.path != "/health":
+    uptime checks aren't throttled, and ``/static/*`` is exempt so a single SPA page
+    load (which fans out into many hashed asset requests) can't trip the limit. No-op
+    when JOBSCOUT_RATE_LIMIT_ENABLED is off."""
+    path = request.url.path
+    if path != "/health" and not path.startswith("/static/"):
         allowed, retry_after = ratelimit.check_global(request)
         if not allowed:
             return JSONResponse(
@@ -125,3 +130,20 @@ def health() -> dict:
         db_ok = False
     ollama = get_client().health()
     return {"status": "ok", "db": db_ok, "ollama": ollama, "ollama_ok": ollama == "ok"}
+
+
+# ── Vue SPA (incremental migration) ──────────────────────────────────────────
+# The built SPA lives in app/static (committed; Vite uses base="/static/"). It's
+# mounted and routed only when a build is present, so tests/dev without a build are
+# unaffected. Registered AFTER every router and pages.py, the /app catch-all serves
+# index.html for client-side (history-mode) routes; scoping it to /app/* means it
+# can't shadow /api/*, /health, or the still-server-rendered pages (/, /login,
+# /positions/{id}, /companies/{id}). Broaden this at the final cutover.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if (_STATIC_DIR / "index.html").exists():
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+    @app.get("/app", include_in_schema=False)
+    @app.get("/app/{rest:path}", include_in_schema=False)
+    def spa_index(rest: str = "") -> FileResponse:
+        return FileResponse(_STATIC_DIR / "index.html")

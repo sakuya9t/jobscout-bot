@@ -8,11 +8,13 @@ once), and the daily scheduler pushes each user's report through that user's own
 bot. Everything no-ops gracefully for a user who hasn't configured a bot/chat."""
 from __future__ import annotations
 
+import html
 import logging
 
 import httpx
 from sqlalchemy import select
 
+from ..config import settings
 from ..db import session_scope
 from ..models import User
 from .reporter import build_report, report_to_telegram
@@ -84,6 +86,25 @@ def send_message(token: str, chat_id: str, text: str) -> bool:
                         resp.status_code, resp.text[:200])
             return False
     return True
+
+
+def send_temp_password(user: User, temp_password: str) -> bool:
+    """Deliver a forgot-password temporary password to the user's linked Telegram chat.
+    Returns False (sending nothing) when the user has no usable channel — the caller
+    relies on this so an account without Telegram linked simply gets no delivery rather
+    than an error. Formatting mirrors reporter.py (HTML, escaped) with the secret in a
+    <code> block so it's tap-to-copy in Telegram."""
+    if not (user.telegram_bot_token and user.telegram_chat_id):
+        return False
+    ttl = settings.password_reset_ttl_minutes
+    text = (
+        "<b>JobScout — password reset</b>\n\n"
+        "Use this temporary password to log in:\n"
+        f"<code>{html.escape(temp_password)}</code>\n\n"
+        f"It expires in {ttl} minutes and can be used once. You'll be asked to set a new "
+        "password right after logging in. If you didn't request this, you can ignore it."
+    )
+    return send_message(user.telegram_bot_token, user.telegram_chat_id, text)
 
 
 def get_bot_username(token: str) -> tuple[bool, str]:

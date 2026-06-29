@@ -74,6 +74,16 @@ PRESETS: list[CompanyPreset] = [
         ats_token="xai",
     ),
     CompanyPreset(
+        # Perplexity runs an Ashby board (jobs.ashbyhq.com/perplexity, ~74 live
+        # roles); scrape the public posting API directly via its token, same as
+        # OpenAI. Applications are submitted on Ashby itself, so no candidate account.
+        key="perplexity",
+        name="Perplexity",
+        careers_url="https://jobs.ashbyhq.com/perplexity",
+        ats_type="ashby",
+        ats_token="perplexity",
+    ),
+    CompanyPreset(
         # NVIDIA's careers site is an Eightfold (PCSX) board: client-rendered, but
         # it exposes an unauthenticated JSON search API the "eightfold" adapter
         # pages over plain HTTP. ats_token carries the org's *registrable* domain

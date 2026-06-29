@@ -32,6 +32,17 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
+    # Password recovery ("forgot password"). On request we mint a single-use temporary
+    # password, store only its bcrypt hash here with a short expiry, and deliver the
+    # plaintext over the user's linked Telegram bot (the app has no email channel). It's
+    # a second credential the login route accepts until used or expired; logging in with
+    # it flips ``must_change_password``, which gates the whole app (get_current_user 403s)
+    # until the user sets a real password via /api/auth/set-new-password. All NULL/False
+    # in steady state.
+    temp_password_hash: Mapped[str | None] = mapped_column(String(255))
+    temp_password_expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+
     # Telegram is per-user: the user supplies their own bot token (created via
     # @BotFather) and links the chat reports go to by DMing ``/start <code>`` to
     # that bot. ``telegram_bot_token`` is a secret: encrypted at rest via

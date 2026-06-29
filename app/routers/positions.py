@@ -17,10 +17,12 @@ from ..schemas import (
     ApplicationKitOut,
     OpenQuestionOut,
     PositionDetailOut,
+    PositionLookupOut,
     PositionOut,
     RescoreStatusOut,
 )
 from ..services import kit_worker, kits, reporter, rescore_worker
+from ..services.urlmatch import normalize_posting_url
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
@@ -43,6 +45,27 @@ def list_positions(
             .order_by(Position.first_seen_at.desc())
         )
     )
+
+
+@router.get("/lookup", response_model=PositionLookupOut)
+def lookup_by_url(
+    url: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Resolve a pasted posting URL to a position in the user's job list. Returns
+    ``matched=false`` when it isn't there; 422 when the URL is unparseable. Read-only —
+    never scrapes or scores. Declared before the ``/{position_id}/...`` routes so the
+    static path isn't shadowed."""
+    if normalize_posting_url(url) is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "That doesn't look like a job posting URL.",
+        )
+    item = reporter.lookup_position_by_url(db, user, url)
+    if item is None:
+        return PositionLookupOut(matched=False)
+    return PositionLookupOut(matched=True, **item)
 
 
 def _require_visible_position(db: Session, user: User, position_id: int) -> Position:

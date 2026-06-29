@@ -62,3 +62,27 @@ jobs:
         # PYTHONPATH=. so `app` resolves from the repo root (DO runs from there); we do
         # not `pip install -e .`, to keep the dependency set identical to DO's.
         run: PYTHONPATH="$PWD" pytest -q
+
+  spa-build:
+    name: SPA build freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # The Vue/Vite SPA builds into app/static, which is COMMITTED so DO's Python
+      # buildpack (no Node step) ships it as-is. Rebuild here and fail if the committed
+      # assets are stale relative to frontend/src — this is what keeps them honest.
+      - name: Install frontend deps
+        run: cd frontend && npm ci
+      - name: Build SPA
+        run: cd frontend && npm run build
+      - name: Fail if committed app/static is stale
+        run: |
+          if ! git diff --exit-code -- app/static; then
+            echo "::error::app/static is out of date. Run 'cd frontend && npm run build' and commit the result."
+            exit 1
+          fi

@@ -93,7 +93,11 @@ def _literal_default(column) -> str | None:
         return None
     value = default.arg
     if isinstance(value, bool):
-        return "1" if value else "0"
+        # Render the SQL keywords, not 1/0: Postgres rejects an integer literal as a
+        # BOOLEAN column default ("column is of type boolean but default expression is of
+        # type integer"). TRUE/FALSE are portable — Postgres and SQLite (>= 3.23) both
+        # accept them. (bool must be checked before int — bool is a subclass of int.)
+        return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
