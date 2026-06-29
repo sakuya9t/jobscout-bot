@@ -14,7 +14,7 @@
         <div class="surface">
           <div class="head-row">
             <div class="job-main">
-              <div class="company-mark" aria-hidden="true">{{ companyInitial }}</div>
+              <CompanyMark :name="detail.company" :size="48" />
               <div>
                 <h1>{{ detail.title }}</h1>
                 <div class="meta">{{ metaBits }}</div>
@@ -159,6 +159,7 @@ import { fmtListed } from "@/utils/format";
 import { mdToHtml } from "@/utils/markdown";
 import DetailTopbar from "@/components/DetailTopbar.vue";
 import DocBlock from "@/components/DocBlock.vue";
+import CompanyMark from "@/components/CompanyMark.vue";
 import type { ApplicationKitOut, PositionDetailOut } from "@/api/types";
 
 const route = useRoute();
@@ -172,7 +173,6 @@ const loadState = ref<"loading" | "ok" | "notfound" | "error">("loading");
 const reevalBusy = ref(false);
 const reevalError = ref<string | null>(null);
 
-const companyInitial = computed(() => (detail.value?.company?.trim()?.charAt(0) || "?").toUpperCase());
 const metaBits = computed(() => {
   const d = detail.value;
   if (!d) return "";
@@ -288,10 +288,6 @@ h2 { margin: 0 0 4px; }
 .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
 .head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .job-main { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
-.company-mark {
-  width: 48px; height: 48px; flex: 0 0 48px; border-radius: 10px; display: grid; place-items: center;
-  background: var(--bg-tag); color: var(--brand-primary); font-size: 20px; font-weight: 800; border: 1px solid var(--line);
-}
 .head-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
 .score-block { text-align: right; }
 .score-number { font-size: 26px; font-weight: 800; color: var(--text-score-primary, var(--accent)); }
