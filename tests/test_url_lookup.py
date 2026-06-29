@@ -38,6 +38,17 @@ def test_normalize_keeps_identifying_query_and_distinct_paths():
     assert normalize_posting_url("https://x.io/jobs/1") != normalize_posting_url("https://x.io/jobs/2")
 
 
+def test_normalize_collapses_google_results_slug():
+    # Google's /jobs/results/{id} page is what we store; users paste the slugged
+    # "{id}-{title}" variant from the careers site. Both collapse to the id.
+    base = "https://www.google.com/about/careers/applications/jobs/results/142794955985691334"
+    slugged = base + "-senior-software-engineer-generative-ai-gup"
+    assert normalize_posting_url(slugged) == normalize_posting_url(base)
+    # Distinct job ids still never collapse.
+    other = "https://www.google.com/about/careers/applications/jobs/results/999999999999999-x"
+    assert normalize_posting_url(slugged) != normalize_posting_url(other)
+
+
 def test_normalize_rejects_empty_and_non_http():
     for bad in (None, "", "   ", "ftp://example.com/x", "javascript:alert(1)", "notaurl"):
         assert normalize_posting_url(bad) is None

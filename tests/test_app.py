@@ -706,7 +706,8 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     rec = [
         "123456789012345",
         "Staff Software Engineer",
-        "https://www.google.com/about/careers/applications/jobs/results/123456789012345",
+        # rec[2] is the opaque ``signin?jobId=<token>`` apply gateway, not a public page.
+        "https://www.google.com/about/careers/applications/signin?jobId=CiUA_opaque%3D%3D_V2&loc=US&title=Staff+Software+Engineer",
         [None, "<ul><li>Build distributed systems</li></ul>"],
         [None, "<h3>Minimum qualifications:</h3><ul><li>BS degree</li></ul>"],
         "projects/x", None, "Google", None,
@@ -724,6 +725,9 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     assert p.external_id == "123456789012345"
     assert p.title == "Staff Software Engineer"
     assert p.location == "New York, NY, USA"
+    # Stored URL is the canonical public results page (keyed by the numeric id), not the
+    # opaque signin gateway from rec[2].
+    assert p.url == "https://www.google.com/about/careers/applications/jobs/results/123456789012345"
     assert p.description and "distributed systems" in p.description and "BS degree" in p.description
 
 

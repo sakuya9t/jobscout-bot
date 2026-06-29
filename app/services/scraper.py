@@ -359,7 +359,11 @@ def _google_position(rec) -> ScrapedPosition:
         external_id=job_id,
         title=(rec[1] or "Untitled")[:300],
         location=_google_location(rec),
-        url=_http_url(rec[2] if len(rec) > 2 else None) or f"{_GOOGLE_RESULTS_URL}{job_id}",
+        # rec[2] is Google's opaque ``signin?jobId=<token>`` apply gateway, not a public
+        # listing — it doesn't render the job and shares nothing with the URL a user
+        # pastes from the careers site. Store the canonical results page instead, keyed
+        # by the numeric id (the same id in the public ``/jobs/results/{id}-{slug}`` URL).
+        url=f"{_GOOGLE_RESULTS_URL}{job_id}",
         description=_strip_html(" ".join(desc_parts)) if desc_parts else None,
     )
 
