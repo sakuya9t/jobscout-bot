@@ -1,7 +1,9 @@
 <template>
   <div class="auth-page">
     <header class="auth-top">
-      <RouterLink class="brand" to="/">JobScout</RouterLink>
+      <!-- Real navigation to the server-rendered "/" (landing for anon, redirects to /app
+           when logged in) — a RouterLink would hit the SPA catch-all and bounce to /app/jobs. -->
+      <a class="brand" href="/">JobScout</a>
       <ThemeToggle />
     </header>
     <main class="auth-main">

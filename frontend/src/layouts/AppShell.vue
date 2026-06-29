@@ -3,7 +3,7 @@
     <aside class="sidebar">
       <div class="sidebar-top">
         <div>
-          <div class="brand-mark">JobScout</div>
+          <RouterLink class="brand-mark" to="/app/jobs">JobScout</RouterLink>
           <div class="account">{{ auth.user?.email }}</div>
         </div>
         <ThemeToggle />
@@ -121,7 +121,7 @@ async function logout(): Promise<void> {
   padding: 0 4px 18px;
   border-bottom: 1px solid var(--line);
 }
-.brand-mark { color: var(--brand-primary); font-size: 18px; line-height: 28px; font-weight: 700; }
+.brand-mark { display: inline-block; color: var(--brand-primary); font-size: 18px; line-height: 28px; font-weight: 700; text-decoration: none; }
 .account { color: var(--muted); font-size: 11px; line-height: 16px; word-break: break-word; }
 .nav-stack { display: grid; gap: 18px; }
 .nav-section { display: grid; gap: 6px; }
