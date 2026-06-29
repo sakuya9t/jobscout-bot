@@ -36,7 +36,7 @@
       <div class="list">
         <div v-for="c in store.companies" :key="c.id" class="list-item">
           <span class="company-meta">
-            <a :href="`/companies/${c.id}`"><b>{{ c.name }}</b></a>
+            <RouterLink :to="`/app/companies/${c.id}`"><b>{{ c.name }}</b></RouterLink>
             <span class="pill">{{ c.ats_type }}</span>
             <span v-if="c.requires_account" class="pill" :class="c.account_attached ? 'good' : 'warn'">
               {{ c.account_attached ? "account attached" : "account needed" }}

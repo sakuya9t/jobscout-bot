@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { api } from "@/api/client";
-import type { CompanyIn, CompanyOut, CompanyPresetOut } from "@/api/types";
+import type { CompanyAccountIn, CompanyDetailOut, CompanyIn, CompanyOut, CompanyPresetOut } from "@/api/types";
 
 // The user's watch-list companies plus the built-in presets. `availablePresets` hides
 // presets already on the list (matched by name), mirroring the classic dropdown.
@@ -32,5 +32,16 @@ export const useCompaniesStore = defineStore("companies", () => {
     await load();
   }
 
-  return { companies, presets, availablePresets, load, loadPresets, add, remove };
+  // ── Per-company detail page (portal account) ──
+  function loadDetail(id: number): Promise<CompanyDetailOut> {
+    return api.get<CompanyDetailOut>(`/api/companies/${id}/detail`);
+  }
+  function saveAccount(id: number, body: CompanyAccountIn): Promise<CompanyDetailOut> {
+    return api.put<CompanyDetailOut>(`/api/companies/${id}/account`, body);
+  }
+  function removeAccount(id: number): Promise<unknown> {
+    return api.del(`/api/companies/${id}/account`);
+  }
+
+  return { companies, presets, availablePresets, load, loadPresets, add, remove, loadDetail, saveAccount, removeAccount };
 });

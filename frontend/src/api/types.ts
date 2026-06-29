@@ -328,6 +328,22 @@ export interface CompanyOut {
   account_attached: boolean;
 }
 
+/** app/schemas.py :: CompanyDetailOut — CompanyOut plus the user's account state. */
+export interface CompanyDetailOut extends CompanyOut {
+  account_portal_url: string | null;
+  account_username: string | null;
+  account_has_password: boolean;
+  account_notes: string | null;
+}
+
+/** app/schemas.py :: CompanyAccountIn — save portal credentials (password keep-blank). */
+export interface CompanyAccountIn {
+  username?: string | null;
+  password?: string;
+  portal_url?: string | null;
+  notes?: string | null;
+}
+
 /** app/schemas.py :: CompanyIn — add a company (preset_key subscribes to a shared preset). */
 export interface CompanyIn {
   name: string;
