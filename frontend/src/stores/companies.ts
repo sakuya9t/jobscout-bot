@@ -11,7 +11,9 @@ export const useCompaniesStore = defineStore("companies", () => {
 
   const availablePresets = computed(() => {
     const watched = new Set(companies.value.map((c) => c.name.toLowerCase()));
-    return presets.value.filter((p) => !watched.has(p.name.toLowerCase()));
+    return presets.value
+      .filter((p) => !watched.has(p.name.toLowerCase()))
+      .sort((a, b) => a.name.localeCompare(b.name));
   });
 
   async function load(): Promise<void> {

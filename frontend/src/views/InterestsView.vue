@@ -5,6 +5,11 @@
       <p class="muted">What roles you're after and how strict the scoring is. Keywords and
         notes steer the model; the minimum score only filters the report.</p>
 
+      <div class="notice">
+        Changing the matching criteria re-scores your existing job lists against the model,
+        which can run up significant LLM costs on large lists.
+      </div>
+
       <form class="form" @submit.prevent="onSubmit">
         <div class="row">
           <div class="field"><label>Label</label><input v-model="form.label" type="text" placeholder="e.g. Backend roles" /></div>
@@ -131,6 +136,10 @@ onMounted(() => void store.load());
 .surface {
   background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
   padding: 20px; box-shadow: var(--shadow-xs);
+}
+.notice {
+  border: 1px solid var(--bg-badge-warning); background: var(--bg-badge-warning); color: var(--text-warning);
+  border-radius: 8px; padding: 12px 14px; margin: 12px 0; font-size: 14px; max-width: 640px;
 }
 .form { display: grid; gap: 12px; margin: 14px 0; max-width: 640px; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
