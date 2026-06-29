@@ -1,5 +1,23 @@
 <template>
-  <main class="dashboard">
+  <main class="dashboard" :class="{ 'nav-open': mobileNavOpen }">
+    <header class="mobile-bar">
+      <button
+        class="menu-toggle"
+        type="button"
+        :aria-expanded="mobileNavOpen"
+        aria-label="Toggle navigation menu"
+        @click="mobileNavOpen = !mobileNavOpen"
+      >
+        <svg v-if="!mobileNavOpen" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+        </svg>
+        <svg v-else width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+        </svg>
+      </button>
+      <RouterLink class="brand-mark" to="/app/jobs">JobScout</RouterLink>
+    </header>
+
     <aside class="sidebar">
       <div class="sidebar-top">
         <div>
@@ -72,11 +90,15 @@ const subtitle = computed(() => (route.meta.subtitle as string) ?? "");
 // classic dashboard's nav behavior).
 const applicationOpen = ref(false);
 const systemOpen = ref(false);
+// On narrow screens the sidebar is hidden behind a menu toggle; opening it hides the
+// content, so navigating to a panel must close it again to reveal the content.
+const mobileNavOpen = ref(false);
 watch(
   () => route.path,
   (p) => {
     if (["/app/resume", "/app/profile", "/app/companies", "/app/interests"].includes(p)) applicationOpen.value = true;
     if (["/app/llm", "/app/telegram", "/app/account"].includes(p)) systemOpen.value = true;
+    mobileNavOpen.value = false;
   },
   { immediate: true },
 );
@@ -164,8 +186,44 @@ async function logout(): Promise<void> {
 .view-header h1 { margin: 0 0 4px; }
 :deep(.panel), .workspace > :deep(section) { padding: 16px 24px 24px; }
 
+/* Mobile top bar with the menu toggle: hidden on wide screens. */
+.mobile-bar {
+  display: none;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--sidebar);
+  color: var(--sidebar-ink);
+  border-bottom: 1px solid var(--line);
+}
+.menu-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--sidebar-ink);
+  cursor: pointer;
+}
+.menu-toggle:hover { background: var(--bg-input-hover); }
+.mobile-bar .brand-mark { line-height: 38px; }
+
 @media (max-width: 860px) {
   .dashboard { grid-template-columns: 1fr; }
+  /* The bar spans the single column above both panes. */
+  .mobile-bar { display: flex; }
   .sidebar { height: auto; position: static; }
+  /* Default: show content, hide the sidebar behind the toggle. */
+  .sidebar { display: none; }
+  /* Toggle open: reveal the menu, hide the content. */
+  .dashboard.nav-open .sidebar { display: flex; }
+  .dashboard.nav-open .workspace { display: none; }
 }
 </style>
