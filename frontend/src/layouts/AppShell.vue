@@ -155,7 +155,7 @@ async function logout(): Promise<void> {
   width: 100%; min-height: 32px; padding: 8px 16px 4px; border: 0; border-radius: 8px;
   background: transparent; color: var(--text-sidebar-section); display: flex; align-items: center;
   justify-content: space-between; font-size: 11px; line-height: 16px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.08em;
+  text-transform: uppercase; letter-spacing: 0.08em; white-space: nowrap;
 }
 .nav-section-toggle:hover { background: var(--bg-input-hover); color: var(--text-heading); }
 .nav-section-toggle::after {
