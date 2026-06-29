@@ -4,7 +4,7 @@
       <div class="job-main">
         <CompanyMark :name="m.company" />
         <div>
-          <div class="job-title"><a :href="`/positions/${m.position_id}`">{{ m.title }}</a></div>
+          <div class="job-title"><RouterLink :to="`/app/positions/${m.position_id}`">{{ m.title }}</RouterLink></div>
           <div class="job-meta">
             {{ m.company }}<template v-if="m.location"> · {{ m.location }}</template><template v-if="listed"> · {{ listed }}</template>
           </div>

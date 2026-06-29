@@ -196,6 +196,67 @@ export interface ApplicantProfileOut {
 
 export type ApplicantProfileIn = ApplicantProfileOut;
 
+/** app/schemas.py :: OpenQuestionOut — one detected application question. */
+export interface OpenQuestionOut {
+  question: string;
+  advice: string;
+  suggested_answer: string;
+}
+
+/** app/schemas.py :: ApplicationKitOut — the generated (or in-progress) kit. */
+export interface ApplicationKitOut {
+  status: "generating" | "ok" | "error";
+  looking_for: string[];
+  open_questions: OpenQuestionOut[];
+  cover_letter: string | null;
+  revised_resume: string | null;
+  resume_optimization: string | null;
+  model: string | null;
+  error_detail: string | null;
+  updated_at: string | null;
+}
+
+/** app/schemas.py :: MatchSubScore — one aspect of the score breakdown. */
+export interface MatchSubScore {
+  label: string;
+  score: number;
+  rationale: string | null;
+}
+
+/** app/schemas.py :: PositionDetailOut — the per-position detail payload. */
+export interface PositionDetailOut {
+  position_id: number;
+  company: string;
+  title: string;
+  location: string | null;
+  department: string | null;
+  employment_type: string | null;
+  url: string | null;
+  description: string | null;
+  listed_at: string | null;
+  match_score: number | null;
+  win_probability: number | null;
+  reasoning: string | null;
+  strengths: string[];
+  gaps: string[];
+  score_breakdown: MatchSubScore[];
+  non_matching: boolean;
+  removed: boolean;
+  applied: boolean;
+  salary_min: number | null;
+  salary_max: number | null;
+  salary_currency: string | null;
+  salary_period: string | null;
+  salary_display: string | null;
+  kit: ApplicationKitOut | null;
+}
+
+/** app/schemas.py :: RescoreStatusOut — per-position re-evaluation poll. */
+export interface RescoreStatusOut {
+  in_progress: boolean;
+  error: string | null;
+}
+
 /** app/schemas.py :: JobListRunOut — a saved snapshot for the version dropdown. */
 export interface JobListRunOut {
   id: number;

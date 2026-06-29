@@ -10,6 +10,7 @@ import ResumeView from "@/views/ResumeView.vue";
 import InterestsView from "@/views/InterestsView.vue";
 import CompaniesView from "@/views/CompaniesView.vue";
 import ProfileView from "@/views/ProfileView.vue";
+import PositionDetailView from "@/views/PositionDetailView.vue";
 
 // Pass 1: the SPA owns only /app/*. The dashboard's old hash panels (#jobs, #resume, …)
 // become child routes here; the other panels are placeholders until later passes.
@@ -32,6 +33,9 @@ const routes: RouteRecordRaw[] = [
       { path: "account", component: AccountView, meta: { title: "Account", subtitle: "Change your login password" } },
     ],
   },
+  // Detail pages are standalone (their own topbar, no sidebar) to match the classic
+  // pages and keep print-to-PDF isolation simple; auth-guarded like the rest of /app.
+  { path: "/app/positions/:id", component: PositionDetailView, meta: { requiresAuth: true } },
   // Any other in-SPA path lands on the jobs view.
   { path: "/:pathMatch(.*)*", redirect: "/app/jobs" },
 ];

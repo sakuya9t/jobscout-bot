@@ -22,7 +22,7 @@
     <p v-else-if="result && result.matched" class="lookup-result hit">
       <span v-if="result.applied" class="pill ok">✓ Already applied</span>
       <span v-else class="pill neutral">In your job list</span>
-      <a class="lookup-link" :href="`/positions/${result.position_id}`">{{ result.title }}</a>
+      <RouterLink class="lookup-link" :to="`/app/positions/${result.position_id}`">{{ result.title }}</RouterLink>
       <span class="muted">· {{ result.company }}</span>
       <span v-if="!result.applied && result.match_score != null" class="muted">· score {{ result.match_score }}</span>
       <span v-if="result.removed" class="muted">· closed</span>
