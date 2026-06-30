@@ -18,14 +18,19 @@
 
     <span v-if="m.removed" class="pill neutral">Closed — no longer listed</span>
     <span v-if="!m.non_matching && m.below_threshold" class="pill warn">below threshold</span>
-    <div v-if="m.reasoning">{{ m.reasoning }}</div>
-    <template v-if="m.strengths.length">
-      <div class="muted">Strengths</div>
-      <ul class="tight"><li v-for="(s, i) in m.strengths" :key="i">{{ s }}</li></ul>
-    </template>
-    <template v-if="m.gaps.length">
-      <div class="muted">Watch-outs</div>
-      <ul class="tight"><li v-for="(s, i) in m.gaps" :key="i">{{ s }}</li></ul>
+    <div v-if="m.reasoning || hasDetails">
+      <span v-if="m.reasoning">{{ m.reasoning }}</span><button
+        v-if="hasDetails" type="button" class="toggle-more" @click="expanded = !expanded">{{ expanded ? "less" : "more…" }}</button>
+    </div>
+    <template v-if="hasDetails && expanded">
+      <template v-if="m.strengths.length">
+        <div class="muted">Strengths</div>
+        <ul class="tight"><li v-for="(s, i) in m.strengths" :key="i">{{ s }}</li></ul>
+      </template>
+      <template v-if="m.gaps.length">
+        <div class="muted">Watch-outs</div>
+        <ul class="tight"><li v-for="(s, i) in m.gaps" :key="i">{{ s }}</li></ul>
+      </template>
     </template>
 
     <div class="job-actions">
@@ -37,7 +42,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import type { MatchOut } from "@/api/types";
 import { fmtListed, kitIcon } from "@/utils/format";
 import CompanyMark from "@/components/CompanyMark.vue";
@@ -49,6 +54,8 @@ const emit = defineEmits<{ (e: "toggleApplied", positionId: number, next: boolea
 
 const listed = computed(() => fmtListed(props.m.listed_at));
 const kit = computed(() => kitIcon(props.m.kit_status));
+const hasDetails = computed(() => props.m.strengths.length > 0 || props.m.gaps.length > 0);
+const expanded = ref(false);
 </script>
 
 <style scoped>
@@ -66,6 +73,11 @@ const kit = computed(() => kitIcon(props.m.kit_status));
 .job-meta { color: var(--muted); font-size: 13px; }
 .job-head-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
 .salary { color: var(--ink); font-size: 13px; font-weight: 650; white-space: nowrap; }
+.toggle-more {
+  margin-left: 6px; padding: 0; border: 0; background: none; cursor: pointer;
+  vertical-align: baseline; color: var(--accent); font: inherit; font-weight: 600;
+}
+.toggle-more:hover { text-decoration: underline; }
 .job-actions { display: flex; align-items: center; gap: 14px; margin-top: 2px; }
 .kit-icon { margin-left: auto; font-size: 15px; cursor: default; line-height: 1; }
 .pill {
