@@ -19,6 +19,17 @@ export function fmtListed(value: string | null | undefined): string {
   return `Listed ${d.toLocaleDateString([], { dateStyle: "medium" })}`;
 }
 
+export function fmtApplied(value: string | null | undefined): string {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if (days <= 0) return "Applied today";
+  if (days === 1) return "Applied yesterday";
+  if (days < 30) return `Applied ${days} days ago`;
+  return `Applied ${d.toLocaleDateString([], { dateStyle: "medium" })}`;
+}
+
 export interface KitIcon { icon: string; title: string; }
 
 export function kitIcon(status: string | null | undefined): KitIcon | null {

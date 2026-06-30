@@ -9,6 +9,7 @@ for the same job (a company-site ``?gh_jid=`` embed vs the canonical
 extraction and is out of scope here."""
 from __future__ import annotations
 
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 # Query params that never identify a posting — dropped before comparing. (Compared
@@ -17,6 +18,13 @@ _TRACKING_PARAMS = frozenset({
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "gh_src", "source", "src", "ref", "referrer", "mc_cid", "mc_eid",
 })
+
+# Google careers results pages key on a numeric job id but append a decorative
+# ``-{title-slug}`` ("/jobs/results/123…-senior-software-engineer"). The slug is
+# cosmetic and Google truncates it, so reduce the segment to the id alone — that way a
+# pasted slugged URL matches the bare ``/jobs/results/{id}`` page we store.
+_GOOGLE_RESULTS_PATH = "/about/careers/applications/jobs/results/"
+_GOOGLE_JOB_ID = re.compile(r"^(\d{10,})(?:-|$)")
 
 
 def normalize_posting_url(url: str | None) -> str | None:
@@ -41,6 +49,10 @@ def normalize_posting_url(url: str | None) -> str | None:
     if host.startswith("www."):
         host = host[4:]
     path = parts.path.rstrip("/")
+    if host == "google.com" and path.startswith(_GOOGLE_RESULTS_PATH):
+        m = _GOOGLE_JOB_ID.match(path[len(_GOOGLE_RESULTS_PATH):])
+        if m:
+            path = _GOOGLE_RESULTS_PATH + m.group(1)
     query = urlencode(sorted(
         (k, v)
         for k, v in parse_qsl(parts.query, keep_blank_values=True)

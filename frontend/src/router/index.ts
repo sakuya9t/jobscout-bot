@@ -2,6 +2,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 import { useAuthStore } from "@/stores/auth";
 import AppShell from "@/layouts/AppShell.vue";
 import JobsView from "@/views/JobsView.vue";
+import ApplicationHistoryView from "@/views/ApplicationHistoryView.vue";
 import SearchView from "@/views/SearchView.vue";
 import AccountView from "@/views/AccountView.vue";
 import LlmView from "@/views/LlmView.vue";
@@ -27,6 +28,7 @@ const routes: RouteRecordRaw[] = [
     children: [
       { path: "", redirect: "/app/jobs" },
       { path: "jobs", component: JobsView, meta: { title: "Job lists", subtitle: "Latest ranked positions from your scans" } },
+      { path: "applications", component: ApplicationHistoryView, meta: { title: "Application history", subtitle: "Every position you’ve marked as applied" } },
       { path: "search", component: SearchView, meta: { title: "Search for Job", subtitle: "Look up a posting by its URL in your job list" } },
       { path: "resume", component: ResumeView, meta: { title: "Resume", subtitle: "Current resume used for matching" } },
       { path: "profile", component: ProfileView, meta: { title: "Profile", subtitle: "Reusable application details" } },

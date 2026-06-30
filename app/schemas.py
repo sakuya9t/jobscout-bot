@@ -460,6 +460,46 @@ class ApplicationOut(_ORM):
     applied_at: datetime
 
 
+class ApplicationHistoryOut(BaseModel):
+    """One row of the application-history view: a position the user marked applied,
+    with when/how they applied plus the posting's current state. Built from the
+    ``Application`` rows directly — not the match list — so it includes every applied
+    posting regardless of whether it still matches an active interest (or is scored
+    at all). ``match_score``/``win_probability`` are null when the position has no
+    stored match (e.g. its only match was dropped by an interest edit); ``url`` is
+    the live posting; ``removed`` is true once it left the company's board."""
+
+    position_id: int
+    company: str
+    title: str
+    location: str | None = None
+    url: str | None = None
+    # When the user marked it applied (ISO datetime) and the application's status
+    # ("applied" today; room for auto-apply states later) — the history's sort key.
+    applied_at: datetime
+    status: str
+    # The position's best stored match, or null when none exists anymore.
+    match_score: int | None = None
+    win_probability: int | None = None
+    # True when the best stored match didn't pass the relevance filter (scores aren't
+    # meaningful) — the row shows a "not a match" pill instead of a score.
+    non_matching: bool = False
+    # True once the posting left the company's board (badged "Closed").
+    removed: bool = False
+    listed_at: str | None = None
+    salary_display: str | None = None
+    # Application-kit status, overlaid live: None | "generating" | "ok" | "error".
+    kit_status: str | None = None
+
+
+class ApplicationHistoryPageOut(BaseModel):
+    """One server-paginated page of the application-history view: the page's rows plus
+    the total number of applications (for the pager), mirroring ``JobListOut``."""
+
+    items: list[ApplicationHistoryOut] = Field(default_factory=list)
+    total: int = 0
+
+
 # ── Application kit (per-position detail page) ───────────────────────────────
 class OpenQuestionOut(BaseModel):
     """One open application question the LLM detected for a posting, with how to

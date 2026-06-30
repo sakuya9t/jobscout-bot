@@ -706,7 +706,8 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     rec = [
         "123456789012345",
         "Staff Software Engineer",
-        "https://www.google.com/about/careers/applications/jobs/results/123456789012345",
+        # rec[2] is the opaque ``signin?jobId=<token>`` apply gateway, not a public page.
+        "https://www.google.com/about/careers/applications/signin?jobId=CiUA_opaque%3D%3D_V2&loc=US&title=Staff+Software+Engineer",
         [None, "<ul><li>Build distributed systems</li></ul>"],
         [None, "<h3>Minimum qualifications:</h3><ul><li>BS degree</li></ul>"],
         "projects/x", None, "Google", None,
@@ -724,6 +725,9 @@ def test_google_scrape_parses_ssr_json_and_paginates(monkeypatch):
     assert p.external_id == "123456789012345"
     assert p.title == "Staff Software Engineer"
     assert p.location == "New York, NY, USA"
+    # Stored URL is the canonical public results page (keyed by the numeric id), not the
+    # opaque signin gateway from rec[2].
+    assert p.url == "https://www.google.com/about/careers/applications/jobs/results/123456789012345"
     assert p.description and "distributed systems" in p.description and "BS degree" in p.description
 
 
@@ -1213,8 +1217,10 @@ def test_reconcile_floor_scopes_removals_to_covered_window(monkeypatch):
 
 
 def test_removed_position_hidden_unless_applied(monkeypatch):
-    """A removed posting drops out of the job list / detail / visibility gate — but
-    one the user applied to stays, flagged removed, so its record survives."""
+    """A removed posting drops out of the job list / detail / visibility gate. Applying
+    keeps it reachable (detail opens, badged removed) but moves it to the Application
+    History view, not back onto the job list — so its record survives without cluttering
+    the list."""
     from app.services import scraper
 
     with session_scope() as db:
@@ -1238,16 +1244,20 @@ def test_removed_position_hidden_unless_applied(monkeypatch):
         assert reporter.position_visible(db, user, pid2) is False
         assert reporter.build_position_detail(db, user, pid2) is None
 
-    # Apply to it → it returns to the list, badged removed, and the detail opens.
+    # Apply to it → it stays OUT of the job list (now in Application History), but the
+    # detail opens again and the history row is badged removed.
     with session_scope() as db:
         db.add(models.Application(user_id=uid, position_id=pid2))
     with session_scope() as db:
         user = db.get(models.User, uid)
         items, _ = reporter.build_job_list(db, user, category="matching")
-        row = next(i for i in items if i["position_id"] == pid2)
-        assert row["removed"] is True
+        assert pid2 not in {i["position_id"] for i in items}
         assert reporter.position_visible(db, user, pid2) is True
         assert reporter.build_position_detail(db, user, pid2)["removed"] is True
+        history, total = reporter.build_application_history(db, user)
+        assert total == 1
+        hist_row = next(h for h in history if h["position_id"] == pid2)
+        assert hist_row["removed"] is True
 
 
 def test_removed_positions_are_not_scored():
@@ -1972,8 +1982,9 @@ def test_unfollowing_preset_drops_its_jobs_from_lists():
 
 
 def test_applied_job_survives_unfollow():
-    """A job the user already applied to stays on the list after they unfollow its
-    company (mirrors the removed-but-applied exception) so the application isn't lost."""
+    """A job the user already applied to survives unfollowing its company — it leaves
+    the job list (it lives in the Application History view now) but stays reachable on
+    the detail page, so the application isn't lost."""
     with session_scope() as db:
         uid = _seed_user(db)
         nv_cid, nv_pid = _seed_preset_subscription_match(db, uid)
@@ -1985,8 +1996,12 @@ def test_applied_job_survives_unfollow():
     with session_scope() as db:
         user = db.get(models.User, uid)
         items, total = reporter.build_job_list(db, user, category="matching", limit=50)
-        assert total == 1 and items[0]["company"] == "NVIDIA" and items[0]["applied"] is True
-        assert reporter.position_visible(db, user, nv_pid) is True
+        assert total == 0  # the applied NVIDIA job is no longer in the job list
+        assert reporter.position_visible(db, user, nv_pid) is True  # detail still opens
+        history, total = reporter.build_application_history(db, user)
+        assert total == 1
+        assert [h["position_id"] for h in history] == [nv_pid]
+        assert history[0]["company"] == "NVIDIA"
 
 
 def test_incomplete_batch_warning_is_not_a_provider_failure():
@@ -2114,15 +2129,20 @@ def test_mark_and_unmark_applied(monkeypatch):
         assert r.status_code == 201 and r.json()["position_id"] == pid and r.json()["status"] == "applied"
         assert c.post(f"/api/applications/{pid}", headers=h).status_code == 201  # idempotent
 
+        # Marking applied moves the position off the job list and into the history view.
         after = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
-        assert any(it["position_id"] == pid and it["applied"] for it in after["items"])
+        assert all(it["position_id"] != pid for it in after["items"])
         assert [a["position_id"] for a in c.get("/api/applications", headers=h).json()] == [pid]
+        history = c.get("/api/applications/history", headers=h).json()
+        assert history["total"] == 1 and [h2["position_id"] for h2 in history["items"]] == [pid]
 
+        # Unmarking brings it back to the job list and clears the history.
         assert c.delete(f"/api/applications/{pid}", headers=h).status_code == 204
         assert c.delete(f"/api/applications/{pid}", headers=h).status_code == 204  # idempotent
-        cleared = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
-        assert all(not it["applied"] for it in cleared["items"])
+        restored = c.get("/api/job-lists/latest?category=matching&limit=10", headers=h).json()
+        assert any(it["position_id"] == pid and not it["applied"] for it in restored["items"])
         assert c.get("/api/applications", headers=h).json() == []
+        assert c.get("/api/applications/history", headers=h).json() == {"items": [], "total": 0}
 
 
 def test_mark_applied_rejects_position_not_in_job_list(monkeypatch):
@@ -2163,7 +2183,9 @@ def test_applied_status_is_per_user(monkeypatch):
         assert c.get("/api/applications", headers=hb).json() == []
 
 
-def test_applied_overlaid_on_frozen_snapshot():
+def test_applied_dropped_from_frozen_snapshot():
+    """A frozen snapshot overlays applied state live, then drops applied rows — they
+    move to the Application History view, even when viewing an old saved list."""
     from app.routers.reports import get_job_list
 
     with session_scope() as db:
@@ -2181,7 +2203,7 @@ def test_applied_overlaid_on_frozen_snapshot():
         db.add(models.Application(user_id=uid, position_id=pid))
         db.commit()
         after = get_job_list(snap.id, user=user, db=db)
-        assert any(it.position_id == pid and it.applied for it in after.items)
+        assert all(it.position_id != pid for it in after.items)
 
 
 def test_applications_cascade_on_user_delete():

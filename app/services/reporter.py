@@ -90,8 +90,10 @@ def _listed_at(pos: Position) -> datetime | None:
 def _visible_positions_clause(user: User):
     """WHERE clause keeping only positions a user should still see: ones currently
     listed (``removed_at`` NULL), plus any they've already applied to — so a posting
-    that closed after they applied stays on their list (badged removed) rather than
-    vanishing with its application record. Applied to every match-listing query."""
+    that closed after they applied stays reachable (its detail page and report row)
+    rather than vanishing with its application record. Applied to every match-listing
+    query. (The dashboard job list itself then excludes applied postings, which live
+    in the Application History view instead — see ``build_job_list``.)"""
     applied = select(Application.position_id).where(Application.user_id == user.id)
     return or_(Position.removed_at.is_(None), Position.id.in_(applied))
 
@@ -349,6 +351,11 @@ def build_job_list(
 
     ``company_id`` (None = all) narrows to one company's postings, applied — like
     the date filter — before counting/paging so the total reflects the scope."""
+    # Applied positions move to the Application History view, so they drop out of the
+    # job list here — and reappear the moment they're unmarked. (The shared visibility/
+    # follow clauses keep their "or applied" branch so the detail page and URL lookup
+    # still surface them; only this list hides them.)
+    applied = select(Application.position_id).where(Application.user_id == user.id)
     base = (
         select(MatchResult, Position, Company)
         .join(Position, MatchResult.position_id == Position.id)
@@ -356,6 +363,7 @@ def build_job_list(
         .where(MatchResult.user_id == user.id)
         .where(_visible_positions_clause(user))
         .where(_followed_companies_clause(user))
+        .where(Position.id.not_in(applied))
     )
     if company_id is not None:
         base = base.where(Position.company_id == company_id)
@@ -520,6 +528,82 @@ def build_position_detail(db: Session, user: User, position_id: int) -> dict | N
     }
     tag_applied(db, user, [detail])
     return detail
+
+
+def build_application_history(
+    db: Session, user: User, *, limit: int = 20, offset: int = 0,
+) -> tuple[list[dict], int]:
+    """One page of the application-history view, newest application first, plus the
+    total number of applications. Built straight from the ``Application`` rows (not the
+    match list), so it includes applied postings that no longer match any active
+    interest, were screened out, or have no stored match at all (e.g. their only match
+    was dropped when an interest's criteria changed). Each row carries the posting's
+    best surviving match for a score when one exists, the current ``removed`` state,
+    and live ``kit_status``. None of the job-list visibility/follow filters apply —
+    applying is itself the reason to keep the row. Pagination is server-side via
+    ``limit``/``offset``, mirroring the job list."""
+    total = db.scalar(
+        select(func.count()).select_from(Application).where(Application.user_id == user.id)
+    ) or 0
+    if total == 0:
+        return [], 0
+    rows = db.execute(
+        select(Application, Position, Company)
+        .join(Position, Application.position_id == Position.id)
+        .join(Company, Position.company_id == Company.id)
+        .where(Application.user_id == user.id)
+        .order_by(Application.applied_at.desc(), Application.id.desc())
+        .offset(max(0, offset))
+        .limit(limit)
+    ).all()
+    if not rows:
+        return [], total
+
+    # The best surviving match per applied position on this page, ranked like
+    # build_position_detail (a passing match, then highest score). One query for the
+    # page's positions; the first row seen per position is its best because the result
+    # is globally rank-ordered.
+    position_ids = [pos.id for _app, pos, _co in rows]
+    best: dict[int, MatchResult] = {}
+    for match in db.scalars(
+        select(MatchResult)
+        .where(MatchResult.user_id == user.id, MatchResult.position_id.in_(position_ids))
+        .order_by(
+            MatchResult.passed_filter.desc(),
+            MatchResult.match_score.desc(),
+            MatchResult.win_probability.desc(),
+        )
+    ):
+        best.setdefault(match.position_id, match)
+
+    items = [_application_row(app, pos, company, best.get(pos.id)) for app, pos, company in rows]
+    tag_kit_status(db, user, items)
+    return items, total
+
+
+def _application_row(app: Application, pos: Position, company: Company,
+                     match: MatchResult | None) -> dict:
+    """Build one application-history row from an (application, position, company) and
+    the position's best surviving match (or None when it has no stored match)."""
+    listed = _listed_at(pos)
+    return {
+        "position_id": pos.id,
+        "company": company.name,
+        "title": pos.title,
+        "location": pos.location,
+        "url": pos.url,
+        "applied_at": app.applied_at,
+        "status": app.status,
+        "match_score": match.match_score if match else None,
+        "win_probability": match.win_probability if match else None,
+        "non_matching": (not match.passed_filter) if match else False,
+        "removed": pos.removed_at is not None,
+        "listed_at": listed.isoformat() if listed else None,
+        "salary_display": salary.format_range(
+            pos.salary_min, pos.salary_max, pos.salary_currency, pos.salary_period
+        ),
+        "kit_status": None,  # overlaid by tag_kit_status
+    }
 
 
 def _match_out_payload(match: dict) -> dict:

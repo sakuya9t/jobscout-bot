@@ -34,6 +34,34 @@ export interface MatchOut {
   kit_status: KitStatus;
 }
 
+/** app/schemas.py :: ApplicationHistoryOut — one row of the application-history view.
+ *  Built from the user's Application rows directly, so it includes every applied
+ *  posting regardless of match state; `match_score`/`win_probability` are null when
+ *  the position has no stored match anymore. */
+export interface ApplicationHistoryOut {
+  position_id: number;
+  company: string;
+  title: string;
+  location: string | null;
+  url: string | null;
+  applied_at: string;
+  status: string;
+  match_score: number | null;
+  win_probability: number | null;
+  non_matching: boolean;
+  removed: boolean;
+  listed_at: string | null;
+  salary_display: string | null;
+  kit_status: KitStatus;
+}
+
+/** app/schemas.py :: ApplicationHistoryPageOut — one server-paginated page of the
+ *  application-history view plus the total count (for the pager). */
+export interface ApplicationHistoryPageOut {
+  items: ApplicationHistoryOut[];
+  total: number;
+}
+
 /** app/schemas.py :: PositionLookupOut — resolve a pasted posting URL to a job-list row.
  *  All fields but `matched` are null when the URL isn't in the user's list. */
 export interface PositionLookupOut {
