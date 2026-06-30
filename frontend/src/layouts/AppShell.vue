@@ -31,6 +31,7 @@
         <div class="nav-section">
           <div class="nav-section-title">Workspace</div>
           <RouterLink to="/app/jobs" class="nav-button" active-class="active">Job lists</RouterLink>
+          <RouterLink to="/app/applications" class="nav-button" active-class="active">Application history</RouterLink>
           <RouterLink to="/app/search" class="nav-button" active-class="active">Search for Job</RouterLink>
         </div>
 

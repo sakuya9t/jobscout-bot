@@ -6,6 +6,7 @@ import type {
   EvaluationStatus,
   JobListOut,
   JobListRunOut,
+  MatchOut,
   PositionLookupOut,
   ResumeOut,
   RunSummary,
@@ -149,18 +150,33 @@ export const useJobsStore = defineStore("jobs", () => {
     }
   }
 
-  // Toggle a position's applied status in place (no list reload, so paging/scroll are
-  // preserved). Optimistic: flips locally, reverts on failure.
+  // Mark a position applied. An applied position moves to the Application History view
+  // and leaves the job list, so drop the row here — optimistically for instant feedback
+  // (restoring it in place on failure), then reload the page so the freed slot refills
+  // with the next match from the server instead of the list just shrinking. The job
+  // list never shows already-applied rows, so the toggle only ever runs in the applied
+  // direction; the unmark branch (reachable from the history view) just calls the API.
   async function markApplied(positionId: number, applied: boolean): Promise<void> {
-    const row = items.value.find((m) => m.position_id === positionId);
-    if (row) row.applied = applied;
+    const list = data.value?.items;
+    const idx = list ? list.findIndex((m) => m.position_id === positionId) : -1;
+    let removed: MatchOut | null = null;
+    if (applied && list && idx !== -1) {
+      [removed] = list.splice(idx, 1);
+      if (data.value) data.value.total = Math.max(0, data.value.total - 1);
+    }
     try {
       if (applied) await api.post(`/api/applications/${positionId}`);
       else await api.del(`/api/applications/${positionId}`);
     } catch {
-      if (row) row.applied = !applied; // revert
+      if (removed && list) {
+        list.splice(idx, 0, removed); // revert
+        if (data.value) data.value.total += 1;
+      }
       throw new Error("Could not update application status");
     }
+    // Refill from the server (top up the page, reconcile total/pagination). Skipped for
+    // unmark, which isn't reachable from the job list.
+    if (applied) await loadJobList();
   }
 
   /** Resolve a pasted posting URL to a position in the user's job list (lookup-only —

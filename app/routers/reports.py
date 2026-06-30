@@ -169,12 +169,13 @@ def get_job_list(
             m for m in all_items
             if m.get("match_score", 0) >= min_score and m.get("win_probability", 0) >= min_win
         ]
-    # Overlay live applied + removed state onto the frozen rows, then drop postings
-    # that have since left the board unless the user applied to them — same rule the
-    # live list enforces in SQL — before paging so counts stay consistent.
+    # Overlay live applied + removed state onto the frozen rows, then drop applied
+    # postings (they move to the Application History view) and any that have since left
+    # the board — the same rules the live list enforces in SQL — before paging so
+    # counts stay consistent.
     reporter.tag_applied(db, user, all_items)
     reporter.tag_removed(db, user, all_items)
-    all_items = [m for m in all_items if not m.get("removed") or m.get("applied")]
+    all_items = [m for m in all_items if not m.get("applied") and not m.get("removed")]
     all_items = reporter.sort_items_by_salary(all_items, _sort(sort))
     start = max(0, offset)
     page = all_items[start : start + _safe_limit(limit)]

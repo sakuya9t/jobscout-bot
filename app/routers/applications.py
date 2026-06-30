@@ -17,9 +17,14 @@ from sqlalchemy.orm import Session
 from ..auth import get_current_user
 from ..db import get_db
 from ..models import Application, MatchResult, Position, User
-from ..schemas import ApplicationOut
+from ..schemas import ApplicationHistoryPageOut, ApplicationOut
+from ..services import reporter
+from ..timeutil import utcnow
 
 router = APIRouter(prefix="/api/applications", tags=["applications"])
+
+# Upper bound on a single application-history page, mirroring the job list's cap.
+_HISTORY_PAGE_LIMIT = 200
 
 
 def _require_visible(db: Session, user: User, position_id: int) -> None:
@@ -47,13 +52,34 @@ def list_applications(user: User = Depends(get_current_user), db: Session = Depe
     return list(db.scalars(select(Application).where(Application.user_id == user.id)))
 
 
+@router.get("/history", response_model=ApplicationHistoryPageOut)
+def application_history(
+    limit: int = 20,
+    offset: int = 0,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One page of the application-history view: every position the user marked applied,
+    newest first, with its current state and best surviving match (when any). Includes
+    applied postings that no longer match an active interest or aren't scored at all.
+    ``limit``/``offset`` paginate server-side (``total`` drives the pager). Declared
+    before the ``/{position_id}`` routes so the static path isn't shadowed."""
+    items, total = reporter.build_application_history(
+        db, user, limit=min(max(limit, 1), _HISTORY_PAGE_LIMIT), offset=max(0, offset)
+    )
+    return ApplicationHistoryPageOut(items=items, total=total)
+
+
 @router.post("/{position_id}", response_model=ApplicationOut, status_code=status.HTTP_201_CREATED)
 def mark_applied(
     position_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Mark a position applied. Idempotent: re-marking returns the existing row."""
+    """Mark a position applied. Idempotent in state (one row per user+position), but
+    every click records the time: ``applied_at`` is (re)set to now, so re-applying —
+    e.g. after unmarking — bumps the row to the top of the application history, which is
+    ordered by most-recent apply."""
     _require_visible(db, user, position_id)
     position = db.get(Position, position_id)
     if position is not None and position.removed_at is not None:
@@ -63,10 +89,12 @@ def mark_applied(
         )
     application = _get(db, user, position_id)
     if application is None:
-        application = Application(user_id=user.id, position_id=position_id)
+        application = Application(user_id=user.id, position_id=position_id, applied_at=utcnow())
         db.add(application)
-        db.commit()
-        db.refresh(application)
+    else:
+        application.applied_at = utcnow()  # the history sorts by the latest apply click
+    db.commit()
+    db.refresh(application)
     return application
 
 
