@@ -77,6 +77,8 @@ const expanded = ref(false);
   margin-left: 6px; padding: 0; border: 0; background: none; cursor: pointer;
   vertical-align: baseline; color: var(--accent); font: inherit; font-weight: 600;
 }
+/* Stay a plain text link: override the global button hover/active background. */
+.toggle-more:hover, .toggle-more:active { background: none; }
 .toggle-more:hover { text-decoration: underline; }
 .job-actions { display: flex; align-items: center; gap: 14px; margin-top: 2px; }
 .kit-icon { margin-left: auto; font-size: 15px; cursor: default; line-height: 1; }
